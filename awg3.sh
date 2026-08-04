@@ -85,6 +85,16 @@ DO_APPLY=1
 ASSUME_YES=0
 PRUNE_KEEP=""
 
+# Параметры server-init. Пустой SRV_PORT означает «выбрать случайный»:
+# предсказуемый порт сам по себе является признаком.
+SRV_PORT=""
+SRV_SUBNET="10.9.9.1/24"
+SRV_MTU="1280"
+SRV_ISOLATION="off"
+SRV_IPV6="off"
+SRV_IPV6_SUBNET="fddd:2c4:2c4:2c4::/64"
+SRV_FORCE=0
+
 # device/noise-types.go: HeaderCipherNonceSize. При включённой защите заголовка
 # nonce читается из первых NONCE_SIZE байт padding'а, поэтому S1-S4 не могут
 # быть короче.
@@ -724,7 +734,7 @@ check_dependencies() {
     # Переменная цикла объявлена local: без этого она перетирает одноимённую
     # переменную вызывающей функции — область видимости в bash динамическая.
     local missing=() dep
-    for dep in awg awg-quick flock od grep awk sed; do
+    for dep in awg awg-quick flock od grep awk sed ip iptables; do
         command -v "$dep" >/dev/null 2>&1 || missing+=("$dep")
     done
     [[ "${#missing[@]}" -eq 0 ]] || die "нет обязательных команд: ${missing[*]}"
@@ -973,6 +983,121 @@ server_public_key() {
     priv=$(_iface_value PrivateKey)
     [[ -n "$priv" ]] || die "в $SERVER_CONF нет PrivateKey"
     printf '%s' "$priv" | awg pubkey
+}
+
+# ── Команда: server-init ────────────────────────────────────────────────────
+#
+# Создание сервера AWG 3.0 с нуля: ключи, параметры обфускации, NAT, конфиг,
+# форвардинг. Промежуточной стадии 2.0 не существует, server-upgrade здесь не
+# участвует — он остаётся только для уже существующих 2.0-серверов.
+
+guard_existing_server() {
+    if [[ -f "$SERVER_CONF" && "$SRV_FORCE" -ne 1 ]]; then
+        log_err "сервер уже существует: $SERVER_CONF"
+        log_err "Пересоздать с переносом пиров: $0 server-init --force"
+        return 1
+    fi
+    return 0
+}
+
+# enable_forwarding IPV6 FILE — форвардинг через sysctl.d плюс немедленно.
+enable_forwarding() {
+    local ipv6="$1" file="$2"
+    {
+        printf '# Создано awg3.sh server-init.\n'
+        printf 'net.ipv4.ip_forward = 1\n'
+        if [[ "$ipv6" == "on" ]]; then
+            printf 'net.ipv6.conf.all.forwarding = 1\n'
+        fi
+    } > "$file" || { log_err "не записан $file"; return 1; }
+    chmod 644 "$file"
+
+    if command -v sysctl >/dev/null 2>&1; then
+        sysctl -q -p "$file" 2>/dev/null \
+            || log_warn "sysctl не применил $file, потребуется перезагрузка"
+    fi
+    return 0
+}
+
+cmd_server_init() {
+    guard_existing_server || exit 1
+
+    [[ -n "$SRV_PORT" ]] || { rand_int 1024 65000; SRV_PORT=$REPLY; }
+    validate_awg_port "$SRV_PORT" || exit 1
+    validate_subnet   "$SRV_SUBNET" || exit 1
+    validate_mtu      "$SRV_MTU"    || exit 1
+    port_is_free "$SRV_PORT" || die "UDP-порт $SRV_PORT уже занят"
+
+    local nic
+    nic=$(get_main_nic) \
+        || die "не определён внешний интерфейс — проверьте маршрут по умолчанию"
+    log "внешний интерфейс: $nic"
+
+    local peers_src=""
+    if [[ -f "$SERVER_CONF" ]]; then
+        _backup_file "$SERVER_CONF"
+        peers_src="$BACKUP_LAST"
+    fi
+
+    ROLLBACK_SERVER_BAK="$peers_src"
+    ROLLBACK_ACTIVE=1
+    trap '_rollback_server_init' EXIT
+
+    mkdir -p "$AWG_DIR"; chmod 700 "$AWG_DIR"; _fix_owner "$AWG_DIR"
+    generate_server_keys
+
+    local address="$SRV_SUBNET"
+    if [[ "$SRV_IPV6" == "on" ]]; then
+        address="${address}, $(derive_ipv6_server_addr "$SRV_IPV6_SUBNET")"
+    fi
+
+    gen_shared_params
+    gen_sender_params
+
+    local postup postdown
+    postup=$(build_postup     "$nic" "$SRV_MTU" "$SRV_ISOLATION" "$SRV_IPV6")
+    postdown=$(build_postdown "$nic" "$SRV_MTU" "$SRV_ISOLATION" "$SRV_IPV6")
+
+    local privkey
+    privkey=$(tr -d '[:space:]' < "$AWG_DIR/server_private.key")
+
+    render_server_conf "$SERVER_CONF" "$privkey" "$address" \
+        "$SRV_PORT" "$SRV_MTU" "$postup" "$postdown" "$peers_src"
+
+    enable_forwarding "$SRV_IPV6" /etc/sysctl.d/99-awg3.conf \
+        || log_warn "форвардинг не настроен"
+
+    ROLLBACK_ACTIVE=0
+    trap - EXIT
+
+    if [[ "$DO_APPLY" -eq 1 ]]; then
+        systemctl enable --now "awg-quick@${AWG_IFACE}" 2>/dev/null \
+            || log_warn "сервис не запустился, смотрите: systemctl status awg-quick@${AWG_IFACE}"
+    fi
+
+    log_ok "сервер AWG 3.0 создан: $SERVER_CONF"
+    log "  порт: ${SRV_PORT}/udp, подсеть: ${SRV_SUBNET}, MTU: ${SRV_MTU}"
+    log "  изоляция клиентов: ${SRV_ISOLATION}, IPv6: ${SRV_IPV6}"
+    log "  добавить клиента: $0 add ИМЯ"
+}
+
+# Ловушка висит на EXIT, а не на ERR: die() выходит через exit, и ERR на нём
+# не срабатывает.
+_rollback_server_init() {
+    local rc=$?
+    if [[ "${ROLLBACK_ACTIVE:-0}" -ne 1 ]]; then return 0; fi
+    ROLLBACK_ACTIVE=0
+    log_err "сбой при создании сервера — откатываю"
+    rm -f "$AWG_DIR/server_private.key" "$AWG_DIR/server_public.key" 2>/dev/null || true
+    if [[ -n "${ROLLBACK_SERVER_BAK:-}" && -f "$ROLLBACK_SERVER_BAK" ]]; then
+        if cp -p "$ROLLBACK_SERVER_BAK" "$SERVER_CONF"; then
+            log_ok "прежний конфиг восстановлен"
+        fi
+    else
+        rm -f "$SERVER_CONF" 2>/dev/null || true
+    fi
+    if [[ "$rc" -eq 0 ]]; then rc=1; fi
+    exit "$rc"
 }
 
 # ── Команда: add ────────────────────────────────────────────────────────────
@@ -1681,6 +1806,7 @@ awg3.sh ${SCRIPT_VERSION} — AmneziaWG ${AWG_PROTOCOL}: клиенты и па�
     backup [--prune N]    архив конфигов и ключей в ~/awg/backups
     migrate               разложить клиентов из старой плоской схемы по каталогам
     gen                   вывести готовый набор параметров AWG 3.0
+    server-init           создать сервер AWG 3.0 с нуля
     server-upgrade        сгенерировать новые общие параметры для сервера
 
 ОПЦИИ
@@ -1696,6 +1822,14 @@ awg3.sh ${SCRIPT_VERSION} — AmneziaWG ${AWG_PROTOCOL}: клиенты и па�
         --no-apply        не применять изменения к запущенному интерфейсу
         --prune N         (backup) оставить N последних архивов, остальные
                           удалить — со списком и подтверждением
+        --awg-port N      (server-init) UDP-порт сервера   (по умолч.: случайный)
+        --subnet CIDR     (server-init) подсеть туннеля    (по умолч.: ${SRV_SUBNET})
+        --isolation on|off
+                          (server-init) изоляция клиентов  (по умолч.: ${SRV_ISOLATION})
+        --ipv6 on|off     (server-init) IPv6 в туннеле     (по умолч.: ${SRV_IPV6})
+        --ipv6-subnet CIDR
+                          (server-init) подсеть IPv6       (по умолч.: ${SRV_IPV6_SUBNET})
+        --force           (server-init) пересоздать сервер, перенеся пиров
     -y, --yes             не задавать вопросов
     -h, --help            эта справка
 
@@ -1721,7 +1855,7 @@ main() {
     local cmd="$1"; shift
     case "$cmd" in
         -h|--help|help) usage; exit 0 ;;
-        add|remove|list|names|stats|show|restart|backup|gen|migrate|server-upgrade) ;;
+        add|remove|list|names|stats|show|restart|backup|gen|migrate|server-upgrade|server-init) ;;
         *) die "неизвестная команда: ${cmd}  (см. --help)" ;;
     esac
 
@@ -1738,6 +1872,12 @@ main() {
             --no-qr)        MAKE_QR=0; shift ;;
             --no-apply)     DO_APPLY=0; shift ;;
             --prune)        PRUNE_KEEP="${2:-}"; shift 2 ;;
+            --awg-port)     SRV_PORT="${2:-}"; shift 2 ;;
+            --subnet)       SRV_SUBNET="${2:-}"; shift 2 ;;
+            --isolation)    SRV_ISOLATION="${2:-}"; shift 2 ;;
+            --ipv6)         SRV_IPV6="${2:-}"; shift 2 ;;
+            --ipv6-subnet)  SRV_IPV6_SUBNET="${2:-}"; shift 2 ;;
+            --force)        SRV_FORCE=1; shift ;;
             -y|--yes)       ASSUME_YES=1; shift ;;
             -h|--help)      usage; exit 0 ;;
             -*)             die "неизвестная опция: $1  (см. --help)" ;;
@@ -1752,6 +1892,14 @@ main() {
     case "$INTENSITY" in
         low|medium|high) ;;
         *) die "неизвестная интенсивность: ${INTENSITY}  (low, medium, high)" ;;
+    esac
+    case "$SRV_ISOLATION" in
+        on|off) ;;
+        *) die "--isolation ожидает on|off: $SRV_ISOLATION" ;;
+    esac
+    case "$SRV_IPV6" in
+        on|off) ;;
+        *) die "--ipv6 ожидает on|off: $SRV_IPV6" ;;
     esac
     if [[ -n "$PRUNE_KEEP" ]]; then
         [[ "$PRUNE_KEEP" =~ ^[0-9]+$ ]] && (( PRUNE_KEEP >= 1 )) \
@@ -1780,6 +1928,7 @@ main() {
         gen)            cmd_gen ;;
         migrate)        cmd_migrate ;;
         server-upgrade) cmd_server_upgrade ;;
+        server-init)    cmd_server_init ;;
     esac
 }
 
