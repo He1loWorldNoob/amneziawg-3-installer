@@ -1,27 +1,30 @@
 #!/usr/bin/env bash
 #
-# awg3.sh — AmneziaWG 3.0: создание клиентов и перевод конфигов на 3.0.
+# awg3.sh — AmneziaWG 3.0: сервер с нуля, клиенты, перевод конфигов на 3.0.
 #
-# Объединяет два прежних скрипта в один самодостаточный файл:
-#   * создание клиента (ключи, свободный IP, [Peer] в awg0.conf, apply, QR)
-#     — раньше manage_amneziawg.sh + awg_common.sh;
-#   * генерацию параметров обфускации AWG 3.0 — раньше awg-gen.sh.
+# Самодостаточный файл, без внешних библиотек:
+#   * создание сервера сразу в 3.0 (ключи, NAT, обфускация, awg0.conf);
+#   * создание клиента (ключи, свободный IP, [Peer] в awg0.conf, apply, QR);
+#   * генерация параметров обфускации AWG 3.0.
 #
-# Зависимостей от awg_common.sh / manage_amneziawg.sh нет. Каждый клиент
-# держит свои файлы в собственном каталоге ~/awg/ИМЯ/ — конфиг, QR и пару
-# ключей рядом, чтобы отдать клиента целиком одной папкой.
+# Каждый клиент держит свои файлы в собственном каталоге ~/awg/ИМЯ/ — конфиг,
+# QR и пару ключей рядом, чтобы отдать клиента целиком одной папкой.
 #
+#   ./awg3.sh server-init            # поднять сервер AWG 3.0 с нуля
 #   ./awg3.sh add ivan2              # новый клиент сразу в AWG 3.0
-#   ./awg3.sh list                   # кто на 2.0, кто на 3.0
+#   ./awg3.sh list                   # клиенты и фактическое состояние сервера
 #   ./awg3.sh migrate                # разложить старых клиентов по каталогам
 #   ./awg3.sh gen                    # просто выдать набор параметров
-#   ./awg3.sh server-upgrade         # перевести сам сервер на 3.0
+#   ./awg3.sh server-upgrade         # перевести существующий 2.0-сервер на 3.0
 #
-# Общие параметры (S1-S4, H1-H4, HeaderProtectionKey) всегда читаются из
-# awg0.conf — сервер является источником истины, клиент обязан их повторить.
-# Остальное (Jc, Jmin, Jmax, I1-I5, ContentPaddingAddition, таймеры) —
-# sender-side, генерируется для каждого клиента заново: одинаковые наборы у
-# всех устройств сами по себе являются отпечатком.
+# ЕДИНСТВЕННЫЙ источник истины — /etc/amnezia/amneziawg/awg0.conf. Отдельного
+# файла настроек нет: порт, подсеть, MTU, изоляция клиентов и IPv6 читаются из
+# самого конфига, поэтому расходиться с реальностью нечему.
+#
+# Общие параметры (S1-S4, H1-H4, HeaderProtectionKey) клиент обязан повторить
+# за сервером. Остальное (Jc, Jmin, Jmax, I1-I5, ContentPaddingAddition,
+# таймеры) — sender-side, генерируется для каждого клиента заново: одинаковые
+# наборы у всех устройств сами по себе являются отпечатком.
 #
 # Лицензия: MIT.
 
@@ -474,6 +477,24 @@ server_is_awg3() {
     [[ -n "${S_HPK:-}" ]]
 }
 
+# Фактическое состояние сервера читается из PostUp, а не из отдельного файла
+# настроек: конфиг — единственный источник истины, и расходиться с ним нечему.
+server_isolation_state() {
+    if grep -qE 'FORWARD -i %i -o %i -j DROP' "$SERVER_CONF" 2>/dev/null; then
+        printf 'on'
+    else
+        printf 'off'
+    fi
+}
+
+server_ipv6_state() {
+    if grep -q 'ip6tables' "$SERVER_CONF" 2>/dev/null; then
+        printf 'on'
+    else
+        printf 'off'
+    fi
+}
+
 require_server_awg3() {
     if server_is_awg3; then return 0; fi
     log_err "сервер ещё не переведён на AWG 3.0: в $SERVER_CONF нет HeaderProtectionKey."
@@ -688,20 +709,14 @@ build_postdown() {
 
 # ── Endpoint ────────────────────────────────────────────────────────────────
 #
-# Порядок: --endpoint > AWG_ENDPOINT из awgsetup_cfg.init > Endpoint уже
-# существующего клиента > внешний IP.
+# Порядок: --endpoint > Endpoint уже существующего клиента > внешний IP.
+#
+# Отдельного файла настроек больше нет — источник истины только awg0.conf.
 
 resolve_endpoint() {
     if [[ -n "$ENDPOINT_OVERRIDE" ]]; then
         echo "${ENDPOINT_OVERRIDE%%:*}"
         return 0
-    fi
-
-    local cfg="$AWG_DIR/awgsetup_cfg.init"
-    if [[ -r "$cfg" ]]; then
-        local ep
-        ep=$(grep -oP "^export AWG_ENDPOINT='\K[^']*" "$cfg" 2>/dev/null || true)
-        if [[ -n "$ep" ]]; then echo "$ep"; return 0; fi
     fi
 
     local f ep url name
@@ -1303,6 +1318,10 @@ cmd_list() {
     else
         printf 'Сервер: AWG 2.0 — HeaderProtectionKey отсутствует\n'
     fi
+    printf '  порт: %s/udp, подсеть: %s, MTU: %s\n' \
+        "${S_PORT:-?}" "${S_ADDR:-?}" "${S_MTU:-?}"
+    printf '  изоляция клиентов: %s, IPv6: %s\n' \
+        "$(server_isolation_state)" "$(server_ipv6_state)"
 }
 
 # ── Команда: migrate ────────────────────────────────────────────────────────
@@ -1610,7 +1629,7 @@ cmd_restart() {
 # ── Команда: backup ─────────────────────────────────────────────────────────
 #
 # Архив кладётся в ~/awg/backups и содержит серверный конфиг, каталоги
-# клиентов, ключи сервера и awgsetup_cfg.init. Старые архивы НЕ удаляются
+# клиентов и ключи сервера. Старые архивы НЕ удаляются
 # сами: чистка — только явным --prune N, и с подтверждением.
 
 cmd_backup() {
@@ -1630,7 +1649,7 @@ cmd_backup() {
 
     if [[ -f "$SERVER_CONF" ]]; then cp -a "$SERVER_CONF" "$staging/server/"; fi
     local f
-    for f in "$AWG_DIR/awgsetup_cfg.init" "$AWG_DIR/server_private.key" "$AWG_DIR/server_public.key"; do
+    for f in "$AWG_DIR/server_private.key" "$AWG_DIR/server_public.key"; do
         if [[ -f "$f" ]]; then cp -a "$f" "$staging/server/"; fi
     done
 
