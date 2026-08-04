@@ -534,6 +534,76 @@ get_client_ipv6() {
     echo "${prefix}::${suffix}"
 }
 
+# ── Валидация параметров сервера ────────────────────────────────────────────
+
+# Десятичный порт 1..65535.
+#
+# 10# обязательно: без него "08" трактуется как битое восьмеричное число и
+# роняет арифметику под set -e.
+validate_awg_port() {
+    local p="${1:-}"
+    [[ "$p" =~ ^[0-9]+$ ]] || { log_err "порт не число: '$p'"; return 1; }
+    local n=$((10#$p))
+    (( n >= 1 && n <= 65535 )) || { log_err "порт вне диапазона 1..65535: $p"; return 1; }
+    return 0
+}
+
+# Адрес ХОСТА с префиксом 8..30.
+#
+# Именно хоста: в awg0.conf это Address самого сервера, и адрес сети или
+# broadcast там означал бы неработающий интерфейс.
+validate_subnet() {
+    local cidr="${1:-}" ip prefix o
+    [[ "$cidr" == */* ]] || { log_err "подсеть без префикса: '$cidr'"; return 1; }
+    ip="${cidr%%/*}"; prefix="${cidr##*/}"
+
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+        || { log_err "не IPv4-адрес: '$ip'"; return 1; }
+
+    local IFS='.'
+    for o in $ip; do
+        (( 10#$o <= 255 )) || { log_err "октет больше 255 в '$ip'"; return 1; }
+    done
+    unset IFS
+
+    [[ "$prefix" =~ ^[0-9]+$ ]] && (( 10#$prefix >= 8 && 10#$prefix <= 30 )) \
+        || { log_err "префикс вне диапазона 8..30: '$prefix'"; return 1; }
+
+    local net_int bcast_int ip_int
+    read -r net_int bcast_int < <(_cidr_bounds "$cidr") \
+        || { log_err "не разобрана подсеть '$cidr'"; return 1; }
+    ip_int=$(_ipv4_to_int "$ip")
+    (( ip_int != net_int )) \
+        || { log_err "'$ip' — адрес сети, нужен адрес хоста"; return 1; }
+    (( ip_int != bcast_int )) \
+        || { log_err "'$ip' — broadcast, нужен адрес хоста"; return 1; }
+    return 0
+}
+
+validate_mtu() {
+    local m="${1:-}"
+    [[ "$m" =~ ^[0-9]+$ ]] || { log_err "MTU не число: '$m'"; return 1; }
+    (( 10#$m >= 576 && 10#$m <= 9100 )) \
+        || { log_err "MTU вне диапазона 576..9100: $m"; return 1; }
+    return 0
+}
+
+# UDP-порт свободен? Отсутствие ss означает «проверить нечем» — не блокируем.
+port_is_free() {
+    local p="$1"
+    command -v ss >/dev/null 2>&1 || return 0
+    ! ss -Hulnp 2>/dev/null | awk '{print $5}' | grep -qE "[:.]${p}\$"
+}
+
+# Интерфейс, через который сервер выходит наружу — цель MASQUERADE.
+get_main_nic() {
+    local nic
+    nic=$(ip route get 1.1.1.1 2>/dev/null \
+          | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+    [[ -n "$nic" ]] || return 1
+    printf '%s' "$nic"
+}
+
 # ── Endpoint ────────────────────────────────────────────────────────────────
 #
 # Порядок: --endpoint > AWG_ENDPOINT из awgsetup_cfg.init > Endpoint уже
