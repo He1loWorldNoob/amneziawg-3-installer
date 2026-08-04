@@ -604,6 +604,78 @@ get_main_nic() {
     printf '%s' "$nic"
 }
 
+# ── PostUp / PostDown ───────────────────────────────────────────────────────
+#
+# Правила перенесены из render_server_config апстрима (bivlked v5.23.0) без
+# изменения семантики. %i раскрывается awg-quick в имя интерфейса.
+#
+# TCPMSS-clamping обязателен: путь до клиента уже съеден заголовками туннеля,
+# и без правки MSS TCP-сессии зависают на больших пакетах там, где PMTUD
+# упирается в чёрную дыру — та самая жалоба «ping идёт, а сайт не грузится».
+
+# build_postup NIC MTU ISOLATION IPV6   (ISOLATION/IPV6: on|off)
+build_postup() {
+    local nic="$1" mtu="$2" isolation="$3" ipv6="$4"
+    local mss4=$(( mtu - 40 )) mss6=$(( mtu - 60 ))
+    local r
+
+    r="iptables -I FORWARD -i %i -j ACCEPT"
+    r="${r}; iptables -t nat -A POSTROUTING -o ${nic} -j MASQUERADE"
+    r="${r}; iptables -t mangle -A FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss ${mss4}"
+    r="${r}; iptables -t mangle -A FORWARD -i %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss ${mss4}"
+
+    if [[ "$isolation" == "on" ]]; then
+        # Цикл, а не одиночное -D: прерванный прошлый запуск мог оставить
+        # несколько одинаковых правил, снять нужно все.
+        r="${r}; while iptables -D FORWARD -i %i -o %i -j DROP 2>/dev/null; do :; done"
+        r="${r}; iptables -I FORWARD -i %i -o %i -j DROP"
+    fi
+
+    if [[ "$ipv6" == "on" ]]; then
+        r="${r}; ip6tables -I FORWARD -i %i -j ACCEPT"
+        r="${r}; ip6tables -t nat -A POSTROUTING -o ${nic} -j MASQUERADE"
+        r="${r}; ip6tables -t mangle -A FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss ${mss6}"
+        r="${r}; ip6tables -t mangle -A FORWARD -i %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss ${mss6}"
+        if [[ "$isolation" == "on" ]]; then
+            r="${r}; while ip6tables -D FORWARD -i %i -o %i -j DROP 2>/dev/null; do :; done"
+            r="${r}; ip6tables -I FORWARD -i %i -o %i -j DROP"
+        fi
+    fi
+
+    printf '%s' "$r"
+}
+
+# build_postdown NIC MTU ISOLATION IPV6 — зеркало build_postup.
+#
+# DROP снимается с `|| true`: интерфейс может опускаться после того, как
+# правило уже убрали вручную, и падать на этом PostDown не должен.
+build_postdown() {
+    local nic="$1" mtu="$2" isolation="$3" ipv6="$4"
+    local mss4=$(( mtu - 40 )) mss6=$(( mtu - 60 ))
+    local r
+
+    r="iptables -D FORWARD -i %i -j ACCEPT"
+    r="${r}; iptables -t nat -D POSTROUTING -o ${nic} -j MASQUERADE"
+    r="${r}; iptables -t mangle -D FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss ${mss4}"
+    r="${r}; iptables -t mangle -D FORWARD -i %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss ${mss4}"
+
+    if [[ "$isolation" == "on" ]]; then
+        r="${r}; iptables -D FORWARD -i %i -o %i -j DROP 2>/dev/null || true"
+    fi
+
+    if [[ "$ipv6" == "on" ]]; then
+        r="${r}; ip6tables -D FORWARD -i %i -j ACCEPT"
+        r="${r}; ip6tables -t nat -D POSTROUTING -o ${nic} -j MASQUERADE"
+        r="${r}; ip6tables -t mangle -D FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss ${mss6}"
+        r="${r}; ip6tables -t mangle -D FORWARD -i %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss ${mss6}"
+        if [[ "$isolation" == "on" ]]; then
+            r="${r}; ip6tables -D FORWARD -i %i -o %i -j DROP 2>/dev/null || true"
+        fi
+    fi
+
+    printf '%s' "$r"
+}
+
 # ── Endpoint ────────────────────────────────────────────────────────────────
 #
 # Порядок: --endpoint > AWG_ENDPOINT из awgsetup_cfg.init > Endpoint уже
