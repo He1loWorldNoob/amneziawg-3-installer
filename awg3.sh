@@ -851,6 +851,97 @@ render_client_conf() {
     _fix_owner "$out"
 }
 
+# ── Рендер серверного конфига ───────────────────────────────────────────────
+
+generate_server_keys() {
+    local priv pub
+    priv=$(awg genkey) || die "не сгенерирован приватный ключ сервера"
+    pub=$(printf '%s' "$priv" | awg pubkey) || die "не выведен публичный ключ сервера"
+
+    ( umask 077; printf '%s\n' "$priv" > "$AWG_DIR/server_private.key" ) \
+        || die "не записан server_private.key"
+    ( umask 077; printf '%s\n' "$pub" > "$AWG_DIR/server_public.key" ) \
+        || die "не записан server_public.key"
+    chmod 600 "$AWG_DIR/server_private.key" "$AWG_DIR/server_public.key"
+    _fix_owner "$AWG_DIR/server_private.key"
+    _fix_owner "$AWG_DIR/server_public.key"
+    log_ok "ключи сервера созданы"
+}
+
+# Адрес сервера в IPv6-подсети — первый адрес, ::1.
+derive_ipv6_server_addr() {
+    local subnet="$1" prefix len
+    prefix="${subnet%%/*}"; len="${subnet##*/}"
+    prefix="${prefix%::}"
+    printf '%s::1/%s' "$prefix" "$len"
+}
+
+# Все блоки [Peer] из файла: от первого до конца либо до следующего
+# [Interface], который в норме встречается только в начале.
+extract_peers() {
+    local f="$1"
+    [[ -f "$f" ]] || return 0
+    awk '
+        /^[[:space:]]*\[Peer\]/      { in_peer = 1 }
+        /^[[:space:]]*\[Interface\]/ { in_peer = 0 }
+        in_peer { print }
+    ' "$f"
+}
+
+# render_server_conf OUT PRIVKEY ADDRESS PORT MTU POSTUP POSTDOWN [PEERS_SRC]
+#
+# Общие параметры берутся из G_S*/G_H*/G_HPK, отправительские — из G_Jc,
+# G_Jmin, G_Jmax, G_I1..G_I5, G_CPA, поэтому вызывающая сторона обязана
+# заранее вызвать gen_shared_params и gen_sender_params.
+#
+# Пиры дописываются во ВРЕМЕННЫЙ файл до mv: иначе сбой между записью конфига
+# и добавлением пиров оставил бы живой сервер без единого клиента.
+render_server_conf() {
+    local out="$1" privkey="$2" address="$3" port="$4" mtu="$5"
+    local postup="$6" postdown="$7" peers_src="${8:-}"
+
+    local dir tmp
+    dir=$(dirname "$out")
+    mkdir -p "$dir" || die "не создан каталог $dir"
+    chmod 700 "$dir" 2>/dev/null || true
+
+    tmp=$(mktemp "${out}.tmp.XXXXXX") || die "mktemp не сработал"
+    chmod 600 "$tmp"
+
+    {
+        printf '[Interface]\n'
+        printf 'PrivateKey = %s\n' "$privkey"
+        printf 'Address = %s\n' "$address"
+        printf 'ListenPort = %s\n' "$port"
+        printf 'MTU = %s\n' "$mtu"
+        printf 'PostUp = %s\n' "$postup"
+        printf 'PostDown = %s\n' "$postdown"
+        printf '\n'
+        printf 'S1 = %s\nS2 = %s\nS3 = %s\nS4 = %s\n' "$G_S1" "$G_S2" "$G_S3" "$G_S4"
+        printf 'H1 = %s\nH2 = %s\nH3 = %s\nH4 = %s\n' "$G_H1" "$G_H2" "$G_H3" "$G_H4"
+        printf 'HeaderProtectionKey = %s\n' "$G_HPK"
+        printf 'ContentPaddingAddition = %s\n' "$G_CPA"
+        printf 'Jc = %s\nJmin = %s\nJmax = %s\n' "$G_Jc" "$G_Jmin" "$G_Jmax"
+        local n var
+        for n in 1 2 3 4 5; do
+            var="G_I${n}"
+            if [[ -n "${!var}" ]]; then printf 'I%s = %s\n' "$n" "${!var}"; fi
+        done
+    } > "$tmp"
+
+    if [[ -n "$peers_src" && -f "$peers_src" ]]; then
+        local peers
+        peers=$(extract_peers "$peers_src")
+        if [[ -n "$peers" ]]; then
+            printf '\n%s\n' "$peers" >> "$tmp"
+        fi
+    fi
+
+    mv -f "$tmp" "$out" || { rm -f "$tmp"; die "не записан $out"; }
+    chmod 600 "$out"
+    _fix_owner "$out"
+}
+
 # generate_qr <имя> <путь к conf> — PNG кладётся рядом с конфигом.
 generate_qr() {
     local name="$1" conf="$2"
