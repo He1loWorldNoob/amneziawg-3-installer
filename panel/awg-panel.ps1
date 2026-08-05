@@ -494,11 +494,35 @@ function Save-Profiles {
 
 # Ключ создаётся один на все серверы: он нужен, чтобы не хранить пароль, а не
 # чтобы разграничивать доступ между ними.
+# Запуск ssh-keygen со строкой аргументов целиком.
+#
+# Пустой аргумент — а «-N ""» означает «ключ без парольной фразы» — Windows
+# PowerShell 5.1 по дороге ВЫБРАСЫВАЕТ: ssh-keygen получает «-N -C», считает
+# комментарий парольной фразой, упирается в лишний аргумент и падает с «Too
+# many arguments», не создав ключа. Под pwsh 7 тот же код работает, поэтому
+# поломка видна только на машинах со встроенной PowerShell — то есть у всех,
+# кто не ставил семёрку.
+#
+# Start-Process принимает аргументы одной строкой и ничего из неё не
+# выбрасывает. Вывод отправляем в файл: -y печатает открытый ключ в stdout, и
+# без перенаправления он высыпался бы в меню панели.
+function Invoke-Keygen {
+    param([string] $Exe, [string] $ArgLine)
+
+    $log = Join-Path ([System.IO.Path]::GetTempPath()) ("awg-keygen-{0}.log" -f [guid]::NewGuid())
+    try {
+        $proc = Start-Process -FilePath $Exe -ArgumentList $ArgLine -NoNewWindow -Wait -PassThru `
+                              -RedirectStandardOutput $log -RedirectStandardError "$log.err"
+        if ($proc) { return $proc.ExitCode }
+        return 127
+    } catch {
+        return 127
+    } finally {
+        Remove-Item $log, "$log.err" -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Ensure-PanelKey {
-    # ssh-keygen тоже пишет в stderr в штатной работе — см. Invoke-Native.
-    # Здесь запускаем его напрямую, а не через неё: пустой аргумент («-N ""» —
-    # ключ без парольной фразы) PowerShell по дороге в массиве теряет, а
-    # потерянный -N превратил бы запуск в молчаливое ожидание ввода фразы.
     $ErrorActionPreference = 'Continue'
 
     $keygen = (Get-Command ssh-keygen -ErrorAction SilentlyContinue).Source
@@ -510,24 +534,21 @@ function Ensure-PanelKey {
     if (Test-Path $KeyPath) { return $true }
 
     New-Item -ItemType Directory -Force -Path $PanelDir | Out-Null
-    # Именно "" (двойные), а не '""': одинарные кавычки в PowerShell дают
-    # буквальные два символа кавычки, и они становятся ПАРОЛЬНОЙ ФРАЗОЙ.
-    # Ключ тогда создаётся зашифрованным, и ssh при каждом действии панели
-    # спрашивал бы фразу — а под BatchMode просто отказывал бы во входе.
-    # Комментарий с именем машины: он же служит меткой при повторной
-    # настройке — заменяем запись именно этого компьютера, не трогая ключи
-    # других, с которых вы тоже могли подключаться.
-    & $keygen -q -t ed25519 -f $KeyPath -N "" -C "awg-panel@$env:COMPUTERNAME" 2>&1 | Out-Null
+    # Кавычки вокруг путей: каталог панели лежит в домашнем, а он бывает и
+    # «C:\Users\Иван Петров». Комментарий с именем машины служит меткой при
+    # повторной настройке — заменяем запись именно этого компьютера, не трогая
+    # ключи других, с которых вы тоже могли подключаться.
+    $rc = Invoke-Keygen $keygen ('-q -t ed25519 -f "{0}" -N "" -C "awg-panel@{1}"' -f $KeyPath, $env:COMPUTERNAME)
 
-    if (-not (Test-Path $KeyPath)) {
+    if ($rc -ne 0 -or -not (Test-Path $KeyPath)) {
         Write-Err 'Не удалось создать ключ.'
+        Write-Dim "Создайте вручную: ssh-keygen -t ed25519 -f `"$KeyPath`" -N `"`""
         return $false
     }
 
     # Проверяем, что ключ действительно без фразы: иначе автовход молча не
     # заработает, а ошибка будет выглядеть как неверный пароль.
-    & $keygen -y -P '' -f $KeyPath 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) {
+    if ((Invoke-Keygen $keygen ('-y -P "" -f "{0}"' -f $KeyPath)) -ne 0) {
         Remove-Item $KeyPath, "$KeyPath.pub" -Force -ErrorAction SilentlyContinue
         Write-Err 'Ключ создался с парольной фразой — так автовход не заработает.'
         Write-Dim "Создайте вручную: ssh-keygen -t ed25519 -f `"$KeyPath`" -N `"`""
