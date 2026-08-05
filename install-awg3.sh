@@ -1465,9 +1465,11 @@ secure_files() {
     find "$AWG_DIR" -name "*.conf" -type f -exec chmod 600 {} \; 2>/dev/null
     find "$AWG_DIR" -name "*.key" -type f -exec chmod 600 {} \; 2>/dev/null
     find "$AWG_DIR" -name "*.png" -type f -exec chmod 600 {} \; 2>/dev/null
+    # Ссылка vpn:// несёт приватный ключ клиента наравне с конфигом и QR.
+    find "$AWG_DIR" -name "*.vpnuri" -type f -exec chmod 600 {} \; 2>/dev/null
     find "$AWG_DIR" -name "*.private" -type f -exec chmod 600 {} \; 2>/dev/null
     find "$AWG_DIR" -name "*.public" -type f -exec chmod 600 {} \; 2>/dev/null
-    # Каталоги клиентов: у каждого свой, внутри ключи и QR.
+    # Каталоги клиентов: у каждого свой, внутри ключи, QR и ссылка.
     find "$AWG_DIR" -mindepth 1 -maxdepth 1 -type d -exec chmod 700 {} \; 2>/dev/null
     [[ -f "$LOG_FILE" ]] && chmod 640 "$LOG_FILE"
     [[ -f "$AWG_DIR/awg3.sh" ]] && chmod 700 "$AWG_DIR/awg3.sh"
@@ -2956,7 +2958,8 @@ step99_finish() {
     log "AmneziaWG 3.0 развёрнут."
     log " "
     log "КЛИЕНТЫ:"
-    log "  каждый живёт в своём каталоге ${AWG_DIR}/ИМЯ/ — conf, QR и пара ключей"
+    log "  каждый живёт в своём каталоге ${AWG_DIR}/ИМЯ/ — conf, QR, ссылка vpn://"
+    log "  и пара ключей"
     log "  добавить:  sudo awg3 add ИМЯ"
     log "  забрать:   scp -r ПОЛЬЗОВАТЕЛЬ@<СЕРВЕР>:${AWG_DIR}/ИМЯ ./"
     log " "

@@ -4,14 +4,16 @@
 #
 # Самодостаточный файл, без внешних библиотек:
 #   * создание сервера сразу в 3.0 (ключи, NAT, обфускация, awg0.conf);
-#   * создание клиента (ключи, свободный IP, [Peer] в awg0.conf, apply, QR);
+#   * создание клиента (ключи, свободный IP, [Peer] в awg0.conf, apply, QR,
+#     ссылка vpn:// для приложения Amnezia);
 #   * генерация параметров обфускации AWG 3.0.
 #
 # Каждый клиент держит свои файлы в собственном каталоге ~/awg/ИМЯ/ — конфиг,
-# QR и пару ключей рядом, чтобы отдать клиента целиком одной папкой.
+# QR, ссылку и пару ключей рядом, чтобы отдать клиента целиком одной папкой.
 #
 #   ./awg3.sh server-init            # поднять сервер AWG 3.0 с нуля
 #   ./awg3.sh add ivan2              # новый клиент сразу в AWG 3.0
+#   ./awg3.sh link ivan2             # пересобрать ссылку по готовому конфигу
 #   ./awg3.sh list                   # клиенты и фактическое состояние сервера
 #   ./awg3.sh migrate                # разложить старых клиентов по каталогам
 #   ./awg3.sh gen                    # просто выдать набор параметров
@@ -55,6 +57,7 @@ AWG_IFACE="${AWG3_IFACE:-awg0}"
 #
 #   ~/awg/ИМЯ/ИМЯ.conf     ~/awg/ИМЯ/ИМЯ.private
 #   ~/awg/ИМЯ/ИМЯ.png      ~/awg/ИМЯ/ИМЯ.public
+#   ~/awg/ИМЯ/ИМЯ.vpnuri
 #
 # Прежняя плоская раскладка (~/awg/ИМЯ.conf + ~/awg/keys/ИМЯ.private) ещё
 # читается, чтобы list и remove работали до переноса; `awg3.sh migrate`
@@ -90,6 +93,7 @@ CLIENT_ALLOWED_IPS="0.0.0.0/0, ::/0"
 CLIENT_ALLOWED_IPS_EXPLICIT=0
 MTU_OVERRIDE=""
 MAKE_QR=1
+MAKE_LINK=1
 DO_APPLY=1
 ASSUME_YES=0
 PRUNE_KEEP=""
@@ -1036,6 +1040,255 @@ generate_qr() {
     fi
 }
 
+# ── Ссылка vpn:// для приложения Amnezia ────────────────────────────────────
+#
+# Формат ровно тот, который приложение AmneziaVPN принимает при импорте
+# ссылки:
+#
+#   vpn:// + base64url( BE32(длина JSON) || zlib(JSON) )
+#
+# Четыре байта длины впереди — это формат QByteArray::qCompress из Qt, на
+# котором построен клиент; без них qUncompress не разожмёт поток.
+#
+# Внутри JSON лежит ВТОРОЙ JSON строкой в поле last_config, а тот несёт
+# целиком текст клиентского конфига в поле config. Двойная вложенность не
+# наша выдумка — так устроен формат.
+#
+# Параметры, которых в структурированных полях формата нет
+# (HeaderProtectionKey, ContentPaddingAddition, таймеры 3.0), кладутся туда
+# же по именам ключей конфига: приложение, которое их не знает, лишние поля
+# проигнорирует, а полный текст конфига в любом случае едет в config.
+
+# Обрезка пробелов по краям — значения из конфига приходят с ними постоянно.
+_trim_ws() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+# Экранирование строки для JSON. Пяти символов достаточно: другого
+# управляющего в конфиге взяться неоткуда.
+_json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    s="${s//$'\n'/\\n}"
+    printf '%s' "$s"
+}
+
+# adler32 по stdin — хвост zlib-потока. Печатается восемью hex-цифрами.
+_adler32() {
+    od -An -v -tu1 | awk '
+        BEGIN { a = 1; b = 0 }
+        {
+            for (i = 1; i <= NF; i++) {
+                a = (a + $i) % 65521
+                b = (b + a) % 65521
+            }
+        }
+        # Двумя половинами: %x от 32-битного значения в mawk переполняется.
+        END { printf "%04x%04x", b, a }
+    '
+}
+
+# Четыре байта числа, старший вперёд.
+_be32() {
+    local n="$1"
+    printf '%b' "$(printf '\\x%02x\\x%02x\\x%02x\\x%02x' \
+        "$(( (n >> 24) & 255 ))" "$(( (n >> 16) & 255 ))" \
+        "$(( (n >> 8) & 255 ))"  "$(( n & 255 ))")"
+}
+
+# zlib-поток из файла в stdout.
+#
+# Отдельного упаковщика zlib в системе может не быть, зато gzip есть всегда,
+# а deflate внутри у них один и тот же — различаются только обёртки. С флагом
+# -n gzip не пишет в заголовок имя файла и время, поэтому заголовок ровно
+# 10 байт, а хвост (CRC32 + размер) — 8; остаётся заменить их на пару
+# 0x78 0x9c впереди и adler32 в конце.
+_zlib_compress() {
+    local src="$1" gz size head4 adler
+    gz="${src}.gz"
+    # Внутри сжатого — приватный ключ клиента, поэтому файл создаётся сразу
+    # закрытым: umask ставится в подоболочке вместе с самим перенаправлением.
+    ( umask 077; gzip -c -n -9 < "$src" > "$gz" ) || { rm -f "$gz"; return 1; }
+    size=$(wc -c < "$gz"); size=$(_trim_ws "$size")
+
+    head4=$(head -c 4 "$gz" | od -An -v -tx1 | tr -d ' \n')
+    # Заголовок обязан быть каноническим: 1f8b (магия), 08 (deflate), 00
+    # (флагов нет). Иначе смещения ниже уедут и получится мусор.
+    if [[ "$head4" != "1f8b0800" ]]; then
+        rm -f "$gz"
+        log_warn "неожиданный заголовок gzip ($head4)"
+        return 1
+    fi
+
+    adler=$(_adler32 < "$src")
+
+    printf '\x78\x9c'
+    tail -c +11 "$gz" | head -c "$(( size - 18 ))"
+    printf '%b' "\\x${adler:0:2}\\x${adler:2:2}\\x${adler:4:2}\\x${adler:6:2}"
+    rm -f "$gz"
+}
+
+# build_vpn_uri <конфиг> [описание] — печатает ссылку vpn:// в stdout.
+#
+# Описание — имя сервера в списке приложения; по умолчанию берётся хост из
+# Endpoint.
+build_vpn_uri() {
+    local conf="$1" desc="${2:-}"
+    [[ -f "$conf" ]] || { log_warn "конфиг не найден: $conf"; return 1; }
+
+    local dep
+    for dep in gzip base64 od head tail; do
+        command -v "$dep" >/dev/null 2>&1 \
+            || { log_warn "нет команды $dep — ссылка vpn:// не создана"; return 1; }
+    done
+
+    local priv pub psk addr dns mtu endpoint_raw aips keepalive
+    priv=$(_conf_value "$conf" PrivateKey interface)
+    addr=$(_conf_value "$conf" Address interface)
+    dns=$(_conf_value "$conf" DNS interface)
+    mtu=$(_conf_value "$conf" MTU interface)
+    pub=$(_conf_value "$conf" PublicKey peer)
+    psk=$(_conf_value "$conf" PresharedKey peer)
+    endpoint_raw=$(_conf_value "$conf" Endpoint peer)
+    aips=$(_conf_value "$conf" AllowedIPs peer)
+    keepalive=$(_conf_value "$conf" PersistentKeepalive peer)
+
+    [[ -n "$priv" ]] || { log_warn "в $conf нет PrivateKey"; return 1; }
+    [[ -n "$pub" ]]  || { log_warn "в $conf нет PublicKey сервера"; return 1; }
+    [[ -n "$endpoint_raw" ]] || { log_warn "в $conf нет Endpoint"; return 1; }
+
+    # Хост и порт. IPv6 приходит в скобках — [::1]:443, поэтому обрезать по
+    # последнему двоеточию нельзя.
+    local host port
+    if [[ "$endpoint_raw" == \[*\]:* ]]; then
+        host="${endpoint_raw%%]:*}"; host="${host#\[}"
+        port="${endpoint_raw##*]:}"
+    else
+        host="${endpoint_raw%:*}"
+        port="${endpoint_raw##*:}"
+    fi
+    # port уезжает в JSON единственным числом без кавычек: пустое или
+    # нечисловое значение сделало бы JSON синтаксически битым, и приложение
+    # молча откажется импортировать ссылку.
+    [[ "$port" =~ ^[0-9]+$ ]] || { log_warn "непонятный Endpoint '$endpoint_raw'"; return 1; }
+
+    local ip4="" ip6="" part
+    while IFS= read -r part; do
+        part=$(_trim_ws "$part")
+        [[ -n "$part" ]] || continue
+        part="${part%%/*}"
+        if [[ "$part" == *:* ]]; then ip6="${ip6:-$part}"; else ip4="${ip4:-$part}"; fi
+    done < <(printf '%s\n' "${addr//,/$'\n'}")
+
+    local dns1 dns2
+    dns1=$(_trim_ws "${dns%%,*}")
+    if [[ "$dns" == *,* ]]; then dns2=$(_trim_ws "${dns#*,}"); dns2="${dns2%%,*}"; else dns2="$dns1"; fi
+    dns1="${dns1:-1.1.1.1}"; dns2="${dns2:-$dns1}"
+    mtu="${mtu:-1280}"
+    keepalive="${keepalive:-33}"
+    desc="${desc:-$host}"
+
+    # AllowedIPs в формате уезжает массивом, а не строкой.
+    local aips_json="" first=1
+    while IFS= read -r part; do
+        part=$(_trim_ws "$part")
+        [[ -n "$part" ]] || continue
+        if [[ "$first" -eq 1 ]]; then first=0; else aips_json+=","; fi
+        aips_json+="\"$(_json_escape "$part")\""
+    done < <(printf '%s\n' "${aips//,/$'\n'}")
+    [[ -n "$aips_json" ]] || aips_json='"0.0.0.0/0"'
+
+    local inner="{" key val
+    for key in H1 H2 H3 H4 Jc Jmin Jmax S1 S2 S3 S4; do
+        val=$(_conf_value "$conf" "$key" interface)
+        inner+="\"${key}\":\"$(_json_escape "$val")\","
+    done
+    # I1-I5 в режиме роутера пустуют, а пустые поля приложение принимает за
+    # заданные — поэтому только непустые.
+    for key in I1 I2 I3 I4 I5; do
+        val=$(_conf_value "$conf" "$key" interface)
+        [[ -n "$val" ]] || continue
+        inner+="\"${key}\":\"$(_json_escape "$val")\","
+    done
+    for key in HeaderProtectionKey ContentPaddingAddition RekeyAfterTime \
+               RekeyTimeout RejectAfterTime KeepaliveTimeout MaxHandshakeAttempts; do
+        val=$(_conf_value "$conf" "$key" interface)
+        [[ -n "$val" ]] || continue
+        inner+="\"${key}\":\"$(_json_escape "$val")\","
+    done
+    inner+="\"allowed_ips\":[${aips_json}],"
+    inner+="\"client_ip\":\"$(_json_escape "$ip4")\","
+    inner+="\"client_ipv6\":\"$(_json_escape "$ip6")\","
+    inner+="\"client_priv_key\":\"$(_json_escape "$priv")\","
+    # Без psk_key импорт теряет PresharedKey, и рукопожатие не проходит —
+    # текста конфига в поле config для этого недостаточно.
+    if [[ -n "$psk" ]]; then inner+="\"psk_key\":\"$(_json_escape "$psk")\","; fi
+    inner+="\"config\":\"$(_json_escape "$(<"$conf")")\","
+    inner+="\"hostName\":\"$(_json_escape "$host")\",\"mtu\":\"$(_json_escape "$mtu")\","
+    inner+="\"persistent_keep_alive\":\"$(_json_escape "$keepalive")\",\"port\":${port},"
+    inner+="\"server_pub_key\":\"$(_json_escape "$pub")\"}"
+
+    local outer="{"
+    outer+='"containers":[{"awg":{"isThirdPartyConfig":true,'
+    outer+="\"last_config\":\"$(_json_escape "$inner")\","
+    outer+="\"port\":\"${port}\",\"protocol_version\":\"2\",\"transport_proto\":\"udp\"},"
+    outer+='"container":"amnezia-awg"}],'
+    outer+='"defaultContainer":"amnezia-awg",'
+    outer+="\"description\":\"$(_json_escape "$desc")\","
+    outer+="\"dns1\":\"$(_json_escape "$dns1")\",\"dns2\":\"$(_json_escape "$dns2")\","
+    outer+="\"hostName\":\"$(_json_escape "$host")\"}"
+
+    # Приватный ключ клиента идёт через файл рядом с конфигом (каталог 700),
+    # а не через /tmp, который читаем всем.
+    local tmp size b64
+    tmp=$(mktemp "${conf}.uri.XXXXXX") || { log_warn "mktemp не сработал"; return 1; }
+    chmod 600 "$tmp"
+    printf '%s' "$outer" > "$tmp" || { rm -f "$tmp" "${tmp}.gz"; return 1; }
+    size=$(wc -c < "$tmp"); size=$(_trim_ws "$size")
+
+    if ! b64=$({ _be32 "$size"; _zlib_compress "$tmp"; } | base64 | tr -d '\n' | tr '+/' '-_' | tr -d '='); then
+        rm -f "$tmp" "${tmp}.gz"
+        log_warn "не удалось собрать ссылку vpn://"
+        return 1
+    fi
+    rm -f "$tmp" "${tmp}.gz"
+    [[ -n "$b64" ]] || { log_warn "пустая ссылка vpn://"; return 1; }
+
+    printf 'vpn://%s\n' "$b64"
+}
+
+# generate_link <имя> <путь к conf> — файл со ссылкой рядом с конфигом.
+# Готовая ссылка остаётся в LINK_LAST, чтобы её можно было ещё и напечатать.
+generate_link() {
+    local name="$1" conf="$2"
+    LINK_LAST=""
+    [[ "$MAKE_LINK" -eq 1 ]] || return 0
+
+    local uri file="${conf%.conf}.vpnuri" tmp
+    if ! uri=$(build_vpn_uri "$conf"); then
+        log_warn "ссылка vpn:// для '$name' не создана"
+        return 1
+    fi
+
+    tmp=$(mktemp "${file}.tmp.XXXXXX") || { log_warn "mktemp не сработал"; return 1; }
+    chmod 600 "$tmp"
+    printf '%s\n' "$uri" > "$tmp" || { rm -f "$tmp"; return 1; }
+    if ! mv -f "$tmp" "$file"; then
+        rm -f "$tmp"
+        log_warn "не записана ссылка $file"
+        return 1
+    fi
+    _fix_owner "$file"
+    LINK_LAST="$uri"
+    log_ok "ссылка: $file"
+}
+
 # Публичный ключ сервера: из сохранённого файла, иначе выводится из приватного.
 server_public_key() {
     if [[ -r "$AWG_DIR/server_public.key" ]]; then
@@ -1311,11 +1564,15 @@ cmd_add() {
     exec {lock_fd}>&-
 
     generate_qr "$name" "$conf"
+    # Ссылка — приятное дополнение, а не условие успеха: клиент уже создан,
+    # применён и работоспособен с конфигом и QR даже без неё.
+    generate_link "$name" "$conf" || true
     apply_peers || true
 
     log_ok "клиент '$name' создан: ${client_ip}${client_ip6:+, $client_ip6}"
     log "  каталог: $cdir"
     log "  конфиг: $conf"
+    if [[ -f "${conf%.conf}.vpnuri" ]]; then log "  ссылка: ${conf%.conf}.vpnuri"; fi
     log "  профиль обфускации: AWG 3.0 / ${PROFILE} / ${INTENSITY}"
 }
 
@@ -1334,6 +1591,48 @@ _rollback_add() {
     fi
     if [[ "$rc" -eq 0 ]]; then rc=1; fi
     exit "$rc"
+}
+
+# ── Команда: link ───────────────────────────────────────────────────────────
+#
+# Пересобирает файл со ссылкой по уже существующему конфигу. Нужна тем, у
+# кого клиенты созданы прежними версиями скрипта, и после правки конфига
+# руками. Ключи и пир при этом не трогаются: ссылка — производная от конфига.
+
+cmd_link() {
+    local names=()
+    if [[ $# -gt 0 ]]; then
+        names=("$@")
+    else
+        mapfile -t names < <(list_client_names)
+        [[ "${#names[@]}" -gt 0 ]] || die "клиентов нет"
+    fi
+
+    # Команду вызвали явно, значит ссылка нужна вопреки --no-qr-подобным
+    # умолчаниям.
+    MAKE_LINK=1
+
+    local name conf ok=0 failed=0
+    for name in "${names[@]}"; do
+        validate_client_name "$name"
+        conf=$(client_conf_path "$name")
+        if [[ ! -f "$conf" ]]; then
+            log_err "'$name': конфиг не найден"
+            failed=$((failed + 1))
+            continue
+        fi
+        if generate_link "$name" "$conf"; then
+            ok=$((ok + 1))
+            # Одно имя — почти всегда «покажи мне ссылку»; списком же
+            # печатать ссылки бессмысленно, они по несколько килобайт.
+            if [[ "${#names[@]}" -eq 1 ]]; then printf '%s\n' "$LINK_LAST"; fi
+        else
+            failed=$((failed + 1))
+        fi
+    done
+
+    if [[ "${#names[@]}" -gt 1 ]]; then log "Готово: ссылок $ok, с ошибками $failed"; fi
+    [[ "$failed" -eq 0 ]]
 }
 
 # ── Чтение клиентского конфига ──────────────────────────────────────────────
@@ -1682,6 +1981,7 @@ cmd_remove() {
             rm -rf "${AWG_DIR:?}/${name:?}"
         fi
         rm -f "$AWG_DIR/${name}.conf" "$AWG_DIR/${name}.png" \
+              "$AWG_DIR/${name}.vpnuri" "$AWG_DIR/${name}.vpnuri.png" \
               "$AWG_DIR/${name}.conf".bak-* 2>/dev/null || true
         if [[ -f "$LEGACY_KEYS_DIR/${name}.private" ]]; then
             shred -u "$LEGACY_KEYS_DIR/${name}.private" 2>/dev/null || true
@@ -1940,6 +2240,9 @@ awg3.sh ${SCRIPT_VERSION} — AmneziaWG ${AWG_PROTOCOL}: клиенты и па�
 КОМАНДЫ
     add NAME              создать клиента сразу с параметрами AWG 3.0
     remove NAME...        удалить клиента: пир, файлы и ключи
+    link [NAME...]        пересобрать ссылку vpn:// по конфигу
+                          (без имён — всем клиентам; с одним именем ссылка
+                          ещё и печатается)
     list                  клиенты: адрес, связь, совместимость с сервером
     names                 только имена клиентов, по одному в строке (для скриптов)
     stats                 трафик и последняя активность по клиентам
@@ -1962,6 +2265,7 @@ awg3.sh ${SCRIPT_VERSION} — AmneziaWG ${AWG_PROTOCOL}: клиенты и па�
         --mtu N           MTU клиента            (по умолч.: из awg0.conf)
         --allowed-ips L   AllowedIPs клиента     (по умолч.: ${CLIENT_ALLOWED_IPS})
         --no-qr           не создавать PNG с QR-кодом
+        --no-link         не создавать файл со ссылкой vpn://
         --no-apply        не применять изменения к запущенному интерфейсу
         --prune N         (backup) оставить N последних архивов, остальные
                           удалить — со списком и подтверждением
@@ -1984,6 +2288,7 @@ awg3.sh ${SCRIPT_VERSION} — AmneziaWG ${AWG_PROTOCOL}: клиенты и па�
     Каждый клиент живёт в собственном каталоге:
         ${AWG_DIR}/ИМЯ/ИМЯ.conf
         ${AWG_DIR}/ИМЯ/ИМЯ.png
+        ${AWG_DIR}/ИМЯ/ИМЯ.vpnuri
         ${AWG_DIR}/ИМЯ/ИМЯ.private, ИМЯ.public
     Прежняя плоская раскладка ещё читается командами list и remove;
     'migrate' переносит её на новую схему.
@@ -1998,7 +2303,7 @@ main() {
     local cmd="$1"; shift
     case "$cmd" in
         -h|--help|help) usage; exit 0 ;;
-        add|remove|list|names|stats|show|restart|backup|gen|migrate|server-upgrade|server-init|set-endpoint) ;;
+        add|remove|link|list|names|stats|show|restart|backup|gen|migrate|server-upgrade|server-init|set-endpoint) ;;
         *) die "неизвестная команда: ${cmd}  (см. --help)" ;;
     esac
 
@@ -2013,6 +2318,7 @@ main() {
             --mtu)          MTU_OVERRIDE="${2:-}"; shift 2 ;;
             --allowed-ips)  CLIENT_ALLOWED_IPS="${2:-}"; CLIENT_ALLOWED_IPS_EXPLICIT=1; shift 2 ;;
             --no-qr)        MAKE_QR=0; shift ;;
+            --no-link)      MAKE_LINK=0; shift ;;
             --no-apply)     DO_APPLY=0; shift ;;
             --prune)        PRUNE_KEEP="${2:-}"; shift 2 ;;
             --awg-port)     SRV_PORT="${2:-}"; shift 2 ;;
@@ -2062,6 +2368,7 @@ main() {
             cmd_add "${positional[0]}"
             ;;
         remove)         cmd_remove "${positional[@]+"${positional[@]}"}" ;;
+        link)           cmd_link "${positional[@]+"${positional[@]}"}" ;;
         list)           cmd_list ;;
         names)          list_client_names ;;
         stats)          cmd_stats ;;

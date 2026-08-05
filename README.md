@@ -15,7 +15,7 @@
 |---|---|
 | `bootstrap.sh` | подготовка свежего сервера: обновление, `sudo`, новый sudo-пользователь, SSH-порт, отключение root по SSH, фаервол |
 | `install-awg3.sh` | пакеты, DKMS-модуль, фаервол, запуск `server-init`; форк [bivlked/amneziawg-installer](https://github.com/bivlked/amneziawg-installer) v5.23.0 |
-| `awg3.sh` | `server-init`, `add`, `remove`, `list`, `stats`, `backup`, `show`, `restart` |
+| `awg3.sh` | `server-init`, `add`, `remove`, `link`, `list`, `stats`, `backup`, `show`, `restart` |
 | `panel/` | необязательная панель управления с Windows: то же самое, но меню вместо SSH-команд |
 
 ## Требования
@@ -47,7 +47,7 @@ cd amneziawg-3-installer
 sudo ./bootstrap.sh --user vpnadmin --ssh-port 2222 --disable-root-ssh yes
 # переподключиться: ssh -p 2222 vpnadmin@СЕРВЕР, затем снова скачать репозиторий
 sudo ./install-awg3.sh --mode awg-only
-sudo awg3 add my_phone          # QR ляжет рядом с конфигом
+sudo awg3 add my_phone          # QR и ссылка vpn:// лягут рядом с конфигом
 ```
 
 Либо одной командой с меню:
@@ -77,9 +77,13 @@ sudo ./install-awg3.sh --mode full --user vpnadmin --password-file /root/pw \
 Каждый клиент живёт в своём каталоге, чтобы отдать его целиком одной папкой:
 
 ```
-~/awg/ИМЯ/ИМЯ.conf   ~/awg/ИМЯ/ИМЯ.png
+~/awg/ИМЯ/ИМЯ.conf   ~/awg/ИМЯ/ИМЯ.png     ~/awg/ИМЯ/ИМЯ.vpnuri
 ~/awg/ИМЯ/ИМЯ.private ~/awg/ИМЯ/ИМЯ.public
 ```
+
+`ИМЯ.vpnuri` — ссылка `vpn://` для импорта в приложение AmneziaVPN. Она
+собирается из того же конфига, поэтому конфиг и ссылка не расходятся;
+`awg3 link ИМЯ` пересобирает её для клиентов, выданных раньше.
 
 Каталог данных вычисляется: домашний каталог того, кто запустил через `sudo`,
 либо `/root/awg` при работе под root. Перекрывается `--awg-dir`.
@@ -104,7 +108,8 @@ sudo ./install-awg3.sh --mode full --user vpnadmin --password-file /root/pw \
 
 Если не хочется каждый раз ходить по SSH, в [`panel/`](panel/) лежит
 интерактивная панель: список клиентов, трафик, создание и удаление ключей,
-скачивание `.conf` и QR прямо к себе, бэкапы, перезапуск сервиса.
+скачивание `.conf`, QR и ссылки `vpn://` прямо к себе, бэкапы, перезапуск
+сервиса.
 
 Запускается двойным щелчком по `awg-panel.bat`, при входе спрашивает адрес,
 порт, пользователя и пароль. Пароль нигде не сохраняется, а каждое действие —
