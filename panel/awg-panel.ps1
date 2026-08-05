@@ -218,7 +218,10 @@ elif mode == "fetch":
     remote_dir, name, outdir = rest[0], rest[1], rest[2]
     os.makedirs(outdir, exist_ok=True)
     got = []
-    for suffix in (".conf", ".png"):
+    # Обязателен только конфиг. QR может не собраться без qrencode, ссылки
+    # vpn:// не будет у клиентов, созданных прежними версиями awg3.sh — на
+    # обоих молчим, иначе каждое скачивание сыпало бы руганью на пустом месте.
+    for suffix, required in ((".conf", True), (".png", False), (".vpnuri", False)):
         remote = "%s/%s/%s%s" % (remote_dir, name, name, suffix)
         # Сначала без sudo: каталог клиентов принадлежит самому пользователю,
         # и правило NOPASSWD выдано только на awg3.sh — sudo cat под ключом
@@ -228,7 +231,8 @@ elif mode == "fetch":
         if rc != 0 or not out.strip():
             rc, out, err = run("%s cat %s | base64 -w0" % (SUDO, shlex.quote(remote)))
         if rc != 0 or not out.strip():
-            sys.stderr.write("нет файла: %s\n" % remote)
+            if required:
+                sys.stderr.write("нет файла: %s\n" % remote)
             continue
         local = os.path.join(outdir, name + suffix)
         with open(local, "wb") as fh:
@@ -292,13 +296,56 @@ function Invoke-Remote {
 }
 
 function Invoke-Fetch {
-    param([string] $Name, [string] $OutDir)
+    param([string] $Name, [string] $OutDir, [switch] $Quiet)
 
     $all = @($VpsHost, $VpsPort, $VpsUser, 'fetch', $RemoteDir, $Name, $OutDir)
     $out = $script:Password | & $python $helperPath @all 2>&1
     $script:LastRc = $LASTEXITCODE
-    foreach ($line in $out) { Write-Host "  $line" }
+    if (-not $Quiet) {
+        foreach ($line in $out) { Write-Host "  $line" }
+    }
     return $script:LastRc
+}
+
+# Путь к скачанной ссылке vpn:// или $null.
+#
+# У клиентов, созданных прежними версиями awg3.sh, файла со ссылкой на
+# сервере просто нет. Просим собрать его по готовому конфигу и качаем ещё
+# раз: ключи и пир при этом не трогаются. На сервере со старым скриптом
+# команда не найдётся — тогда остаёмся с конфигом и QR, это не ошибка.
+function Get-ClientLink {
+    param([string] $Name, [string] $OutDir)
+
+    $link = Join-Path $OutDir "$Name.vpnuri"
+    if (Test-Path $link) { return $link }
+
+    Invoke-Remote -CmdArgs @('link', $Name) -Quiet | Out-Null
+    if ($script:LastRc -ne 0) { return $null }
+
+    Invoke-Fetch -Name $Name -OutDir $OutDir -Quiet | Out-Null
+    if (Test-Path $link) { return $link }
+    return $null
+}
+
+# Показывает ссылку и предлагает положить её в буфер обмена: вставить в
+# приложение проще, чем возить файл.
+function Show-ClientLink {
+    param([string] $Name, [string] $OutDir)
+
+    $link = Get-ClientLink -Name $Name -OutDir $OutDir
+    if (-not $link) {
+        Write-Dim 'Ссылки vpn:// нет: на сервере awg3.sh без команды link.'
+        return
+    }
+
+    Write-Ok "Ссылка vpn://: $link"
+    if (-not (Confirm-Action 'Скопировать ссылку в буфер обмена?')) { return }
+    try {
+        Set-Clipboard -Value (Get-Content -LiteralPath $link -Raw).Trim()
+        Write-Ok 'Скопировано. В AmneziaVPN: «+» → «Ввести ключ вручную» → вставить.'
+    } catch {
+        Write-Warn "Буфер обмена недоступен, откройте файл: $link"
+    }
 }
 
 function Get-ClientNames {
@@ -488,6 +535,7 @@ function Action-Add {
     Write-Host ''
     if ((Invoke-Fetch -Name $name -OutDir $outDir) -eq 0) {
         Write-Ok "Файлы здесь: $outDir"
+        Show-ClientLink -Name $name -OutDir $outDir
     } else {
         Write-Warn "Ключ на сервере создан, но файлы не скачались. Попробуйте пункт «Скачать ключ»."
         if (Test-Path $outDir) { Remove-Item -LiteralPath $outDir -Recurse -Force -ErrorAction SilentlyContinue }
@@ -505,6 +553,7 @@ function Action-Download {
     Write-Host ''
     if ((Invoke-Fetch -Name $name -OutDir $outDir) -eq 0) {
         Write-Ok "Файлы здесь: $outDir"
+        Show-ClientLink -Name $name -OutDir $outDir
         if (Confirm-Action 'Показать QR-код?') {
             $png = Join-Path $outDir "$name.png"
             if (Test-Path $png) { Start-Process $png }
@@ -806,6 +855,12 @@ function Read-Password {
     Write-Host "  Сервер: $VpsUser@$VpsHost`:$VpsPort" -ForegroundColor DarkGray
     $secure = Read-Host "  Пароль администратора ($VpsUser)" -AsSecureString
 
+    # Enter на пустом поле или Ctrl+C: Read-Host отдаёт $null либо пустой
+    # SecureString, а ConvertFrom-SecureString на таком падает руганью
+    # «value of argument "SecureString" is not valid» поверх уже закрытой
+    # панели. Пустой ввод — это отказ от пароля, а не сбой.
+    if ($null -eq $secure -or $secure.Length -eq 0) { return '' }
+
     if ($PSVersionTable.PSVersion.Major -ge 7) {
         $plain = ConvertFrom-SecureString $secure -AsPlainText
     } else {
@@ -832,7 +887,7 @@ function Show-Menu {
     Write-Host '    1  Список клиентов'
     Write-Host '    2  Трафик и активность'
     Write-Host '    3  Создать ключ'
-    Write-Host '    4  Скачать ключ (conf + QR)'
+    Write-Host '    4  Скачать ключ (conf + QR + ссылка vpn://)'
     Write-Host '    5  Удалить ключ'
     Write-Host ''
     Write-Host '   СЕРВЕР' -ForegroundColor DarkCyan
