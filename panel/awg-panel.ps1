@@ -81,9 +81,19 @@ function Pause-Panel {
 $helperCode = @'
 import sys, os, base64, shlex, paramiko
 
+# Первая строка stdin — пароль. При входе по ключу она пустая: пароль тогда
+# не нужен вовсе, потому что sudo на сервере настроен через NOPASSWD именно
+# для awg3.sh.
 password = sys.stdin.readline().rstrip("\n")
 host, port, user, mode = sys.argv[1:5]
 rest = sys.argv[5:]
+
+# Путь к приватному ключу передаётся через окружение, а не аргументом:
+# аргументы видны в списке процессов, и хотя сам путь секретом не является,
+# держать всё чувствительное вне командной строки — единое правило здесь.
+keyfile = os.environ.get("AWG_PANEL_KEY") or None
+if keyfile and not os.path.isfile(keyfile):
+    keyfile = None
 
 def fail(msg, code=1):
     sys.stderr.write(msg + "\n")
@@ -107,8 +117,13 @@ client = paramiko.SSHClient()
 client.load_host_keys(hostkeys)
 client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 try:
-    client.connect(host, port=int(port), username=user, password=password,
-                   timeout=30, look_for_keys=False, allow_agent=False)
+    if keyfile:
+        client.connect(host, port=int(port), username=user,
+                       key_filename=keyfile, timeout=30,
+                       look_for_keys=False, allow_agent=False)
+    else:
+        client.connect(host, port=int(port), username=user, password=password,
+                       timeout=30, look_for_keys=False, allow_agent=False)
 except paramiko.BadHostKeyException as exc:
     fail(
         "ОТПЕЧАТОК СЕРВЕРА ИЗМЕНИЛСЯ.\n"
@@ -131,19 +146,69 @@ except paramiko.AuthenticationException:
 except Exception as exc:
     fail("Не удалось подключиться: %s" % exc, 3)
 
+# При входе по ключу пароля нет вовсе, поэтому sudo должен работать без
+# запроса — это обеспечивает правило NOPASSWD, которое ставит режим setup.
+# -n вместо -S: пусть лучше честно упадёт с «требуется пароль», чем молча
+# зависнет в ожидании ввода, которого никто не сделает.
+SUDO = "sudo -n" if keyfile else "sudo -S -p ''"
+
 def run(cmd):
     stdin, stdout, stderr = client.exec_command(cmd, timeout=300)
-    stdin.write(password + "\n")
-    stdin.flush()
+    if not keyfile:
+        stdin.write(password + "\n")
+        stdin.flush()
     out = stdout.read()
     err = stderr.read()
     return stdout.channel.recv_exit_status(), out, err
 
-if mode == "run":
+if mode == "setup":
+    # Разовая настройка входа по ключу: публичная половина кладётся в
+    # authorized_keys, а sudo получает право запускать ТОЛЬКО awg3.sh без
+    # пароля. Узко намеренно: полный NOPASSWD: ALL отдал бы всю машину тому,
+    # кто украдёт ключ, тогда как здесь потеря ограничена управлением VPN.
+    pubkey, remote_script = rest[0], rest[1]
+
+    rc, out, err = run(
+        "install -d -m 700 ~/.ssh && touch ~/.ssh/authorized_keys && "
+        "chmod 600 ~/.ssh/authorized_keys && "
+        "{ grep -qxF %s ~/.ssh/authorized_keys || printf '%%s\\n' %s >> ~/.ssh/authorized_keys; }"
+        % (shlex.quote(pubkey), shlex.quote(pubkey))
+    )
+    if rc != 0:
+        fail("не удалось добавить ключ: %s" % err.decode("utf-8", "replace"), 5)
+
+    # Имя файла в sudoers.d не может содержать точку — иначе он игнорируется.
+    #
+    # Весь блок уходит в ОДИН sudo -S: его stdin занят паролем, поэтому текст
+    # правила нельзя подавать туда же через конвейер — sudo принял бы правило
+    # за пароль и отказал с «no password was provided». По той же причине
+    # sudo здесь ровно один, а не три подряд: пароль пишется в stdin однажды,
+    # и второму вызову он бы уже не достался.
+    # Правило сначала пишется во временный файл и проверяется visudo, и лишь
+    # затем встаёт на место. Обратный порядок — запись в /etc/sudoers.d с
+    # проверкой после — при любой ошибке оставил бы битый файл, а битый файл
+    # в sudoers.d ломает sudo целиком: чинить было бы уже нечем.
+    rule = "%s ALL=(root) NOPASSWD: %s" % (user, remote_script)
+    inner = (
+        "tmp=$(mktemp) && umask 077 && printf '%%s\\n' %s > \"$tmp\" && "
+        "visudo -cf \"$tmp\" >/dev/null && "
+        "install -m 440 -o root -g root \"$tmp\" /etc/sudoers.d/awg3-panel; "
+        "rc=$?; rm -f \"$tmp\"; exit $rc"
+        % shlex.quote(rule)
+    )
+    rc, out, err = run("sudo -S -p '' sh -c %s" % shlex.quote(inner))
+    if rc != 0:
+        fail("не удалось настроить sudo: %s" % err.decode("utf-8", "replace"), 6)
+
+    client.close()
+    print("Ключ добавлен, sudo настроен.")
+    sys.exit(0)
+
+elif mode == "run":
     # rest — уже разобранные аргументы awg3.sh; quote защищает от пробелов
     # и спецсимволов в именах.
     remote_script, args = rest[0], rest[1:]
-    cmd = "sudo -S -p '' %s %s" % (remote_script, " ".join(shlex.quote(a) for a in args))
+    cmd = "%s %s %s" % (SUDO, remote_script, " ".join(shlex.quote(a) for a in args))
     rc, out, err = run(cmd)
     sys.stdout.write((out + err).decode("utf-8", "replace"))
     client.close()
@@ -155,7 +220,13 @@ elif mode == "fetch":
     got = []
     for suffix in (".conf", ".png"):
         remote = "%s/%s/%s%s" % (remote_dir, name, name, suffix)
-        rc, out, err = run("sudo -S -p '' cat %s | base64 -w0" % shlex.quote(remote))
+        # Сначала без sudo: каталог клиентов принадлежит самому пользователю,
+        # и правило NOPASSWD выдано только на awg3.sh — sudo cat под ключом
+        # просто не пройдёт. На sudo откатываемся ради root-установок, где
+        # данные лежат в /root/awg.
+        rc, out, err = run("cat %s | base64 -w0" % shlex.quote(remote))
+        if rc != 0 or not out.strip():
+            rc, out, err = run("%s cat %s | base64 -w0" % (SUDO, shlex.quote(remote)))
         if rc != 0 or not out.strip():
             sys.stderr.write("нет файла: %s\n" % remote)
             continue
@@ -196,6 +267,14 @@ Set-Content -LiteralPath $helperPath -Value $helperCode -Encoding utf8
 # ── Вызовы сервера ──────────────────────────────────────────────────────────
 
 $script:Password = $null
+
+# Путь к ключу уходит помощнику через окружение: при подключении по ключу
+# пароля нет вовсе, и помощник должен об этом знать. Пустое значение —
+# признак входа по паролю.
+function Set-AuthMode {
+    param([bool] $UseKey)
+    $env:AWG_PANEL_KEY = if ($UseKey) { $KeyPath } else { '' }
+}
 
 # Выполняет awg3.sh с аргументами. Возвращает строки вывода, код — в $script:LastRc.
 function Invoke-Remote {
@@ -259,8 +338,71 @@ function Confirm-Action {
     return ($answer -match '^[yYдД]')
 }
 
-# Файл с запомненными отпечатками серверов. Тот же путь, что в помощнике.
-$KnownHostsPath = Join-Path (Join-Path $HOME '.awg-panel') 'known_hosts'
+# ── Профили серверов ────────────────────────────────────────────────────────
+#
+# Всё состояние панели живёт в одном каталоге: отпечатки серверов, список
+# профилей и ключ для входа. Пароль не хранится нигде — вместо него панель
+# заводит SSH-ключ при добавлении сервера.
+
+$PanelDir       = Join-Path $HOME '.awg-panel'
+$KnownHostsPath = Join-Path $PanelDir 'known_hosts'
+$ProfilesPath   = Join-Path $PanelDir 'servers.json'
+$KeyPath        = Join-Path $PanelDir 'id_ed25519'
+
+function Get-Profiles {
+    if (-not (Test-Path $ProfilesPath)) { return @() }
+    try {
+        return @(Get-Content $ProfilesPath -Raw | ConvertFrom-Json)
+    } catch {
+        Write-Warn "Файл профилей повреждён: $ProfilesPath"
+        return @()
+    }
+}
+
+function Save-Profiles {
+    param([array] $Items)
+    New-Item -ItemType Directory -Force -Path $PanelDir | Out-Null
+    # ConvertTo-Json с одним элементом отдаёт объект, а не массив — на чтении
+    # это ломает перечисление, поэтому глубина и явный массив обязательны.
+    ,@($Items) | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $ProfilesPath
+}
+
+# Ключ создаётся один на все серверы: он нужен, чтобы не хранить пароль, а не
+# чтобы разграничивать доступ между ними.
+function Ensure-PanelKey {
+    $keygen = (Get-Command ssh-keygen -ErrorAction SilentlyContinue).Source
+    if (-not $keygen) {
+        Write-Err 'Не найден ssh-keygen. Установите OpenSSH Client в компонентах Windows.'
+        return $false
+    }
+
+    if (Test-Path $KeyPath) { return $true }
+
+    New-Item -ItemType Directory -Force -Path $PanelDir | Out-Null
+    # Именно "" (двойные), а не '""': одинарные кавычки в PowerShell дают
+    # буквальные два символа кавычки, и они становятся ПАРОЛЬНОЙ ФРАЗОЙ.
+    # Ключ тогда создаётся зашифрованным, а paramiko открыть его не может и
+    # сообщает про неверный пароль — искать причину приходится долго.
+    & $keygen -q -t ed25519 -f $KeyPath -N "" -C 'awg-panel' 2>&1 | Out-Null
+
+    if (-not (Test-Path $KeyPath)) {
+        Write-Err 'Не удалось создать ключ.'
+        return $false
+    }
+
+    # Проверяем, что ключ действительно без фразы: иначе автовход молча не
+    # заработает, а ошибка будет выглядеть как неверный пароль.
+    & $keygen -y -P '' -f $KeyPath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Remove-Item $KeyPath, "$KeyPath.pub" -Force -ErrorAction SilentlyContinue
+        Write-Err 'Ключ создался с парольной фразой — так автовход не заработает.'
+        Write-Dim "Создайте вручную: ssh-keygen -t ed25519 -f `"$KeyPath`" -N `"`""
+        return $false
+    }
+
+    Write-Ok "Ключ панели создан: $KeyPath"
+    return $true
+}
 
 # Убирает запись о сервере, чтобы следующий вход запомнил новый отпечаток.
 # paramiko пишет "host" для порта 22 и "[host]:port" для остальных.
@@ -495,6 +637,140 @@ function Read-Connection {
     $script:RemoteScript = "$home_/awg/awg3.sh"
 }
 
+# Применяет профиль к переменным подключения.
+function Use-Profile {
+    param($Item)
+    $script:VpsHost = $Item.host
+    $script:VpsPort = [int]$Item.port
+    $script:VpsUser = $Item.user
+    $home_ = if ($Item.user -eq 'root') { '/root' } else { "/home/$($Item.user)" }
+    $script:RemoteDir    = "$home_/awg"
+    $script:RemoteScript = "$home_/awg/awg3.sh"
+}
+
+# Добавление сервера: один раз спрашиваем пароль, кладём ключ и настраиваем
+# sudo — дальше вход без вопросов.
+function New-ServerProfile {
+    Write-Head 'Новый сервер'
+    Read-Connection
+    Use-Profile ([pscustomobject]@{ host = $VpsHost; port = $VpsPort; user = $VpsUser })
+
+    if (-not (Ensure-PanelKey)) { return $false }
+
+    $script:Password = Read-Password
+    if (-not $script:Password) { Write-Err 'Пароль не введён.'; return $false }
+
+    Write-Host ''
+    Write-Host '  Настраиваю вход по ключу...' -ForegroundColor DarkGray
+    Set-AuthMode $false
+
+    $pub = (Get-Content "$KeyPath.pub" -Raw).Trim()
+    $all = @($VpsHost, $VpsPort, $VpsUser, 'setup', $pub, $RemoteScript)
+    $out = $script:Password | & $python $helperPath @all 2>&1
+    $rc = $LASTEXITCODE
+
+    if ($rc -eq 4) {
+        foreach ($line in $out) { Write-Host "  $line" -ForegroundColor Yellow }
+        return $false
+    }
+    if ($rc -ne 0) {
+        foreach ($line in $out) { Write-Host "  $line" -ForegroundColor Red }
+        Write-Err 'Не удалось настроить вход по ключу.'
+        if ($rc -eq 2) { Write-Warn 'Проверьте пароль и имя пользователя.' }
+        return $false
+    }
+    Write-Ok 'Ключ добавлен, sudo настроен.'
+
+    # Пароль больше не нужен: дальше только ключ. Забываем его из памяти.
+    $script:Password = ''
+    Set-AuthMode $true
+
+    Write-Host '  Проверяю вход по ключу...' -ForegroundColor DarkGray
+    Invoke-Remote -CmdArgs @('names') -Quiet | Out-Null
+    if ($script:LastRc -ne 0) {
+        Write-Err 'Вход по ключу не заработал — профиль не сохранён.'
+        return $false
+    }
+
+    $name = (Read-Host "  Название для этого сервера [$VpsHost]").Trim()
+    if (-not $name) { $name = $VpsHost }
+
+    $items = @(Get-Profiles | Where-Object { $_.name -ne $name })
+    $items += [pscustomobject]@{
+        name = $name; host = $VpsHost; port = $VpsPort; user = $VpsUser
+    }
+    Save-Profiles $items
+    Write-Ok "Сервер '$name' сохранён. Дальше вход без вопросов."
+    return $true
+}
+
+function Remove-ServerProfile {
+    $items = @(Get-Profiles)
+    if ($items.Count -eq 0) { Write-Warn 'Сохранённых серверов нет.'; return }
+
+    Write-Head 'Удалить сервер из списка'
+    for ($i = 0; $i -lt $items.Count; $i++) {
+        Write-Host ("   {0,2}  {1}" -f ($i + 1), $items[$i].name)
+    }
+    Write-Host '    0  отмена' -ForegroundColor DarkGray
+    $choice = Read-Host '  Номер'
+    if ($choice -notmatch '^\d+$') { return }
+    $idx = [int]$choice
+    if ($idx -lt 1 -or $idx -gt $items.Count) { return }
+
+    $victim = $items[$idx - 1]
+    Write-Dim "Запись удаляется только здесь: ключ на сервере останется в"
+    Write-Dim "~/.ssh/authorized_keys, уберите его там, если он больше не нужен."
+    if (-not (Confirm-Action "Удалить '$($victim.name)' из списка?")) { return }
+
+    Save-Profiles @($items | Where-Object { $_.name -ne $victim.name })
+    Write-Ok "'$($victim.name)' удалён из списка."
+}
+
+# Стартовый выбор: сохранённые серверы плюс действия над списком.
+function Select-Server {
+    while ($true) {
+        $items = @(Get-Profiles)
+
+        Write-Host ''
+        Write-Host '  Куда подключаемся' -ForegroundColor Cyan
+        Write-Host ''
+        if ($items.Count -gt 0) {
+            for ($i = 0; $i -lt $items.Count; $i++) {
+                Write-Host ("   {0,2}  {1}" -f ($i + 1), $items[$i].name) -NoNewline
+                Write-Host ("   {0}@{1}:{2}" -f $items[$i].user, $items[$i].host, $items[$i].port) -ForegroundColor DarkGray
+            }
+            Write-Host ''
+        } else {
+            Write-Dim 'Сохранённых серверов пока нет.'
+            Write-Host ''
+        }
+        Write-Host '    N  добавить новый' -ForegroundColor DarkCyan
+        if ($items.Count -gt 0) { Write-Host '    D  удалить из списка' -ForegroundColor DarkCyan }
+        Write-Host '    Q  выход' -ForegroundColor DarkGray
+        Write-Host ''
+
+        $choice = (Read-Host '  Выберите').Trim()
+
+        switch -Regex ($choice) {
+            '^[Qq]$' { return $false }
+            '^[Nn]$' { if (New-ServerProfile) { return $true } }
+            '^[Dd]$' { Remove-ServerProfile }
+            '^\d+$'  {
+                $idx = [int]$choice
+                if ($idx -ge 1 -and $idx -le $items.Count) {
+                    Use-Profile $items[$idx - 1]
+                    $script:Password = ''
+                    Set-AuthMode $true
+                    return $true
+                }
+                Write-Err 'Нет такого номера.'
+            }
+            default { Write-Err 'Не понял. Введите номер, N, D или Q.' }
+        }
+    }
+}
+
 function Read-Password {
     Write-Host ''
     Write-Host "  Сервер: $VpsUser@$VpsHost`:$VpsPort" -ForegroundColor DarkGray
@@ -545,9 +821,8 @@ function Show-Menu {
 
 try {
     Show-Banner
-    Read-Connection
-    $script:Password = Read-Password
-    if (-not $script:Password) { Write-Err 'Пароль не введён.'; exit 1 }
+    if (-not (Select-Server)) { exit 0 }
+    Show-Banner
 
     Write-Host ''
     Write-Host '  Проверяю доступ...' -ForegroundColor DarkGray
