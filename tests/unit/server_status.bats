@@ -97,6 +97,37 @@ teardown() { teardown_awg3; }
     [[ "$output" == *"не задано"* ]]
 }
 
+@test "set-endpoint добавляет имя хоста в конфиг" {
+    run cmd_set_endpoint vpn.example.com
+    [ "$status" -eq 0 ]
+    grep -qx "#_Endpoint = vpn.example.com" "$SERVER_CONF"
+    run server_endpoint_name
+    [ "$output" = "vpn.example.com" ]
+}
+
+@test "set-endpoint заменяет прежнее имя, не дублируя строку" {
+    cmd_set_endpoint first.example.com
+    cmd_set_endpoint second.example.com
+    [ "$(grep -c '^#_Endpoint' "$SERVER_CONF")" -eq 1 ]
+    run server_endpoint_name
+    [ "$output" = "second.example.com" ]
+}
+
+@test "set-endpoint не трогает пиров и параметры" {
+    printf '\n[Peer]\n#_Name = alpha\nPublicKey = AAA\n' >> "$SERVER_CONF"
+    local before_s1 before_peer
+    before_s1=$(grep '^S1 =' "$SERVER_CONF")
+    cmd_set_endpoint vpn.example.com
+    [ "$(grep '^S1 =' "$SERVER_CONF")" = "$before_s1" ]
+    grep -qx "#_Name = alpha" "$SERVER_CONF"
+    grep -qx "PublicKey = AAA" "$SERVER_CONF"
+}
+
+@test "set-endpoint отвергает недопустимое имя" {
+    run cmd_set_endpoint "плохое имя;rm -rf /"
+    [ "$status" -ne 0 ]
+}
+
 @test "strip_ipv6_routes убирает ::/0, сохраняя IPv4" {
     run strip_ipv6_routes "0.0.0.0/0, ::/0"
     [ "$output" = "0.0.0.0/0" ]

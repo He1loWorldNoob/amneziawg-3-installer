@@ -43,7 +43,9 @@ teardown() { teardown_awg3; }
 }
 
 @test "server-init есть в списке команд" {
-    grep -qE '^\s+add\|remove\|.*server-init\)' "$REPO_ROOT/awg3.sh"
+    # Без привязки к соседям: список команд дополняется, и жёсткий якорь на
+    # закрывающую скобку ломался при добавлении следующей команды.
+    grep -qE '^\s+add\|remove\|.*\bserver-init\b' "$REPO_ROOT/awg3.sh"
 }
 
 @test "справка упоминает server-init" {

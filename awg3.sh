@@ -1169,6 +1169,61 @@ _rollback_server_init() {
     exit "$rc"
 }
 
+# ── Команда: set-endpoint ───────────────────────────────────────────────────
+#
+# Меняет имя хоста для клиентских Endpoint, не трогая ничего больше. Отдельная
+# команда нужна потому, что единственная альтернатива — server-init --force —
+# перегенерирует общие параметры и обесценит все выданные конфиги.
+
+cmd_set_endpoint() {
+    local name="$1"
+    [[ -n "$name" ]] || die "укажите имя хоста: $0 set-endpoint vpn.example.com"
+    [[ "$name" =~ ^[a-zA-Z0-9._-]+$ ]] \
+        || die "недопустимое имя хоста: '$name'"
+    [[ -f "$SERVER_CONF" ]] || die "серверный конфиг не найден: $SERVER_CONF"
+
+    local previous
+    previous=$(server_endpoint_name)
+
+    _backup_file "$SERVER_CONF"
+
+    local tmp
+    tmp=$(mktemp "${SERVER_CONF}.tmp.XXXXXX") || die "mktemp не сработал"
+    chmod 600 "$tmp"
+
+    # Строка живёт в [Interface] сразу после заголовка. Прежняя убирается, а
+    # не дублируется: иначе server_endpoint_name читал бы первую попавшуюся.
+    awk -v host="$name" '
+        BEGIN { done = 0; in_peer = 0 }
+        /^[[:space:]]*\[Peer\]/ { in_peer = 1 }
+        # Прежняя строка удаляется независимо от флага: она идёт ПОСЛЕ
+        # [Interface], то есть встречается уже со взведённым done, и проверка
+        # на него оставила бы в файле обе строки разом.
+        !in_peer && /^[[:space:]]*#_Endpoint[[:space:]]*=/ { next }
+        /^[[:space:]]*\[Interface\]/ && !done {
+            print
+            printf "#_Endpoint = %s\n", host
+            done = 1
+            next
+        }
+        { print }
+    ' "$SERVER_CONF" > "$tmp" || { rm -f "$tmp"; die "не перестроен $SERVER_CONF"; }
+
+    grep -qxF "#_Endpoint = ${name}" "$tmp" \
+        || { rm -f "$tmp"; die "строка не добавилась — в конфиге нет секции [Interface]?"; }
+
+    mv -f "$tmp" "$SERVER_CONF" || { rm -f "$tmp"; die "не записан $SERVER_CONF"; }
+    chmod 600 "$SERVER_CONF"
+
+    if [[ -n "$previous" ]]; then
+        log_ok "имя хоста изменено: ${previous} → ${name}"
+    else
+        log_ok "имя хоста задано: ${name}"
+    fi
+    log "Уже выданные конфиги продолжат работать по прежнему адресу."
+    log "Новое имя попадёт в конфиги, созданные дальше: $0 add ИМЯ"
+}
+
 # ── Команда: add ────────────────────────────────────────────────────────────
 
 cmd_add() {
@@ -1894,6 +1949,7 @@ awg3.sh ${SCRIPT_VERSION} — AmneziaWG ${AWG_PROTOCOL}: клиенты и па�
     migrate               разложить клиентов из старой плоской схемы по каталогам
     gen                   вывести готовый набор параметров AWG 3.0
     server-init           создать сервер AWG 3.0 с нуля
+    set-endpoint HOST     сменить имя хоста для новых клиентских конфигов
     server-upgrade        сгенерировать новые общие параметры для сервера
 
 ОПЦИИ
@@ -1942,7 +1998,7 @@ main() {
     local cmd="$1"; shift
     case "$cmd" in
         -h|--help|help) usage; exit 0 ;;
-        add|remove|list|names|stats|show|restart|backup|gen|migrate|server-upgrade|server-init) ;;
+        add|remove|list|names|stats|show|restart|backup|gen|migrate|server-upgrade|server-init|set-endpoint) ;;
         *) die "неизвестная команда: ${cmd}  (см. --help)" ;;
     esac
 
@@ -2016,6 +2072,10 @@ main() {
         migrate)        cmd_migrate ;;
         server-upgrade) cmd_server_upgrade ;;
         server-init)    cmd_server_init ;;
+        set-endpoint)
+            [[ "${#positional[@]}" -eq 1 ]] || die "set-endpoint принимает ровно одно имя хоста"
+            cmd_set_endpoint "${positional[0]}"
+            ;;
     esac
 }
 
