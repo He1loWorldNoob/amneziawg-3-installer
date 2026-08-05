@@ -112,5 +112,12 @@ sudo apt-get install -y bats shellcheck
 ## Происхождение
 
 Форк [bivlked/amneziawg-installer](https://github.com/bivlked/amneziawg-installer)
-v5.23.0. Что именно изменено и как обновлять апстрим —
+v5.23.0 (MIT, © Ivan Bondarev). Что именно изменено и как обновлять апстрим —
 [`docs/upstream.md`](docs/upstream.md).
+
+Апстрим хранится в `vendor/` без изменений: по нему видно, что именно
+поправлено, и обновление сводится к `git diff vendor/`.
+
+## Лицензия
+
+MIT — см. [`LICENSE`](LICENSE).
