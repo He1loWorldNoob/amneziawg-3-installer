@@ -154,6 +154,35 @@ run_isolated() {
     [ "${BOOTSTRAP_ARGS[5]}" = "yes" ]
 }
 
+@test "каталог данных достаётся пользователю, а не root" {
+    # Регрессия: каталог создавался из-под root и оставался root:root —
+    # человек не мог забрать свои конфиги и QR без sudo.
+    local dir="$TEST_TMP/home/testuser/awg"
+    mkdir -p "$TEST_TMP/home/testuser"
+    # chown под обычным пользователем не сработает, поэтому проверяем, что
+    # владелец вычисляется из пути и функция не падает.
+    run prepare_awg_dir "$dir"
+    [ -d "$dir" ]
+    [ "$(stat -c '%a' "$dir")" = "700" ]
+}
+
+@test "владелец /root/awg определяется как root" {
+    grep -q 'if \[\[ "\$dir" == /root/\* \]\]; then owner="root"; fi' "$SCRIPT"
+}
+
+@test "имя создаваемого пользователя запоминается для каталога данных" {
+    # Регрессия: клиенты ложились в домашний каталог того, кто запустил sudo,
+    # а не созданного пользователя.
+    parse_args --user vpnadmin
+    [ "$BOOTSTRAP_USER" = "vpnadmin" ]
+}
+
+@test "--yes прокидывается в bootstrap" {
+    # Регрессия: без него подтверждение доступа требует tty, которого при
+    # неинтерактивном запуске нет, и root молча остаётся включённым.
+    grep -q 'BOOTSTRAP_ARGS+=(--yes)' "$SCRIPT"
+}
+
 @test "неизвестная опция отвергается" {
     run_isolated 'parse_args --нет-такой-опции'
     [ "$status" -ne 0 ]

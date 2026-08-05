@@ -11,7 +11,8 @@
 
 param(
     [Parameter(Mandatory = $true)][string]$Vm,
-    [string]$Dest = 'awg3-deploy'
+    [string]$Dest = 'awg3-deploy',
+    [int]$Port = 22
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,7 +31,7 @@ find ~/$Dest -type f \( -name '*.sh' -o -name '*.bats' -o -name '*.bash' \) -exe
 find ~/$Dest -type f \( -name '*.sh' -o -name '*.bats' \) -exec chmod +x {} + &&
 ls ~/$Dest | tr '\n' ' '
 "@
-    Get-Content -Path $tmp -AsByteStream -Raw | ssh -o BatchMode=yes $Vm $remote
+    Get-Content -Path $tmp -AsByteStream -Raw | ssh -o BatchMode=yes -p $Port $Vm $remote
     if ($LASTEXITCODE -ne 0) { throw "доставка не удалась" }
 }
 finally {

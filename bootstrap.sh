@@ -376,7 +376,12 @@ sshd_listening_on() {
 # ветвление, а не перезапуск обоих подряд.
 restart_ssh() {
     if ssh_socket_active; then
-        systemctl stop ssh.service 2>/dev/null || true
+        # Только сокет. ssh.service при socket activation запускается им по
+        # требованию и постоянно не работает, так что перезапускать его
+        # незачем: `systemctl restart ssh` поднял бы демона рядом с сокетом
+        # (два слушателя на порту → "Connection refused"), а
+        # `systemctl stop ssh.service` убил бы все обслуживающие процессы
+        # вместе с текущей SSH-сессией — то есть оборвал бы сам скрипт.
         systemctl restart ssh.socket || return 1
         return 0
     fi

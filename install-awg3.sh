@@ -44,6 +44,25 @@ STATE_FILE="$AWG_DIR/setup_state"
 LOG_FILE="$AWG_DIR/install-awg3.log"
 SERVER_CONF_FILE="/etc/amnezia/amneziawg/awg0.conf"
 
+# Каталог данных лежит в домашнем каталоге пользователя, но создаётся из-под
+# root — без смены владельца он остаётся root:root, и человек не может забрать
+# собственные конфиги и QR без sudo. Владелец выводится из пути: awg3.sh потом
+# наследует его для всех создаваемых файлов через _fix_owner.
+# Аргумент нужен тестам, в бою используется текущий AWG_DIR.
+# shellcheck disable=SC2120
+prepare_awg_dir() {
+    local dir="${1:-$AWG_DIR}" owner
+    mkdir -p "$dir" || die "не создан каталог $dir"
+    chmod 700 "$dir"
+
+    owner=$(basename "$(dirname "$dir")")
+    if [[ "$dir" == /root/* ]]; then owner="root"; fi
+    if getent passwd "$owner" >/dev/null 2>&1; then
+        chown "${owner}:$(id -gn "$owner" 2>/dev/null || echo "$owner")" "$dir" \
+            || log_warn "не сменился владелец $dir"
+    fi
+}
+
 # AmneziaWG 2.0 pin (H0, 31 jul 2026). Upstream merged AmneziaWG 3.0 into the
 # amneziawg-linux-kernel-module default branch and the PPA switched to it. The 3.0
 # module needs kernel >= 6.7 (nla_put_uint), so on older kernels (Debian 12 = 6.1)
@@ -2973,6 +2992,10 @@ SRV_INTENSITY="medium"
 SRV_ENDPOINT=""
 CLIENTS=""
 BOOTSTRAP_ARGS=()
+# Пользователь, которого создаёт bootstrap.sh: после подготовки системы
+# каталог данных переезжает в его домашний каталог, а не остаётся у того, кто
+# запустил sudo.
+BOOTSTRAP_USER=""
 
 show_help() {
     cat <<EOF
@@ -3243,7 +3266,8 @@ parse_args() {
                                  SRV_ENDPOINT="${2:-}"; shift 2 ;;
             --awg-dir)           AWG3_DIR="${2:-}"; shift 2 ;;
             # Прокидываются в bootstrap.sh как есть
-            --user)              BOOTSTRAP_ARGS+=(--user "${2:-}"); shift 2 ;;
+            --user)              BOOTSTRAP_USER="${2:-}"
+                                 BOOTSTRAP_ARGS+=(--user "${2:-}"); shift 2 ;;
             --password-file)     BOOTSTRAP_ARGS+=(--password-file "${2:-}"); shift 2 ;;
             --ssh-port)          BOOTSTRAP_ARGS+=(--ssh-port "${2:-}"); shift 2 ;;
             --disable-root-ssh)  BOOTSTRAP_ARGS+=(--disable-root-ssh "${2:-}"); shift 2 ;;
@@ -3278,8 +3302,7 @@ main() {
 
     [[ "$(id -u)" -eq 0 ]] || die "нужны права root: sudo $0"
 
-    mkdir -p "$AWG_DIR" || die "не создан каталог $AWG_DIR"
-    chmod 700 "$AWG_DIR"
+    prepare_awg_dir
 
     [[ -n "$MODE" ]] || show_menu
     validate_mode "$MODE" || exit 1
@@ -3295,12 +3318,21 @@ main() {
             local bs
             bs="$(script_dir)/bootstrap.sh"
             [[ -x "$bs" ]] || die "рядом со скриптом нет исполняемого bootstrap.sh"
+            # --yes обязан дойти до bootstrap: без него подтверждение нового
+            # доступа требует tty, которого при неинтерактивном запуске нет,
+            # и вход root молча остаётся включённым вопреки
+            # --disable-root-ssh yes.
+            if [[ "$AUTO_YES" -eq 1 ]]; then
+                BOOTSTRAP_ARGS+=(--yes)
+            fi
             "$bs" "${BOOTSTRAP_ARGS[@]+"${BOOTSTRAP_ARGS[@]}"}" \
                 || die "bootstrap.sh не отработал"
-            # Пользователь мог быть создан только что — каталог данных
-            # переезжает в его домашний каталог.
-            AWG_DIR="$(resolve_awg_dir "")"
-            mkdir -p "$AWG_DIR"; chmod 700 "$AWG_DIR"
+            # Каталог данных переезжает к созданному пользователю: клиенты
+            # нужны именно ему, а не тому, кто запустил sudo.
+            AWG_DIR="$(resolve_awg_dir "${BOOTSTRAP_USER:-admin}")"
+            LOG_FILE="$AWG_DIR/install-awg3.log"
+            STATE_FILE="$AWG_DIR/setup_state"
+            prepare_awg_dir
             ask_params; validate_params; resolve_awg_port
             install_amneziawg_stack
             deploy_server

@@ -83,7 +83,27 @@ EOF
     write_ssh_socket_override 2222
     # Пустой ListenStream обязателен: иначе сокет продолжит слушать и старый порт
     grep -qx "ListenStream=" "$SSH_SOCKET_DROPIN"
-    grep -qx "ListenStream=2222" "$SSH_SOCKET_DROPIN"
+}
+
+@test "override сокета слушает IPv4 явно" {
+    # Регрессия: голый ListenStream=ПОРТ рассчитан на dual-stack [::]:ПОРТ,
+    # но установщик AmneziaWG отключает IPv6 в sysctl — и тогда IPv4 не
+    # слушает никто, а подключение отбивается "Connection refused".
+    systemctl() { return 0; }
+    write_ssh_socket_override 2222
+    grep -qx "ListenStream=0.0.0.0:2222" "$SSH_SOCKET_DROPIN"
+}
+
+@test "IPv6 в override добавляется только при включённом IPv6" {
+    systemctl() { return 0; }
+    write_ssh_socket_override 2222
+    local disabled
+    disabled=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)
+    if [ "$disabled" = "0" ]; then
+        grep -qx "ListenStream=\[::\]:2222" "$SSH_SOCKET_DROPIN"
+    else
+        ! grep -q "::" "$SSH_SOCKET_DROPIN"
+    fi
 }
 
 @test "ssh_socket_active на Ubuntu 24.04 обнаруживает сокет" {
@@ -106,10 +126,12 @@ EOF
     [ "$status" -ne 0 ]
 }
 
-@test "при socket activation ssh.service останавливается, а не перезапускается" {
-    # Регрессия: перезапуск обоих подряд поднимал sshd в режиме демона рядом
-    # с сокетом — два слушателя на одном порту дают "Connection refused"
-    # при обмене баннерами.
+@test "при socket activation трогается только сокет" {
+    # Две регрессии сразу:
+    #  - `restart ssh` поднимал демона рядом с сокетом, и два слушателя на
+    #    порту давали "Connection refused" при обмене баннерами;
+    #  - `stop ssh.service` убивал все обслуживающие процессы вместе с
+    #    текущей SSH-сессией, обрывая сам скрипт на середине.
     local calls="$TEST_TMP/systemctl-calls"
     : > "$calls"
     systemctl() { printf '%s\n' "$*" >> "$calls"; return 0; }
@@ -117,9 +139,9 @@ EOF
 
     restart_ssh
 
-    grep -qx "stop ssh.service" "$calls"
     grep -qx "restart ssh.socket" "$calls"
     ! grep -qx "restart ssh" "$calls"
+    ! grep -q "stop ssh.service" "$calls"
 }
 
 @test "без socket activation перезапускается сам сервис" {
