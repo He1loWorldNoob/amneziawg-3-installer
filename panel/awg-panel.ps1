@@ -259,6 +259,28 @@ function Confirm-Action {
     return ($answer -match '^[yYдД]')
 }
 
+# Файл с запомненными отпечатками серверов. Тот же путь, что в помощнике.
+$KnownHostsPath = Join-Path (Join-Path $HOME '.awg-panel') 'known_hosts'
+
+# Убирает запись о сервере, чтобы следующий вход запомнил новый отпечаток.
+# paramiko пишет "host" для порта 22 и "[host]:port" для остальных.
+function Remove-KnownHost {
+    param([string] $ServerHost, [int] $ServerPort)
+
+    if (-not (Test-Path $KnownHostsPath)) { return $false }
+
+    $keys = @("$ServerHost ", "[$ServerHost]:$ServerPort ")
+    $before = @(Get-Content $KnownHostsPath)
+    $after = $before | Where-Object {
+        $line = $_
+        -not ($keys | Where-Object { $line.StartsWith($_) })
+    }
+
+    if ($after.Count -eq $before.Count) { return $false }
+    Set-Content -LiteralPath $KnownHostsPath -Value $after
+    return $true
+}
+
 # ── Действия ────────────────────────────────────────────────────────────────
 
 function Action-List {
@@ -530,14 +552,31 @@ try {
     Write-Host ''
     Write-Host '  Проверяю доступ...' -ForegroundColor DarkGray
     $probe = Invoke-Remote -CmdArgs @('names') -Quiet
-    if ($script:LastRc -ne 0) {
+
+    # Смена отпечатка — не сбой входа, а предупреждение о возможной подмене
+    # сервера. Предлагаем забыть старый ключ, но подтверждение строгое:
+    # ответ «yes» целиком, как и при отключении root в bootstrap.sh. Беглое
+    # «y» здесь означало бы отдать пароль тому, кто выдаёт себя за сервер.
+    if ($script:LastRc -eq 4) {
         Write-Host ''
-        # Смена отпечатка — не сбой входа, а предупреждение о возможной
-        # подмене сервера, и выглядеть оно должно иначе.
-        if ($script:LastRc -eq 4) {
-            foreach ($line in $probe) { Write-Host "  $line" -ForegroundColor Yellow }
+        foreach ($line in $probe) { Write-Host "  $line" -ForegroundColor Yellow }
+        Write-Host ''
+        Write-Warn 'Соглашайтесь ТОЛЬКО если сервер переустанавливали вы сами.'
+        $answer = Read-Host '  Забыть прежний отпечаток и подключиться? Введите yes целиком'
+        if ($answer -ne 'yes') {
+            Write-Err 'Отменено. Прежний отпечаток сохранён.'
             exit 4
         }
+        if (Remove-KnownHost -ServerHost $VpsHost -ServerPort $VpsPort) {
+            Write-Ok 'Прежний отпечаток удалён, подключаюсь заново...'
+        } else {
+            Write-Warn "Запись не найдена в $KnownHostsPath — возможно, файл правили вручную."
+        }
+        $probe = Invoke-Remote -CmdArgs @('names') -Quiet
+    }
+
+    if ($script:LastRc -ne 0) {
+        Write-Host ''
         foreach ($line in $probe) { Write-Host "  $line" -ForegroundColor Red }
         Write-Err 'Вход не удался.'
         # На сервере включён fail2ban: несколько неверных попыток подряд
