@@ -27,14 +27,22 @@ modprobe: ERROR: could not insert 'amneziawg': Key was rejected by service
 галку Secure Boot). Альтернатива — enroll собственного MOK-ключа, но это
 интерактивная процедура при каждой загрузке.
 
-**Доставка файлов на сервер.** Гит на сервере не нужен:
+**Как получить файлы на сервере.** Всё выполняется на самом сервере, копировать
+с локальной машины ничего не нужно:
 
 ```bash
-# с вашей машины
-scp -r awg3-deploy root@СЕРВЕР:/root/
-# либо, если репозиторий на Windows
-tar -cz . | ssh root@СЕРВЕР 'mkdir -p awg3-deploy && tar -xz -C awg3-deploy'
+# без git — на свежем сервере его может не быть
+curl -fsSL https://github.com/He1loWorldNoob/amneziawg-3-installer/archive/refs/heads/main.tar.gz \
+  | tar -xz && cd amneziawg-3-installer-main
+
+# либо, если git установлен
+git clone https://github.com/He1loWorldNoob/amneziawg-3-installer.git
+cd amneziawg-3-installer
 ```
+
+Если между шагами вы меняли пользователя (`bootstrap.sh` создаёт нового),
+скачайте репозиторий заново уже под ним — каталог остаётся в домашней папке
+того, кто скачивал.
 
 ---
 
