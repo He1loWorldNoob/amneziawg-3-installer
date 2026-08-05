@@ -3,11 +3,6 @@ MIT License
 Copyright (c) 2026 HelloWorldNoob
 Copyright (c) 2025-2026 Ivan Bondarev (github.com/bivlked)
 
-This project is derived from bivlked/amneziawg-installer v5.23.0, which is
-distributed under the MIT License. The upstream sources are kept unmodified in
-vendor/ for reference; install-awg3.sh is a modified derivative of them. See
-docs/upstream.md for the full list of changes.
-
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights

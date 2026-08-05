@@ -121,3 +121,7 @@ v5.23.0 (MIT, © Ivan Bondarev). Что именно изменено и как 
 ## Лицензия
 
 MIT — см. [`LICENSE`](LICENSE).
+
+Проект производный от `bivlked/amneziawg-installer` v5.23.0, распространяемого
+под MIT (© 2025-2026 Ivan Bondarev). Исходники апстрима лежат в `vendor/` без
+изменений; `install-awg3.sh` — их модифицированная версия.
