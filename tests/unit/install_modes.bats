@@ -186,6 +186,23 @@ run_isolated() {
     [ "$status" -ne 0 ]
 }
 
+@test "заданный порт переносится в AWG_PORT для правил фаервола" {
+    SRV_PORT=48872
+    resolve_awg_port
+    [ "$AWG_PORT" = "48872" ]
+}
+
+@test "пустой порт разрешается до настройки фаервола, а не остаётся пустым" {
+    # Иначе ufw получит "ERROR: Bad port", а server-init выберет свой порт —
+    # фаервол и конфиг разошлись бы.
+    SRV_PORT=""
+    resolve_awg_port
+    [ -n "$SRV_PORT" ]
+    [ "$AWG_PORT" = "$SRV_PORT" ]
+    [ "$SRV_PORT" -ge 1024 ]
+    [ "$SRV_PORT" -le 65000 ]
+}
+
 @test "корректный набор параметров проходит" {
     run_isolated 'SRV_PROFILE=dtls SRV_INTENSITY=high SRV_ISOLATION=on SRV_IPV6=on; validate_params'
     [ "$status" -eq 0 ]

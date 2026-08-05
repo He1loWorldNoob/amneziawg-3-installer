@@ -56,6 +56,67 @@ teardown() { teardown_awg3; }
     [[ "$output" == *"IPv6: off"* ]]
 }
 
+@test "имя хоста читается из awg0.conf" {
+    sed -i '1a #_Endpoint = vpn.example.com' "$SERVER_CONF"
+    run server_endpoint_name
+    [ "$output" = "vpn.example.com" ]
+}
+
+@test "без записи имя хоста пустое" {
+    run server_endpoint_name
+    [ -z "$output" ]
+}
+
+@test "имя хоста из конфига важнее автоопределения" {
+    sed -i '1a #_Endpoint = vpn.example.com' "$SERVER_CONF"
+    run resolve_endpoint
+    [ "$output" = "vpn.example.com" ]
+}
+
+@test "флаг --endpoint важнее записи в конфиге" {
+    sed -i '1a #_Endpoint = vpn.example.com' "$SERVER_CONF"
+    ENDPOINT_OVERRIDE="other.example.net"
+    run resolve_endpoint
+    [ "$output" = "other.example.net" ]
+}
+
+@test "имя хоста ищется только в секции Interface" {
+    printf '\n[Peer]\n#_Endpoint = ложное.имя\n' >> "$SERVER_CONF"
+    run server_endpoint_name
+    [ -z "$output" ]
+}
+
+@test "list показывает имя хоста" {
+    sed -i '1a #_Endpoint = vpn.example.com' "$SERVER_CONF"
+    run cmd_list
+    [[ "$output" == *"имя хоста для клиентов: vpn.example.com"* ]]
+}
+
+@test "list сообщает, когда имя хоста не задано" {
+    run cmd_list
+    [[ "$output" == *"не задано"* ]]
+}
+
+@test "strip_ipv6_routes убирает ::/0, сохраняя IPv4" {
+    run strip_ipv6_routes "0.0.0.0/0, ::/0"
+    [ "$output" = "0.0.0.0/0" ]
+}
+
+@test "strip_ipv6_routes убирает все IPv6-подсети из списка" {
+    run strip_ipv6_routes "10.0.0.0/8, fd00::/8, 192.168.0.0/16, 2001:db8::/32"
+    [ "$output" = "10.0.0.0/8, 192.168.0.0/16" ]
+}
+
+@test "strip_ipv6_routes не трогает список без IPv6" {
+    run strip_ipv6_routes "10.0.0.0/8, 192.168.0.0/16"
+    [ "$output" = "10.0.0.0/8, 192.168.0.0/16" ]
+}
+
+@test "strip_ipv6_routes переживает лишние пробелы" {
+    run strip_ipv6_routes "0.0.0.0/0 ,   ::/0 ,  10.0.0.0/8"
+    [ "$output" = "0.0.0.0/0, 10.0.0.0/8" ]
+}
+
 @test "чтения awgsetup_cfg.init в скрипте не осталось" {
     ! grep -q "awgsetup_cfg.init" "$REPO_ROOT/awg3.sh"
 }

@@ -42,7 +42,10 @@ readonly AWG_PROTOCOL="3.0"
 # Переопределяются переменными окружения — этим же пользуется прогон на копии
 # конфига, чтобы не трогать рабочий сервер.
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# readlink -f обязателен: скрипт вызывается через симлинк /usr/local/sbin/awg3,
+# и без разыменования SCRIPT_DIR указал бы на /usr/local/sbin — каталог, где
+# нет ни одного клиента.
+SCRIPT_DIR="$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 AWG_DIR="${AWG3_DIR:-$SCRIPT_DIR}"
 SERVER_CONF="${AWG3_SERVER_CONF:-/etc/amnezia/amneziawg/awg0.conf}"
 LOG_FILE="$AWG_DIR/awg3.log"
@@ -82,6 +85,9 @@ ROUTER_MODE=0
 ENDPOINT_OVERRIDE=""
 CLIENT_DNS="1.1.1.1, 1.0.0.1"
 CLIENT_ALLOWED_IPS="0.0.0.0/0, ::/0"
+# Задан ли список явно флагом: если да, он уважается как есть, даже когда
+# IPv6-маршруты клиенту не нужны.
+CLIENT_ALLOWED_IPS_EXPLICIT=0
 MTU_OVERRIDE=""
 MAKE_QR=1
 DO_APPLY=1
@@ -709,13 +715,35 @@ build_postdown() {
 
 # ── Endpoint ────────────────────────────────────────────────────────────────
 #
-# Порядок: --endpoint > Endpoint уже существующего клиента > внешний IP.
+# Порядок: --endpoint > #_Endpoint из awg0.conf > Endpoint уже существующего
+# клиента > внешний IP.
 #
-# Отдельного файла настроек больше нет — источник истины только awg0.conf.
+# Отдельного файла настроек нет — источник истины только awg0.conf, поэтому
+# имя хоста хранится там же комментарием.
+
+server_endpoint_name() {
+    [[ -r "$SERVER_CONF" ]] || return 0
+    awk '
+        /^[[:space:]]*\[Peer\]/ { exit }
+        /^[[:space:]]*#_Endpoint[[:space:]]*=/ {
+            sub(/^[^=]*=[[:space:]]*/, "")
+            gsub(/[[:space:]]+$/, "")
+            print
+            exit
+        }
+    ' "$SERVER_CONF"
+}
 
 resolve_endpoint() {
     if [[ -n "$ENDPOINT_OVERRIDE" ]]; then
         echo "${ENDPOINT_OVERRIDE%%:*}"
+        return 0
+    fi
+
+    local saved
+    saved=$(server_endpoint_name)
+    if [[ -n "$saved" ]]; then
+        echo "$saved"
         return 0
     fi
 
@@ -736,6 +764,20 @@ resolve_endpoint() {
 }
 
 # ── Служебное ───────────────────────────────────────────────────────────────
+
+# Выбрасывает IPv6-подсети из списка AllowedIPs, сохраняя порядок остальных.
+strip_ipv6_routes() {
+    local list="$1" part out=""
+    local IFS=','
+    for part in $list; do
+        part="${part#"${part%%[![:space:]]*}"}"
+        part="${part%"${part##*[![:space:]]}"}"
+        [[ -n "$part" ]] || continue
+        [[ "$part" == *:* ]] && continue
+        out="${out:+$out, }${part}"
+    done
+    printf '%s' "$out"
+}
 
 validate_client_name() {
     local name="$1"
@@ -935,6 +977,12 @@ render_server_conf() {
 
     {
         printf '[Interface]\n'
+        # Имя хоста для клиентских Endpoint. Хранится комментарием в самом
+        # конфиге, как и #_Name у пиров: отдельного файла настроек нет, а
+        # выводить DNS-имя из адреса интерфейса неоткуда.
+        if [[ -n "${ENDPOINT_OVERRIDE:-}" ]]; then
+            printf '#_Endpoint = %s\n' "${ENDPOINT_OVERRIDE%%:*}"
+        fi
         printf 'PrivateKey = %s\n' "$privkey"
         printf 'Address = %s\n' "$address"
         printf 'ListenPort = %s\n' "$port"
@@ -1050,6 +1098,12 @@ cmd_server_init() {
 
     local peers_src=""
     if [[ -f "$SERVER_CONF" ]]; then
+        # Имя хоста переживает пересоздание сервера: клиенты продолжат
+        # подключаться по тому же адресу, если его не задали заново.
+        if [[ -z "${ENDPOINT_OVERRIDE:-}" ]]; then
+            ENDPOINT_OVERRIDE=$(server_endpoint_name)
+            [[ -z "$ENDPOINT_OVERRIDE" ]] || log "имя хоста сохранено: $ENDPOINT_OVERRIDE"
+        fi
         _backup_file "$SERVER_CONF"
         peers_src="$BACKUP_LAST"
     fi
@@ -1154,6 +1208,13 @@ cmd_add() {
         address="${client_ip}/32, ${client_ip6}/128"
     else
         address="${client_ip}/32"
+        # У клиента нет IPv6-адреса, значит ::/0 в AllowedIPs — маршрут в
+        # никуда. Хуже того, awg-quick на машине с отключённым IPv6 падает на
+        # нём с «IPv6 is disabled on nexthop device» и не поднимает туннель
+        # вообще. Убираем, если пользователь не потребовал явно.
+        if [[ "$CLIENT_ALLOWED_IPS_EXPLICIT" -eq 0 ]]; then
+            CLIENT_ALLOWED_IPS=$(strip_ipv6_routes "$CLIENT_ALLOWED_IPS")
+        fi
     fi
 
     # Дальше идут изменения на диске: при сбое откатываем всё, что успели.
@@ -1322,6 +1383,13 @@ cmd_list() {
         "${S_PORT:-?}" "${S_ADDR:-?}" "${S_MTU:-?}"
     printf '  изоляция клиентов: %s, IPv6: %s\n' \
         "$(server_isolation_state)" "$(server_ipv6_state)"
+    local ep
+    ep=$(server_endpoint_name)
+    if [[ -n "$ep" ]]; then
+        printf '  имя хоста для клиентов: %s\n' "$ep"
+    else
+        printf '  имя хоста для клиентов: не задано (берётся внешний IP)\n'
+    fi
 }
 
 # ── Команда: migrate ────────────────────────────────────────────────────────
@@ -1887,7 +1955,7 @@ main() {
             -e|--endpoint)  ENDPOINT_OVERRIDE="${2:-}"; shift 2 ;;
             --dns)          CLIENT_DNS="${2:-}"; shift 2 ;;
             --mtu)          MTU_OVERRIDE="${2:-}"; shift 2 ;;
-            --allowed-ips)  CLIENT_ALLOWED_IPS="${2:-}"; shift 2 ;;
+            --allowed-ips)  CLIENT_ALLOWED_IPS="${2:-}"; CLIENT_ALLOWED_IPS_EXPLICIT=1; shift 2 ;;
             --no-qr)        MAKE_QR=0; shift ;;
             --no-apply)     DO_APPLY=0; shift ;;
             --prune)        PRUNE_KEEP="${2:-}"; shift 2 ;;

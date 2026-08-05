@@ -1909,7 +1909,21 @@ step1_update_and_optimize() {
     fi
 
     log "Step 1 completed successfully."
-    request_reboot 2
+
+    # Апстрим здесь перезагружался БЕЗУСЛОВНО и полагался на то, что человек
+    # запустит скрипт заново, а state-машина продолжит со второго шага. Мы
+    # выполняем шаги подряд, поэтому безусловная перезагрузка означала бы
+    # бесконечный цикл: обновлять уже нечего, а reboot всё равно происходит.
+    #
+    # Перезагрузка нужна ровно в одном случае — обновилось ядро. Иначе DKMS
+    # соберёт модуль под работающее (старое) ядро, а после следующего ребута
+    # он окажется несовместим. Признак берём из штатного маркера apt.
+    if [[ -f /var/run/reboot-required ]]; then
+        log_warn "обновилось ядро — нужна перезагрузка перед сборкой модуля"
+        request_reboot 2
+    fi
+    log "Перезагрузка не требуется, продолжаю."
+    update_state 2
 }
 
 # ==============================================================================
@@ -2760,6 +2774,18 @@ AWG_SYSTEMD_UNIT_EOF
     fi
 
     log "Step 2 completed."
+
+    # Как и на первом шаге: апстрим перезагружался безусловно. Нам ребут нужен
+    # только если модуль не удаётся загрузить прямо сейчас — тогда причина
+    # обычно в том, что работающее ядро старше того, под которое собран
+    # модуль. Если modprobe проходит, перезагружаться незачем: step3 всё
+    # равно проверит модуль ещё раз.
+    if modprobe amneziawg 2>/dev/null; then
+        log "Модуль amneziawg загружен, перезагрузка не требуется."
+        update_state 3
+        return 0
+    fi
+    log_warn "модуль не загрузился сразу — требуется перезагрузка"
     request_reboot 3
 }
 
@@ -2944,6 +2970,7 @@ SRV_ISOLATION="off"
 SRV_IPV6="off"
 SRV_PROFILE="quic"
 SRV_INTENSITY="medium"
+SRV_ENDPOINT=""
 CLIENTS=""
 BOOTSTRAP_ARGS=()
 
@@ -2972,6 +2999,8 @@ install-awg3.sh ${SCRIPT_VERSION} — развёртывание AmneziaWG 3.0
     --ipv6 on|off         IPv6 в туннеле              (по умолч.: ${SRV_IPV6})
     --profile NAME        мимикрия: quic|tls|dtls|sip|dns|noise (по умолч.: ${SRV_PROFILE})
     --intensity LVL       low|medium|high             (по умолч.: ${SRV_INTENSITY})
+    --endpoint HOST       имя хоста для клиентских Endpoint: DNS-имя или IP
+                          (синоним: --host-name; по умолч.: внешний IP)
     --clients a,b,c       создать клиентов сразу      (по умолч.: ни одного)
     --awg-dir PATH        каталог данных   (по умолч.: ~/awg целевого пользователя)
 
@@ -3046,6 +3075,9 @@ build_server_init_args() {
     local args="--awg-port ${SRV_PORT} --subnet ${SRV_SUBNET} --mtu ${SRV_MTU}"
     args="${args} --isolation ${SRV_ISOLATION} --ipv6 ${SRV_IPV6}"
     args="${args} -p ${SRV_PROFILE} -i ${SRV_INTENSITY}"
+    if [[ -n "${SRV_ENDPOINT:-}" ]]; then
+        args="${args} --endpoint ${SRV_ENDPOINT}"
+    fi
     if [[ "${MODE:-}" == "reinstall" ]]; then
         args="${args} --force"
     fi
@@ -3125,8 +3157,39 @@ ask_params() {
     read -rp "Интенсивность low|medium|high [${SRV_INTENSITY}]: " answer < /dev/tty
     [[ -z "$answer" ]] || SRV_INTENSITY="$answer"
 
+    if [[ -z "$SRV_ENDPOINT" ]]; then
+        printf '\n'
+        echo "  Имя хоста для клиентов — адрес, который попадёт в Endpoint выданных"
+        echo "  конфигов. Укажите DNS-имя (vpn.example.com), если оно есть: тогда при"
+        echo "  смене IP сервера старые конфиги продолжат работать."
+        read -rp "Имя хоста [Enter — определить внешний IP автоматически]: " answer < /dev/tty
+        [[ -z "$answer" ]] || SRV_ENDPOINT="$answer"
+    fi
+
     read -rp "Клиенты через запятую [Enter — ни одного]: " answer < /dev/tty
     [[ -z "$answer" ]] || CLIENTS="$answer"
+}
+
+# Порт должен быть известен ДО настройки фаервола: step4_setup_firewall
+# открывает ${AWG_PORT}/udp, а server-init выполняется позже. Поэтому пустой
+# --awg-port разрешается здесь, а в server-init уходит уже конкретным числом —
+# иначе установщик и конфиг выбрали бы разные порты.
+resolve_awg_port() {
+    if [[ -n "$SRV_PORT" ]]; then
+        AWG_PORT="$SRV_PORT"
+        return 0
+    fi
+    local candidate attempt
+    for attempt in $(seq 1 20); do
+        candidate=$(( (RANDOM % 63977) + 1024 ))
+        if ! ss -Hulnp 2>/dev/null | awk '{print $5}' | grep -qE "[:.]${candidate}\$"; then
+            SRV_PORT="$candidate"
+            AWG_PORT="$candidate"
+            log "выбран случайный UDP-порт: $SRV_PORT"
+            return 0
+        fi
+    done
+    die "не удалось подобрать свободный UDP-порт — задайте его явно: --awg-port N"
 }
 
 validate_params() {
@@ -3176,6 +3239,8 @@ parse_args() {
             --profile)           SRV_PROFILE="${2:-}"; shift 2 ;;
             --intensity)         SRV_INTENSITY="${2:-}"; shift 2 ;;
             --clients)           CLIENTS="${2:-}"; shift 2 ;;
+            --endpoint|--host-name)
+                                 SRV_ENDPOINT="${2:-}"; shift 2 ;;
             --awg-dir)           AWG3_DIR="${2:-}"; shift 2 ;;
             # Прокидываются в bootstrap.sh как есть
             --user)              BOOTSTRAP_ARGS+=(--user "${2:-}"); shift 2 ;;
@@ -3236,12 +3301,12 @@ main() {
             # переезжает в его домашний каталог.
             AWG_DIR="$(resolve_awg_dir "")"
             mkdir -p "$AWG_DIR"; chmod 700 "$AWG_DIR"
-            ask_params; validate_params
+            ask_params; validate_params; resolve_awg_port
             install_amneziawg_stack
             deploy_server
             ;;
         awg-only)
-            ask_params; validate_params
+            ask_params; validate_params; resolve_awg_port
             install_amneziawg_stack
             deploy_server
             ;;
@@ -3255,7 +3320,7 @@ main() {
                 read -rp "Продолжить? [y/N]: " ans < /dev/tty
                 [[ "$ans" =~ ^[Yy] ]] || die "отменено"
             fi
-            ask_params; validate_params
+            ask_params; validate_params; resolve_awg_port
             install_amneziawg_stack
             deploy_server
             ;;
