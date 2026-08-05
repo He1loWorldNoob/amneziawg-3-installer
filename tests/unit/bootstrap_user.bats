@@ -107,6 +107,40 @@ teardown() { teardown_bootstrap; }
     grep -q 'useradd_opts+=(-g "\$name")' "$REPO_ROOT/bootstrap.sh"
 }
 
+@test "существующий пользователь с nologin-шеллом отвергается" {
+    # Иначе скрипт добавит сервисную учётку в sudo, отрапортует успех и
+    # закроет root — а войти будет нельзя.
+    getent() { [ "$1" = "passwd" ] && echo "svc:x:999:999::/nonexistent:/usr/sbin/nologin"; }
+    run verify_existing_user svc
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"нельзя"* || "$output" == *"невозможен"* ]]
+}
+
+@test "заблокированная учётная запись отвергается" {
+    getent() { [ "$1" = "passwd" ] && echo "locked:x:1002:1002::$TEST_TMP:/bin/bash"; }
+    passwd() { echo "locked L 01/01/2026 0 99999 7 -1"; }
+    mkdir -p "$TEST_TMP"
+    run verify_existing_user locked
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"заблокирована"* ]]
+}
+
+@test "учётная запись без пароля отвергается" {
+    getent() { [ "$1" = "passwd" ] && echo "nopw:x:1003:1003::$TEST_TMP:/bin/bash"; }
+    passwd() { echo "nopw NP 01/01/2026 0 99999 7 -1"; }
+    run verify_existing_user nopw
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"не задан пароль"* ]]
+}
+
+@test "пригодный существующий пользователь принимается" {
+    getent() { [ "$1" = "passwd" ] && echo "good:x:1004:1004::$TEST_TMP:/bin/bash"; }
+    passwd() { echo "good P 01/01/2026 0 99999 7 -1"; }
+    run verify_existing_user good
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"пригоден"* ]]
+}
+
 @test "read_password берёт первую строку файла" {
     printf 'secret123\nмусор\n' > "$TEST_TMP/pw"
     PASSWORD_FILE="$TEST_TMP/pw"

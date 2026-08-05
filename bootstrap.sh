@@ -166,11 +166,62 @@ sudo_group_enabled() {
     return 1
 }
 
+# Существующий пользователь может быть непригоден для входа: сервисная учётка
+# с nologin-шеллом, заблокированный пароль, отсутствующий домашний каталог.
+# Молча добавить такого в sudo и отрапортовать успех — значит отдать сервер,
+# в который нельзя войти, и обнаружится это уже после закрытия root.
+verify_existing_user() {
+    local name="$1" shell home status problems=0
+
+    shell=$(getent passwd "$name" | cut -d: -f7)
+    case "$shell" in
+        */nologin|*/false|"")
+            log_err "у пользователя '$name' шелл '$shell' — вход по SSH невозможен"
+            log_err "Исправьте: usermod -s /bin/bash $name"
+            problems=1
+            ;;
+    esac
+
+    home=$(getent passwd "$name" | cut -d: -f6)
+    if [[ -z "$home" || ! -d "$home" ]]; then
+        log_warn "нет домашнего каталога '$home' — создаю"
+        mkhomedir_helper "$name" 2>/dev/null || {
+            mkdir -p "$home" \
+                && chown "${name}:$(id -gn "$name" 2>/dev/null || echo "$name")" "$home" \
+                && chmod 750 "$home"
+        } || { log_err "не создан домашний каталог для '$name'"; problems=1; }
+    fi
+
+    # Второе поле passwd -S: P — пароль задан, L — учётка заблокирована,
+    # NP — пароля нет вовсе. Войти можно только с P.
+    if status=$(passwd -S "$name" 2>/dev/null | awk '{print $2}'); then
+        case "$status" in
+            P) ;;
+            L)
+                log_err "учётная запись '$name' заблокирована — вход по паролю невозможен"
+                log_err "Исправьте: usermod -U $name  (и задайте пароль: passwd $name)"
+                problems=1
+                ;;
+            NP)
+                log_err "у пользователя '$name' не задан пароль — вход по паролю невозможен"
+                log_err "Исправьте: passwd $name"
+                problems=1
+                ;;
+        esac
+    fi
+
+    [[ "$problems" -eq 0 ]] || return 1
+    log_ok "существующий пользователь '$name' пригоден для входа"
+    return 0
+}
+
 create_sudo_user() {
     local name="$1" password="$2"
 
     if user_exists "$name"; then
         log_warn "пользователь '$name' уже существует — пароль не меняю"
+        verify_existing_user "$name" \
+            || die "пользователь '$name' непригоден для входа — исправьте и запустите снова"
     else
         # В Ubuntu есть системная группа admin (наследие: раньше через неё
         # давали sudo). useradd по умолчанию создаёт группу с именем
