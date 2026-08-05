@@ -41,10 +41,14 @@ EOF
     [ -z "$output" ]
 }
 
-@test "detect_current_ssh_port на этой системе возвращает 22" {
+@test "detect_current_ssh_port возвращает порт, который реально слушает sshd" {
+    # Без привязки к 22: на стенде после bootstrap порт уже другой.
+    local actual
+    actual=$(ss -Htlnp 2>/dev/null | awk '/"sshd"/{n=split($4,a,":"); print a[n]; exit}')
+    [ -n "$actual" ] || skip "sshd не найден в списке слушателей"
     run detect_current_ssh_port
     [ "$status" -eq 0 ]
-    [ "$output" = "22" ]
+    [ "$output" = "$actual" ]
 }
 
 # ── Drop-in ─────────────────────────────────────────────────────────────────
@@ -116,8 +120,11 @@ EOF
 
 # ── Проверка порта ──────────────────────────────────────────────────────────
 
-@test "sshd_listening_on видит порт 22 на этой системе" {
-    run sshd_listening_on 22
+@test "sshd_listening_on видит порт, который слушает sshd" {
+    local actual
+    actual=$(ss -Htlnp 2>/dev/null | awk '/"sshd"/{n=split($4,a,":"); print a[n]; exit}')
+    [ -n "$actual" ] || skip "sshd не найден в списке слушателей"
+    run sshd_listening_on "$actual"
     [ "$status" -eq 0 ]
 }
 

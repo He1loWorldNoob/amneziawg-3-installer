@@ -3228,8 +3228,27 @@ validate_params() {
     case "$SRV_IPV6"      in on|off) ;; *) die "--ipv6 ожидает on|off" ;; esac
 }
 
+# Согласование IPv6 между установщиком и сервером.
+#
+# Первый шаг установщика по умолчанию глушит IPv6 в sysctl. Если при этом
+# сервер просят поднять с IPv6 в туннеле, awg-quick не сможет назначить
+# интерфейсу IPv6-адрес, сервис останется в failed и сервера просто не будет.
+# Обе настройки должны решаться до шага 1, а не после.
+sync_ipv6_settings() {
+    if [[ "$SRV_IPV6" == "on" ]]; then
+        CLI_ALLOW_IPV6_TUNNEL=1
+        CLI_DISABLE_IPV6=0
+        log "IPv6 в туннеле запрошен — глобальное отключение IPv6 снимается"
+    else
+        CLI_DISABLE_IPV6=1
+    fi
+    configure_ipv6
+    configure_ipv6_tunnel
+}
+
 # Установка AmneziaWG: пакеты, модуль ядра, фаервол.
 install_amneziawg_stack() {
+    sync_ipv6_settings
     step1_update_and_optimize
     step2_install_amnezia
     step3_check_module
@@ -3338,6 +3357,22 @@ main() {
             deploy_server
             ;;
         awg-only)
+            # Повторный запуск — обычное дело: человек мог прервать установку
+            # или просто перезапустить её. Пересоздавать сервер молча нельзя
+            # (перегенерация общих параметров обесценит все выданные конфиги),
+            # но и падать с аварийным сообщением незачем: нужное состояние уже
+            # достигнуто.
+            if [[ -f "$SERVER_CONF_FILE" ]] && [[ "$FORCE_REINSTALL" -ne 1 ]]; then
+                log "AmneziaWG уже развёрнут: $SERVER_CONF_FILE"
+                log " "
+                log "  добавить клиента:      sudo awg3 add ИМЯ"
+                log "  посмотреть состояние:  sudo awg3 list"
+                log " "
+                log "Пересоздать сервер с новыми параметрами обфускации можно так:"
+                log "  sudo $0 --mode reinstall"
+                log_warn "ВНИМАНИЕ: после пересоздания все выданные конфиги перестанут подключаться."
+                exit 0
+            fi
             ask_params; validate_params; resolve_awg_port
             install_amneziawg_stack
             deploy_server

@@ -154,6 +154,25 @@ run_isolated() {
     [ "${BOOTSTRAP_ARGS[5]}" = "yes" ]
 }
 
+@test "IPv6 в туннеле снимает глобальное отключение IPv6" {
+    # Регрессия: step1 глушил IPv6 в sysctl, awg-quick не мог назначить
+    # интерфейсу IPv6-адрес, и сервис оставался в failed — сервера не было.
+    SRV_IPV6=on
+    configure_ipv6() { :; }
+    configure_ipv6_tunnel() { :; }
+    sync_ipv6_settings
+    [ "$CLI_ALLOW_IPV6_TUNNEL" -eq 1 ]
+    [ "$CLI_DISABLE_IPV6" -eq 0 ]
+}
+
+@test "без IPv6 в туннеле глобальное отключение остаётся" {
+    SRV_IPV6=off
+    configure_ipv6() { :; }
+    configure_ipv6_tunnel() { :; }
+    sync_ipv6_settings
+    [ "$CLI_DISABLE_IPV6" -eq 1 ]
+}
+
 @test "каталог данных достаётся пользователю, а не root" {
     # Регрессия: каталог создавался из-под root и оставался root:root —
     # человек не мог забрать свои конфиги и QR без sudo.
