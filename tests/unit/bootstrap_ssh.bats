@@ -106,6 +106,34 @@ EOF
     [ "$status" -ne 0 ]
 }
 
+@test "при socket activation ssh.service останавливается, а не перезапускается" {
+    # Регрессия: перезапуск обоих подряд поднимал sshd в режиме демона рядом
+    # с сокетом — два слушателя на одном порту дают "Connection refused"
+    # при обмене баннерами.
+    local calls="$TEST_TMP/systemctl-calls"
+    : > "$calls"
+    systemctl() { printf '%s\n' "$*" >> "$calls"; return 0; }
+    ssh_socket_active() { return 0; }
+
+    restart_ssh
+
+    grep -qx "stop ssh.service" "$calls"
+    grep -qx "restart ssh.socket" "$calls"
+    ! grep -qx "restart ssh" "$calls"
+}
+
+@test "без socket activation перезапускается сам сервис" {
+    local calls="$TEST_TMP/systemctl-calls"
+    : > "$calls"
+    systemctl() { printf '%s\n' "$*" >> "$calls"; return 0; }
+    ssh_socket_active() { return 1; }
+
+    restart_ssh
+
+    grep -qx "restart ssh" "$calls"
+    ! grep -q "ssh.socket" "$calls"
+}
+
 @test "apply_ssh_port ничего не делает, если порт совпадает" {
     OLD_SSH_PORT=22
     run apply_ssh_port 22

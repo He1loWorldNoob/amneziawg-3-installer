@@ -172,7 +172,17 @@ create_sudo_user() {
     if user_exists "$name"; then
         log_warn "пользователь '$name' уже существует — пароль не меняю"
     else
-        useradd -m -s /bin/bash "$name" || die "не создан пользователь '$name'"
+        # В Ubuntu есть системная группа admin (наследие: раньше через неё
+        # давали sudo). useradd по умолчанию создаёт группу с именем
+        # пользователя и падает с «group admin exists» — на дефолтном
+        # --user admin установка ломалась бы у всех. Существующую группу
+        # берём как основную.
+        local useradd_opts=(-m -s /bin/bash)
+        if getent group "$name" >/dev/null 2>&1; then
+            log "группа '$name' уже есть — использую её как основную"
+            useradd_opts+=(-g "$name")
+        fi
+        useradd "${useradd_opts[@]}" "$name" || die "не создан пользователь '$name'"
         printf '%s:%s\n' "$name" "$password" | chpasswd \
             || die "не установлен пароль для '$name'"
         log_ok "пользователь '$name' создан"
@@ -327,6 +337,12 @@ write_sshd_dropin() {
 }
 
 # Порт для socket activation задаётся в юните, а не в sshd_config.
+#
+# Адреса перечисляются явно. Голый `ListenStream=ПОРТ` рассчитан на
+# dual-stack сокет [::]:ПОРТ, принимающий и IPv4 через v4-mapped адреса. Но
+# если IPv6 выключен в sysctl — а установщик AmneziaWG его выключает — сокет
+# поднимается только на IPv6, IPv4 не слушает никто, и подключение отбивается
+# с "Connection refused" при обмене баннерами.
 write_ssh_socket_override() {
     local port="$1"
     mkdir -p "$(dirname "$SSH_SOCKET_DROPIN")"
@@ -336,7 +352,13 @@ write_ssh_socket_override() {
         # Пустой ListenStream сбрасывает унаследованный список портов, иначе
         # сокет продолжит слушать и старый порт тоже.
         printf 'ListenStream=\n'
-        printf 'ListenStream=%s\n' "$port"
+        printf 'ListenStream=0.0.0.0:%s\n' "$port"
+        # IPv6 добавляем, только если он реально включён: иначе юнит не
+        # поднимется вовсе и доступа не станет ни по одному протоколу.
+        if [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)" == "0" ]]; then
+            printf 'ListenStream=[::]:%s\n' "$port"
+            printf 'BindIPv6Only=ipv6-only\n'
+        fi
     } > "$SSH_SOCKET_DROPIN"
     chmod 644 "$SSH_SOCKET_DROPIN"
     systemctl daemon-reload
@@ -347,9 +369,16 @@ sshd_listening_on() {
     ss -Htlnp 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}\$"
 }
 
+# При socket activation порт держит ssh.socket, а ssh.service запускается им
+# по требованию. Если перезапустить ещё и ssh.service самостоятельно, он
+# поднимется в режиме демона и займёт тот же порт: два слушателя на одном
+# сокете дают "Connection refused" при обмене баннерами. Поэтому здесь
+# ветвление, а не перезапуск обоих подряд.
 restart_ssh() {
     if ssh_socket_active; then
+        systemctl stop ssh.service 2>/dev/null || true
         systemctl restart ssh.socket || return 1
+        return 0
     fi
     systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || return 1
     return 0
@@ -484,8 +513,10 @@ write_summary() {
         printf '\nДальше: sudo ./install-awg3.sh\n'
     } > "$f"
     chmod 600 "$f"
+    # Группа берётся у самого пользователя: она не обязана совпадать с его
+    # именем — на Ubuntu для 'admin' это существующая системная группа.
     if user_exists "${NEW_USER:-}"; then
-        chown "$NEW_USER:$NEW_USER" "$f" 2>/dev/null || true
+        chown "${NEW_USER}:$(id -gn "$NEW_USER" 2>/dev/null || echo "$NEW_USER")" "$f" 2>/dev/null || true
     fi
 }
 

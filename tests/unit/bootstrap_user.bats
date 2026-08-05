@@ -92,6 +92,21 @@ teardown() { teardown_bootstrap; }
     [ "$status" -eq 0 ]
 }
 
+@test "в Ubuntu группа admin существует до создания пользователя" {
+    # Регрессия: useradd по умолчанию создаёт одноимённую группу и падает с
+    # «group admin exists». На дефолтном --user admin установка ломалась.
+    if [ "$(. /etc/os-release; echo "$ID")" != "ubuntu" ]; then
+        skip "проверка специфична для Ubuntu"
+    fi
+    run getent group admin
+    [ "$status" -eq 0 ]
+}
+
+@test "create_sudo_user передаёт -g, когда группа уже существует" {
+    grep -q 'getent group "\$name"' "$REPO_ROOT/bootstrap.sh"
+    grep -q 'useradd_opts+=(-g "\$name")' "$REPO_ROOT/bootstrap.sh"
+}
+
 @test "read_password берёт первую строку файла" {
     printf 'secret123\nмусор\n' > "$TEST_TMP/pw"
     PASSWORD_FILE="$TEST_TMP/pw"
