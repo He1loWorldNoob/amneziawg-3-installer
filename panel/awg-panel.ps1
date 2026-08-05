@@ -253,39 +253,66 @@ function Invoke-Remote {
     return $out
 }
 
-# Скачивание conf, QR и ссылки vpn://. Файлы приезжают одной строкой base64 —
-# так они идут по тому же текстовому каналу, что и остальной вывод, и не
-# зависят от того, как ssh и PowerShell обойдутся с сырыми байтами и
-# переводами строк.
+# Скачивание conf, QR и ссылки vpn://. Файлы приезжают строками base64 — так
+# они идут по тому же текстовому каналу, что и остальной вывод, и не зависят от
+# того, как ssh и PowerShell обойдутся с сырыми байтами и переводами строк.
+#
+# ВСЕ файлы забираются ОДНИМ подключением, и это не оптимизация. Установщик
+# ставит на порт SSH `ufw limit`: шестое подключение с одного адреса за 30
+# секунд молча уходит в DROP. Создание ключа — это уже add, затем скачивание, а
+# следом бывает и link; по подключению на файл упиралось в лимит, и хвост
+# набора пропадал с таймаутом вместо ошибки.
 #
 # Обязателен только конфиг: QR может не собраться без qrencode, а ссылки не
-# будет у клиентов, созданных прежними версиями awg3.sh — про эти двое молчим,
+# будет у клиентов, созданных прежними версиями awg3.sh — про этих двоих молчим,
 # иначе каждое скачивание сыпало бы руганью на пустом месте.
 #
 # Возвращает 0, если конфиг скачался.
 function Invoke-Fetch {
     param([string] $Name, [string] $OutDir, [switch] $Quiet)
 
+    $suffixes = @('.conf', '.png', '.vpnuri')
+
+    # Каждый файл предваряется маркером — по нему ответ и разбирается. Сначала
+    # cat без sudo: каталог клиентов принадлежит самому пользователю, а правило
+    # NOPASSWD выдано только на awg3.sh, и sudo cat под ключом не пройдёт. На
+    # sudo откатываемся ради root-установок, где данные лежат в /root/awg. Оба
+    # потока ошибок глушим: их текст смешался бы с base64 и испортил его.
+    $remote = ''
+    foreach ($suffix in $suffixes) {
+        $quoted = Quote-Sh "$RemoteDir/$Name/$Name$suffix"
+        $marker = Quote-Sh ('@@' + $suffix + '@@')
+        $remote += "printf '%s\n' $marker; " +
+                   "{ cat $quoted 2>/dev/null || sudo -n cat $quoted 2>/dev/null; } | base64 -w0; " +
+                   "printf '\n'; "
+    }
+
+    $out = Invoke-Ssh $remote
+    if ($script:LastRc -ne 0) {
+        Write-Err 'Файлы не скачались: сервер не ответил.'
+        Write-Dim 'На порт SSH стоит ufw limit — после нескольких подключений подряд'
+        Write-Dim 'он на полминуты перестаёт отвечать. Подождите и повторите.'
+        return 1
+    }
+
+    # Разбор по маркерам: строка после маркера — либо base64, либо пусто, если
+    # файла на сервере нет.
+    $blocks = @{}
+    $current = ''
+    foreach ($line in @($out)) {
+        $text = "$line".Trim()
+        if ($text -match '^@@(\.[a-z]+)@@$') { $current = $Matches[1]; $blocks[$current] = ''; continue }
+        if ($current -and $text) { $blocks[$current] += $text }
+    }
+
     $got = @()
-    foreach ($item in @(@('.conf', $true), @('.png', $false), @('.vpnuri', $false))) {
-        $suffix   = $item[0]
-        $required = $item[1]
-        $remoteFile = "$RemoteDir/$Name/$Name$suffix"
-        $quoted = Quote-Sh $remoteFile
-
-        # Сначала без sudo: каталог клиентов принадлежит самому пользователю, а
-        # правило NOPASSWD выдано только на awg3.sh — sudo cat под ключом просто
-        # не пройдёт. На sudo откатываемся ради root-установок, где данные лежат
-        # в /root/awg. Оба потока ошибок глушим: их текст всё равно смешался бы
-        # с base64 и испортил его.
-        $out = Invoke-Ssh "{ cat $quoted 2>/dev/null || sudo -n cat $quoted 2>/dev/null; } | base64 -w0"
-        $b64 = (@($out | ForEach-Object { "$_".Trim() }) -join '')
-
+    foreach ($suffix in $suffixes) {
+        $b64 = "$($blocks[$suffix])"
         # Проверяем алфавит base64, а не просто непустоту: любой посторонний
         # текст в ответе (баннер входа, предупреждение) иначе дошёл бы до
         # раскодировщика и уронил панель исключением.
-        if ($script:LastRc -ne 0 -or $b64 -notmatch '^[A-Za-z0-9+/=]+$') {
-            if ($required) { Write-Dim "нет файла: $remoteFile" }
+        if ($b64 -notmatch '^[A-Za-z0-9+/=]+$') {
+            if ($suffix -eq '.conf') { Write-Dim "нет файла: $RemoteDir/$Name/$Name$suffix" }
             continue
         }
 
@@ -306,21 +333,31 @@ function Invoke-Fetch {
 # Путь к скачанной ссылке vpn:// или $null.
 #
 # У клиентов, созданных прежними версиями awg3.sh, файла со ссылкой на сервере
-# нет. Просим собрать его по готовому конфигу и качаем ещё раз: ключи и пир при
-# этом не трогаются. На сервере со старым скриптом команда не найдётся — тогда
-# остаёмся с конфигом и QR, это не ошибка.
+# нет. Просим собрать его по готовому конфигу и забираем: ключи и пир при этом
+# не трогаются, ссылка целиком производна от конфига. На сервере со старым
+# скриптом команда не найдётся — тогда остаёмся с конфигом и QR, это не ошибка.
+#
+# Сборка и выдача — одной командой в одном подключении: лишнее подключение
+# приближает `ufw limit` на сервере, а с ним и молчаливые таймауты.
 function Get-ClientLink {
     param([string] $Name, [string] $OutDir)
 
     $link = Join-Path $OutDir "$Name.vpnuri"
     if (Test-Path $link) { return $link }
 
-    Invoke-Remote -CmdArgs @('link', $Name) -Quiet | Out-Null
+    $script_ = Quote-Sh $RemoteScript
+    $quoted  = Quote-Sh "$RemoteDir/$Name/$Name.vpnuri"
+    $quotedName = Quote-Sh $Name
+    $out = Invoke-Ssh "sudo -n $script_ link $quotedName >/dev/null 2>&1; " +
+                      "{ cat $quoted 2>/dev/null || sudo -n cat $quoted 2>/dev/null; } | base64 -w0"
     if ($script:LastRc -ne 0) { return $null }
 
-    Invoke-Fetch -Name $Name -OutDir $OutDir -Quiet | Out-Null
-    if (Test-Path $link) { return $link }
-    return $null
+    $b64 = (@($out | ForEach-Object { "$_".Trim() }) -join '')
+    if ($b64 -notmatch '^[A-Za-z0-9+/=]+$') { return $null }
+
+    New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+    [System.IO.File]::WriteAllBytes($link, [Convert]::FromBase64String($b64))
+    return $link
 }
 
 # Показывает ссылку и предлагает положить её в буфер обмена: вставить в
