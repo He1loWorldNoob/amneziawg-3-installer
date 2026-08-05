@@ -318,25 +318,32 @@ request_reboot() {
     fi
 
     echo "" >> "$LOG_FILE"
-    log_warn "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    log_warn "!!! SYSTEM REBOOT REQUIRED                                !!!"
-    log_warn "!!! After reboot, run the script again:                   !!!"
-    log_warn "!!! sudo bash $0 [with the same parameters, if any]      !!!"
-    log_warn "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    log_warn "=============================================================="
+    log_warn "  НУЖНА ПЕРЕЗАГРУЗКА"
+    log_warn "  Обновилось ядро. Модуль AmneziaWG должен собираться под то"
+    log_warn "  ядро, которое реально работает, иначе после следующей"
+    log_warn "  перезагрузки он не загрузится."
+    log_warn " "
+    log_warn "  После перезагрузки повторите ТУ ЖЕ команду целиком:"
+    log_warn "    sudo $0 ${ORIGINAL_ARGS:-<те же параметры>}"
+    log_warn " "
+    log_warn "  Важно повторить именно её: от параметров зависит, в чей"
+    log_warn "  домашний каталог лягут конфиги клиентов."
+    log_warn "=============================================================="
     echo "" >> "$LOG_FILE"
     local confirm="y"
     if [[ "$AUTO_YES" -eq 0 ]]; then
-        read -rp "Reboot now? [y/N]: " confirm < /dev/tty
+        read -rp "Перезагрузить сейчас? [y/N]: " confirm < /dev/tty
     else
-        log "Auto-confirming reboot (--yes)."
+        log "Перезагрузка подтверждена автоматически (--yes)."
     fi
-    if [[ "$confirm" =~ ^[[:space:]]*[Yy]([Ee][Ss])?[[:space:]]*$ ]]; then
-        log "Reboot initiated..."
+    if [[ "$confirm" =~ ^[[:space:]]*[YyДд]([Ee][Ss]|[Аа])?[[:space:]]*$ ]]; then
+        log "Перезагружаюсь..."
         sleep 5
-        if ! reboot; then die "Reboot command failed."; fi
+        if ! reboot; then die "команда reboot не сработала"; fi
         exit 1
     else
-        log "Reboot cancelled. Reboot manually and run the script again."
+        log "Перезагрузка отменена. Перезагрузите вручную и повторите команду."
         exit 1
     fi
 }
@@ -3269,7 +3276,12 @@ deploy_server() {
 # Разбор аргументов и запуск
 # ==============================================================================
 
+# Исходные аргументы запоминаются, чтобы предложить их дословно при
+# перезагрузке: от них зависит, в чей домашний каталог лягут конфиги.
+ORIGINAL_ARGS=""
+
 parse_args() {
+    ORIGINAL_ARGS="$*"
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --mode)              MODE="${2:-}"; shift 2 ;;
