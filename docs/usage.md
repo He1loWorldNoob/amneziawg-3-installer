@@ -56,7 +56,7 @@ cd amneziawg-3-installer
 **Шаг 1 — подготовка системы:**
 
 ```bash
-sudo ./bootstrap.sh --user admin --ssh-port 2222 --disable-root-ssh yes
+sudo ./bootstrap.sh --user vpnadmin --ssh-port 2222 --disable-root-ssh yes
 ```
 
 Скрипт спросит пароль для нового пользователя (дважды) и, перед отключением
@@ -67,7 +67,7 @@ root, остановится с требованием проверить нов
 Текущая сессия жива, но НЕ ЗАКРЫВАЙТЕ ЕЁ.
 Откройте ВТОРОЕ окно терминала и проверьте:
 
-    ssh -p 2222 admin@203.0.113.10
+    ssh -p 2222 vpnadmin@203.0.113.10
     sudo -v
 
 Вход и sudo работают? Введите yes целиком:
@@ -83,8 +83,11 @@ root, остановится с требованием проверить нов
 **Шаг 2 — установка AmneziaWG** (уже под новым пользователем):
 
 ```bash
-ssh -p 2222 admin@СЕРВЕР
-cd awg3-deploy
+ssh -p 2222 vpnadmin@СЕРВЕР
+# скачайте репозиторий заново — он остался в домашней папке того, кто
+# скачивал его на первом шаге
+curl -fsSL https://github.com/He1loWorldNoob/amneziawg-3-installer/archive/refs/heads/main.tar.gz \
+  | tar -xz && cd amneziawg-3-installer-main
 sudo ./install-awg3.sh --mode awg-only
 ```
 
@@ -111,7 +114,7 @@ sudo ./install-awg3.sh
 printf 'мой-пароль-минимум-8-символов\n' > /root/pw && chmod 600 /root/pw
 
 sudo ./install-awg3.sh --mode full \
-    --user admin --password-file /root/pw \
+    --user vpnadmin --password-file /root/pw \
     --ssh-port 2222 --disable-root-ssh yes \
     --awg-port 48872 --subnet 10.9.9.1/24 --mtu 1280 \
     --isolation off --ipv6 off \
@@ -190,7 +193,7 @@ sudo awg3 add my_phone
 Отдать клиенту целиком одной папкой:
 
 ```bash
-scp -P 2222 -r admin@СЕРВЕР:~/awg/my_phone ./
+scp -P 2222 -r vpnadmin@СЕРВЕР:~/awg/my_phone ./
 ```
 
 Или показать QR прямо в терминале и отсканировать приложением:

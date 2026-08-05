@@ -8,7 +8,7 @@
 # дальнейшей работе и при этом не отрезать вас от него.
 #
 #   ./bootstrap.sh                       интерактивно
-#   ./bootstrap.sh --user admin --ssh-port 2222 --disable-root-ssh yes --yes
+#   ./bootstrap.sh --user vpnadmin --ssh-port 2222 --disable-root-ssh yes --yes
 #
 # Порядок шагов и есть защита от потери доступа: старый и новый порты открыты
 # одновременно, sshd перезапускается только после проверки конфигурации, а
@@ -23,7 +23,7 @@ BOOTSTRAP_VERSION="1.0.0"
 
 # ── Значения по умолчанию ───────────────────────────────────────────────────
 
-NEW_USER="admin"
+NEW_USER="user"
 NEW_SSH_PORT="22"
 DISABLE_ROOT_SSH="no"
 PASSWORD_FILE=""

@@ -44,8 +44,8 @@ cd amneziawg-3-installer
 
 ```bash
 # под root
-sudo ./bootstrap.sh --user admin --ssh-port 2222 --disable-root-ssh yes
-# переподключиться: ssh -p 2222 admin@СЕРВЕР, затем снова скачать репозиторий
+sudo ./bootstrap.sh --user vpnadmin --ssh-port 2222 --disable-root-ssh yes
+# переподключиться: ssh -p 2222 vpnadmin@СЕРВЕР, затем снова скачать репозиторий
 sudo ./install-awg3.sh --mode awg-only
 sudo awg3 add my_phone          # QR ляжет рядом с конфигом
 ```
@@ -59,7 +59,7 @@ sudo ./install-awg3.sh
 Полностью без вопросов:
 
 ```bash
-sudo ./install-awg3.sh --mode full --user admin --password-file /root/pw \
+sudo ./install-awg3.sh --mode full --user vpnadmin --password-file /root/pw \
     --ssh-port 2222 --disable-root-ssh yes \
     --awg-port 48872 --subnet 10.9.9.1/24 --isolation off \
     --clients my_phone,my_laptop --yes

@@ -3360,7 +3360,7 @@ main() {
                 || die "bootstrap.sh не отработал"
             # Каталог данных переезжает к созданному пользователю: клиенты
             # нужны именно ему, а не тому, кто запустил sudo.
-            AWG_DIR="$(resolve_awg_dir "${BOOTSTRAP_USER:-admin}")"
+            AWG_DIR="$(resolve_awg_dir "${BOOTSTRAP_USER:-user}")"
             LOG_FILE="$AWG_DIR/install-awg3.log"
             STATE_FILE="$AWG_DIR/setup_state"
             prepare_awg_dir
