@@ -45,7 +45,7 @@ $env:PYTHONUTF8 = '1'
 
 $DefaultHost = ''
 $DefaultPort = 22
-$DefaultUser = ''
+$DefaultUser = 'user'
 
 $VpsHost      = $DefaultHost
 $VpsPort      = $DefaultPort
