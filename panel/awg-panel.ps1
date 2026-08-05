@@ -45,7 +45,7 @@ $env:PYTHONUTF8 = '1'
 
 $DefaultHost = ''
 $DefaultPort = 22
-$DefaultUser = 'admin'
+$DefaultUser = ''
 
 $VpsHost      = $DefaultHost
 $VpsPort      = $DefaultPort
@@ -425,8 +425,14 @@ function Read-Connection {
         Write-Err 'Порт должен быть числом от 1 до 65535.'
     }
 
-    $answer = (Read-Host "  Пользователь [$DefaultUser]").Trim()
-    $script:VpsUser = if ($answer) { $answer } else { $DefaultUser }
+    # Как и с адресом: без подсказки просто требуем ввод.
+    while ($true) {
+        $prompt = if ($DefaultUser) { "  Пользователь [$DefaultUser]" } else { '  Пользователь' }
+        $answer = (Read-Host $prompt).Trim()
+        if ($answer) { $script:VpsUser = $answer; break }
+        if ($DefaultUser) { $script:VpsUser = $DefaultUser; break }
+        Write-Err 'Имя пользователя обязательно.'
+    }
 
     # Каталог данных лежит в домашнем каталоге пользователя — так его кладёт
     # install-awg3.sh. У root домашний каталог не в /home.
