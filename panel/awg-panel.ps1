@@ -4,11 +4,13 @@
 # список, статистика, создание и удаление ключей, скачивание conf+QR,
 # бэкап, перезапуск сервиса, генератор параметров.
 #
-# Данные подключения спрашиваются при входе по порядку: имя хоста, порт,
-# пользователь и только потом пароль — ошибку в адресе видно до того, как
-# набран пароль. Пароль нигде не сохраняется и передаётся помощнику через
-# stdin, а не аргументом командной строки: иначе он был бы виден в списке
-# процессов.
+# Работает на одном лишь ssh.exe из состава Windows — ни Python, ни сторонних
+# библиотек не нужно. Всё общение с сервером идёт командами вида
+# `ssh -F конфиг awg <команда>`, а разбор ответа остаётся здесь.
+#
+# Пароль панель не спрашивает и нигде не держит: он нужен только при
+# добавлении сервера, и спрашивает его сам ssh — с клавиатуры, минуя
+# PowerShell. Дальше вход идёт по ключу, и пароль не нужен вовсе.
 #
 # Каждое действие — отдельное SSH-подключение: панель не держит открытую
 # сессию, поэтому забытое окно не оставляет висящего доступа к серверу.
@@ -18,22 +20,19 @@ param()
 
 $ErrorActionPreference = 'Stop'
 
-# Сервер отвечает в UTF-8. PowerShell декодирует вывод внешних программ по
-# кодировке консоли, а она в русской Windows по умолчанию cp866 — без этого
-# кириллица из вывода Python превращается в мусор.
+# Сервер отвечает в UTF-8, а ssh отдаёт его ответ байтами как есть. PowerShell
+# декодирует вывод внешних программ по кодировке консоли, а она в русской
+# Windows по умолчанию cp866 — без этого кириллица от awg3.sh превращается в
+# мусор.
 #
 # ВАЖНО: именно UTF8Encoding с $false, а не [Text.Encoding]::UTF8. Последний
-# включает BOM, и PowerShell дописывает три байта EF BB BF в начало всего,
-# что уходит в stdin внешней программы, — пароль приезжает с невидимым
-# префиксом и сервер отвечает «неверный пароль».
+# включает BOM, и PowerShell дописывает три байта EF BB BF в начало всего, что
+# уходит внешней программе.
 $utf8NoBom = New-Object System.Text.UTF8Encoding $false
 try { [Console]::OutputEncoding = $utf8NoBom } catch { }
-# InputEncoding не трогаем: Read-Host -AsSecureString читает клавиатуру
-# через консольный API, и подмена кодировки ввода ему только мешает.
+# InputEncoding не трогаем: пароль набирается в самом ssh, а он читает
+# клавиатуру через консольный API — подмена кодировки ввода ему только мешает.
 $OutputEncoding = $utf8NoBom
-# Python тоже должен писать в UTF-8, а не в кодировке локали Windows.
-$env:PYTHONIOENCODING = 'utf-8'
-$env:PYTHONUTF8 = '1'
 
 # ── Куда ходим ──────────────────────────────────────────────────────────────
 #
@@ -73,207 +72,35 @@ function Pause-Panel {
     [void](Read-Host)
 }
 
-# ── Помощник на Python ──────────────────────────────────────────────────────
-#
-# Живёт во временном файле всё время работы панели и удаляется на выходе.
-# stdin занят паролем, поэтому передать его через конвейер нельзя.
-
-$helperCode = @'
-import sys, os, base64, shlex, paramiko
-
-# Первая строка stdin — пароль. При входе по ключу она пустая: пароль тогда
-# не нужен вовсе, потому что sudo на сервере настроен через NOPASSWD именно
-# для awg3.sh.
-password = sys.stdin.readline().rstrip("\n")
-host, port, user, mode = sys.argv[1:5]
-rest = sys.argv[5:]
-
-# Путь к приватному ключу передаётся через окружение, а не аргументом:
-# аргументы видны в списке процессов, и хотя сам путь секретом не является,
-# держать всё чувствительное вне командной строки — единое правило здесь.
-keyfile = os.environ.get("AWG_PANEL_KEY") or None
-if keyfile and not os.path.isfile(keyfile):
-    keyfile = None
-
-def fail(msg, code=1):
-    sys.stderr.write(msg + "\n")
-    sys.exit(code)
-
-# Отпечаток сервера запоминается при первом подключении и сверяется дальше.
-#
-# Это не формальность: вход идёт по паролю, и при подмене сервера пароль
-# уходит атакующему в первом же обмене — в отличие от ключей, где подмена
-# стоит ему лишь провала аутентификации. Проверка отпечатка остаётся
-# единственным, что удерживает пароль от утечки.
-#
-# load_host_keys, а не load_system_host_keys: только первый записывает файл
-# обратно при close(), иначе ключ не запоминался бы между запусками и
-# подмену не поймала бы даже вторая попытка.
-hostkeys = os.path.join(os.path.expanduser("~"), ".awg-panel", "known_hosts")
-os.makedirs(os.path.dirname(hostkeys), exist_ok=True)
-open(hostkeys, "a").close()
-
-client = paramiko.SSHClient()
-client.load_host_keys(hostkeys)
-client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-try:
-    if keyfile:
-        client.connect(host, port=int(port), username=user,
-                       key_filename=keyfile, timeout=30,
-                       look_for_keys=False, allow_agent=False)
-    else:
-        client.connect(host, port=int(port), username=user, password=password,
-                       timeout=30, look_for_keys=False, allow_agent=False)
-except paramiko.BadHostKeyException as exc:
-    fail(
-        "ОТПЕЧАТОК СЕРВЕРА ИЗМЕНИЛСЯ.\n"
-        "\n"
-        "Ожидался: %s\n"
-        "Получен:  %s\n"
-        "\n"
-        "Так выглядит и переустановка сервера, и попытка перехвата: кто-то\n"
-        "может выдавать себя за него, чтобы получить ваш пароль. Пароль НЕ\n"
-        "был отправлен.\n"
-        "\n"
-        "Если сервер переустанавливали вы — удалите его строку из файла:\n"
-        "  %s\n"
-        "Если нет — не подключайтесь и разберитесь, что происходит."
-        % (exc.expected_key.get_base64(), exc.key.get_base64(), hostkeys),
-        4,
-    )
-except paramiko.AuthenticationException:
-    fail("Неверный пароль или логин.", 2)
-except Exception as exc:
-    fail("Не удалось подключиться: %s" % exc, 3)
-
-# При входе по ключу пароля нет вовсе, поэтому sudo должен работать без
-# запроса — это обеспечивает правило NOPASSWD, которое ставит режим setup.
-# -n вместо -S: пусть лучше честно упадёт с «требуется пароль», чем молча
-# зависнет в ожидании ввода, которого никто не сделает.
-SUDO = "sudo -n" if keyfile else "sudo -S -p ''"
-
-def run(cmd):
-    stdin, stdout, stderr = client.exec_command(cmd, timeout=300)
-    if not keyfile:
-        stdin.write(password + "\n")
-        stdin.flush()
-    out = stdout.read()
-    err = stderr.read()
-    return stdout.channel.recv_exit_status(), out, err
-
-if mode == "setup":
-    # Разовая настройка входа по ключу: публичная половина кладётся в
-    # authorized_keys, а sudo получает право запускать ТОЛЬКО awg3.sh без
-    # пароля. Узко намеренно: полный NOPASSWD: ALL отдал бы всю машину тому,
-    # кто украдёт ключ, тогда как здесь потеря ограничена управлением VPN.
-    pubkey, remote_script = rest[0], rest[1]
-
-    rc, out, err = run(
-        "install -d -m 700 ~/.ssh && touch ~/.ssh/authorized_keys && "
-        "chmod 600 ~/.ssh/authorized_keys && "
-        "{ grep -qxF %s ~/.ssh/authorized_keys || printf '%%s\\n' %s >> ~/.ssh/authorized_keys; }"
-        % (shlex.quote(pubkey), shlex.quote(pubkey))
-    )
-    if rc != 0:
-        fail("не удалось добавить ключ: %s" % err.decode("utf-8", "replace"), 5)
-
-    # Имя файла в sudoers.d не может содержать точку — иначе он игнорируется.
-    #
-    # Весь блок уходит в ОДИН sudo -S: его stdin занят паролем, поэтому текст
-    # правила нельзя подавать туда же через конвейер — sudo принял бы правило
-    # за пароль и отказал с «no password was provided». По той же причине
-    # sudo здесь ровно один, а не три подряд: пароль пишется в stdin однажды,
-    # и второму вызову он бы уже не достался.
-    # Правило сначала пишется во временный файл и проверяется visudo, и лишь
-    # затем встаёт на место. Обратный порядок — запись в /etc/sudoers.d с
-    # проверкой после — при любой ошибке оставил бы битый файл, а битый файл
-    # в sudoers.d ломает sudo целиком: чинить было бы уже нечем.
-    rule = "%s ALL=(root) NOPASSWD: %s" % (user, remote_script)
-    inner = (
-        "tmp=$(mktemp) && umask 077 && printf '%%s\\n' %s > \"$tmp\" && "
-        "visudo -cf \"$tmp\" >/dev/null && "
-        "install -m 440 -o root -g root \"$tmp\" /etc/sudoers.d/awg3-panel; "
-        "rc=$?; rm -f \"$tmp\"; exit $rc"
-        % shlex.quote(rule)
-    )
-    rc, out, err = run("sudo -S -p '' sh -c %s" % shlex.quote(inner))
-    if rc != 0:
-        fail("не удалось настроить sudo: %s" % err.decode("utf-8", "replace"), 6)
-
-    client.close()
-    print("Ключ добавлен, sudo настроен.")
-    sys.exit(0)
-
-elif mode == "run":
-    # rest — уже разобранные аргументы awg3.sh; quote защищает от пробелов
-    # и спецсимволов в именах.
-    remote_script, args = rest[0], rest[1:]
-    cmd = "%s %s %s" % (SUDO, remote_script, " ".join(shlex.quote(a) for a in args))
-    rc, out, err = run(cmd)
-    sys.stdout.write((out + err).decode("utf-8", "replace"))
-    client.close()
-    sys.exit(rc)
-
-elif mode == "fetch":
-    remote_dir, name, outdir = rest[0], rest[1], rest[2]
-    os.makedirs(outdir, exist_ok=True)
-    got = []
-    for suffix in (".conf", ".png"):
-        remote = "%s/%s/%s%s" % (remote_dir, name, name, suffix)
-        # Сначала без sudo: каталог клиентов принадлежит самому пользователю,
-        # и правило NOPASSWD выдано только на awg3.sh — sudo cat под ключом
-        # просто не пройдёт. На sudo откатываемся ради root-установок, где
-        # данные лежат в /root/awg.
-        rc, out, err = run("cat %s | base64 -w0" % shlex.quote(remote))
-        if rc != 0 or not out.strip():
-            rc, out, err = run("%s cat %s | base64 -w0" % (SUDO, shlex.quote(remote)))
-        if rc != 0 or not out.strip():
-            sys.stderr.write("нет файла: %s\n" % remote)
-            continue
-        local = os.path.join(outdir, name + suffix)
-        with open(local, "wb") as fh:
-            fh.write(base64.b64decode(out.strip()))
-        got.append(local)
-    client.close()
-    if not any(p.endswith(".conf") for p in got):
-        fail("Конфиг не скачался.")
-    for p in got:
-        print("СКАЧАНО: %s" % p)
-    sys.exit(0)
-
-else:
-    fail("Неизвестный режим: %s" % mode)
-'@
 
 # ── Каталоги ────────────────────────────────────────────────────────────────
 #
-# Состояние панели живёт в одном каталоге: отпечатки серверов, список профилей
-# и ключ для входа. Пароль не хранится нигде — вместо него панель заводит
-# SSH-ключ при добавлении сервера.
-#
-# Окружение Python — исключение: оно лежит в `.venv` рядом со скриптом, там же,
-# куда скачиваются готовые конфиги. Так всё, что панель принесла с собой,
-# удаляется вместе с её папкой и не остаётся в профиле пользователя.
+# Состояние панели живёт в одном каталоге: отпечатки серверов, список профилей,
+# ключ для входа и конфиг ssh. Пароль не хранится нигде — вместо него панель
+# заводит SSH-ключ при добавлении сервера.
 
 $PanelDir       = Join-Path $HOME '.awg-panel'
 $KnownHostsPath = Join-Path $PanelDir 'known_hosts'
 $ProfilesPath   = Join-Path $PanelDir 'servers.json'
 $KeyPath        = Join-Path $PanelDir 'id_ed25519'
-$VenvDir        = Join-Path $ScriptDir '.venv'
+$SshConfigPath  = Join-Path $PanelDir 'ssh_config'
+
+# Имя сервера внутри нашего конфига. Настоящие адрес, порт и логин лежат там
+# же, поэтому в командную строку ssh они не попадают вовсе.
+$SshAlias = 'awg-panel-target'
 
 # ── Окружение ───────────────────────────────────────────────────────────────
 
-# Запуск внешней программы. Отдаёт её вывод (stdout и stderr вперемешку,
-# как их видит пользователь), код возврата — в $LASTEXITCODE.
+# Запуск внешней программы. Отдаёт её вывод (stdout и stderr вперемешку, как
+# их видит пользователь), код возврата — в $LASTEXITCODE.
 #
 # Присваивание $ErrorActionPreference здесь ЛОКАЛЬНОЕ и потому обязательное.
 # При 'Stop' PowerShell считает каждую строку, которую программа пишет в
 # stderr, терминирующей ошибкой — но только если stderr перенаправлен
-# (2>&1, 2>$null). Панель падала с NativeCommandError на проверке
-# `python -c 'import paramiko'`: ненайденная библиотека — это трассировка в
-# stderr, то есть ровно тот случай, ради которого проверка и написана. По
-# той же причине падал любой ответ помощника с текстом в stderr: вместо
-# понятного сообщения пользователь видел трассировку PowerShell.
+# (2>&1, 2>$null). А ssh пишет туда в самой обычной работе: и приглашение
+# ввести пароль, и предупреждение о новом отпечатке, и сообщение об отказе.
+# Без этой строки панель падала бы с NativeCommandError вместо того, чтобы
+# показать человеку, что ответил сервер.
 #
 # Внутри функции значение живёт только до возврата и восстанавливается само —
 # ни try/finally, ни ручного отката не нужно. Об успехе судим по коду
@@ -286,139 +113,241 @@ $VenvDir        = Join-Path $ScriptDir '.venv'
 # нашего сообщения. Текст самой программы при этом не теряется — его забирает
 # перенаправление 2>&1 в вывод, который возвращает функция.
 #
-# StdIn пишется в поток ввода программы.
+# Interactive — для случая, когда ssh сам разговаривает с человеком: вывод
+# тогда не перехватываем вовсе, иначе приглашение ввести пароль осталось бы в
+# переменной, а человек смотрел бы на пустой экран.
 function Invoke-Native {
-    param([string] $Exe, [string[]] $ExeArgs, [string] $StdIn)
+    param([string] $Exe, [string[]] $ExeArgs, [switch] $Interactive)
 
     $ErrorActionPreference = 'SilentlyContinue'
     # Если программа не запустилась, кода возврата не будет вовсе и в
     # $LASTEXITCODE остался бы ответ прошлого вызова — возможно, нулевой.
     # Ставим заранее 127: общепринятое «команду выполнить не удалось».
     $global:LASTEXITCODE = 127
-    return $StdIn | & $Exe @ExeArgs 2>&1
+
+    if ($Interactive) {
+        # Start-Process, а не обычный вызов: он отдаёт программе саму консоль и
+        # не заводит канал между ней и PowerShell. Через канал приглашение
+        # «введите пароль» не доходит вовсе: оно приходит строкой без перевода в
+        # конце, а PowerShell отдаёт вывод на экран построчно и держит такую
+        # строку у себя. Человек смотрит на пустой экран, а ssh ждёт ответа —
+        # и оба ждут друг друга до конца времён. Заодно из канала не выбраться
+        # и возвращаемому значению: вывод программы стал бы им, а не кодом.
+        #
+        # Аргументы собираем в строку сами: -ArgumentList склеивает массив через
+        # пробел и ничего не заключает в кавычки, так что путь с пробелом
+        # разъехался бы на два аргумента. Кавычки двойные — их командная строка
+        # Windows как раз понимает, а внутри наших аргументов их нет ни одной
+        # (см. Quote-Sh).
+        $line = ($ExeArgs | ForEach-Object { '"' + $_ + '"' }) -join ' '
+        $proc = Start-Process -FilePath $Exe -ArgumentList $line -NoNewWindow -Wait -PassThru
+        if ($proc) { $global:LASTEXITCODE = $proc.ExitCode }
+        return
+    }
+    return & $Exe @ExeArgs 2>&1
 }
 
-# Путь к интерпретатору внутри окружения. Разложение по папкам у venv разное:
-# Windows кладёт python.exe в Scripts, остальные системы — python в bin.
-function Get-VenvPython {
-    foreach ($rel in 'Scripts\python.exe', 'bin/python') {
-        $path = Join-Path $VenvDir $rel
-        if (Test-Path -LiteralPath $path) { return $path }
-    }
-    return $null
+# Панели нужен только ssh — он входит в Windows 10 и 11 как «Клиент OpenSSH»
+# и в свежих сборках стоит из коробки.
+$ssh = (Get-Command ssh -ErrorAction SilentlyContinue).Source
+if (-not $ssh) {
+    Write-Err 'Не найден ssh.'
+    Write-Dim 'Установите «Клиент OpenSSH»: Параметры → Приложения →'
+    Write-Dim 'Дополнительные компоненты → Добавить компонент.'
+    exit 1
 }
-
-# paramiko ставится в собственное окружение панели, а не в системный Python.
-# Так установка не требует прав администратора (системный Python на Windows
-# лежит в Program Files, куда обычной учётке не записать), не спорит с
-# пакетами системы (свежие сборки Python и Linux-дистрибутивы прямо запрещают
-# pip install мимо пакетного менеджера) и не зависит от того, какой Python
-# окажется первым в PATH завтра.
-#
-# Возвращает путь к интерпретатору с paramiko или $null, если не сложилось.
-function Initialize-Python {
-    $venvPython = Get-VenvPython
-    if ($venvPython) {
-        Invoke-Native $venvPython @('-c', 'import paramiko') | Out-Null
-        if ($LASTEXITCODE -eq 0) { return $venvPython }
-
-        # Окружение ссылается на конкретный exe: если системный Python удалили
-        # или обновили до другой версии, venv перестаёт запускаться целиком.
-        # Такое проще пересоздать с нуля, чем чинить.
-        Invoke-Native $venvPython @('-c', 'pass') | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            Write-Dim 'Окружение панели испорчено — создаю заново.'
-            Remove-Item -LiteralPath $VenvDir -Recurse -Force -ErrorAction SilentlyContinue
-            $venvPython = $null
-        }
-    }
-
-    $python = (Get-Command python -ErrorAction SilentlyContinue).Source
-    if (-not $python) { $python = (Get-Command python3 -ErrorAction SilentlyContinue).Source }
-    if (-not $python) {
-        Write-Err 'Не найден Python. Установите его с python.org и повторите.'
-        Write-Dim 'При установке отметьте «Add python.exe to PATH».'
-        return $null
-    }
-
-    if (-not $venvPython) {
-        Write-Host '  Готовлю окружение панели (разово)...' -ForegroundColor Cyan
-        $log = Invoke-Native $python @('-m', 'venv', $VenvDir)
-        # Судим по факту наличия интерпретатора, а не по коду возврата: venv
-        # умеет отчитаться об ошибке обновления pip, собрав при этом рабочее
-        # окружение, — а нам нужно именно оно.
-        $venvPython = Get-VenvPython
-        if (-not $venvPython) {
-            foreach ($line in $log) { Write-Dim $line }
-            Write-Err "Не удалось создать окружение в $VenvDir."
-            return $null
-        }
-    }
-
-    Write-Host '  Ставлю библиотеку paramiko (нужна для SSH)...' -ForegroundColor Cyan
-    $log = Invoke-Native $venvPython @('-m', 'pip', 'install', '--quiet', 'paramiko')
-
-    # Проверяем импортом, а не кодом pip: пакет мог поставиться, но не собраться
-    # (у paramiko есть модули на C), и тогда падало бы уже первое подключение.
-    Invoke-Native $venvPython @('-c', 'import paramiko') | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        foreach ($line in $log) { Write-Dim $line }
-        Write-Err 'Не удалось установить paramiko.'
-        Write-Dim "Удалите папку $VenvDir и запустите панель заново."
-        return $null
-    }
-
-    return $venvPython
-}
-
-$python = Initialize-Python
-if (-not $python) { exit 1 }
-
-$helperPath = Join-Path ([System.IO.Path]::GetTempPath()) ("awg-panel-{0}.py" -f [guid]::NewGuid())
-Set-Content -LiteralPath $helperPath -Value $helperCode -Encoding utf8
 
 # ── Вызовы сервера ──────────────────────────────────────────────────────────
 
-$script:Password = $null
-
-# Путь к ключу уходит помощнику через окружение: при подключении по ключу
-# пароля нет вовсе, и помощник должен об этом знать. Пустое значение —
-# признак входа по паролю.
-function Set-AuthMode {
-    param([bool] $UseKey)
-    $env:AWG_PANEL_KEY = if ($UseKey) { $KeyPath } else { '' }
+# Одинарные кавычки для оболочки на сервере. Через неё проходит всё, что туда
+# уезжает: имена клиентов панель проверяет регулярками, но пути и ключи берутся
+# из настроек, и защита от пробела в них должна быть общей.
+#
+# Двойных кавычек в удалённой команде нет ни одной, и это правило: Windows
+# PowerShell 5.1 портит их при передаче внешней программе, и строка доезжает до
+# ssh разорванной. Одинарные он не трогает.
+function Quote-Sh {
+    param([string] $Value)
+    return "'" + $Value.Replace("'", "'\''") + "'"
 }
 
-# Единственное место, откуда запускается помощник. Пароль уходит ему первой
-# строкой stdin, а не аргументом: аргументы видны в списке процессов.
-# Возвращает строки вывода, код — в $script:LastRc.
-function Invoke-Helper {
-    param([string[]] $HelperArgs)
+# Конфиг ssh панель пишет сама и передаёт его через -F. Так у команды остаётся
+# один короткий аргумент вместо десятка -o, а путь с пробелом (скажем,
+# C:\Users\Иван Петров\.awg-panel) можно взять в кавычки: внутри файла их
+# разбирает сам ssh, и порча кавычек в командной строке Windows нам уже не
+# грозит.
+#
+# -F заодно отсекает ~/.ssh/config пользователя: панель должна ходить на сервер
+# одинаково у всех, а не так, как человек однажды настроил себе что-то другое.
+function Write-SshConfig {
+    New-Item -ItemType Directory -Force -Path $PanelDir | Out-Null
 
-    $out = Invoke-Native $python (@($helperPath) + $HelperArgs) $script:Password
+    # HashKnownHosts no: пункт «забыть отпечаток» ищет строку по имени хоста,
+    # а хешированную запись так не найти.
+    # IdentitiesOnly yes: иначе ssh-agent успеет предложить свои ключи и
+    # исчерпать лимит попыток раньше, чем дойдёт до нашего.
+    $lines = @(
+        '# Файл создаётся панелью заново при каждом подключении — править смысла нет.',
+        "Host $SshAlias",
+        "    HostName $VpsHost",
+        "    Port $VpsPort",
+        "    User $VpsUser",
+        "    IdentityFile `"$KeyPath`"",
+        "    UserKnownHostsFile `"$KnownHostsPath`"",
+        '    IdentitiesOnly yes',
+        '    HashKnownHosts no',
+        '    ConnectTimeout 15',
+        '    ServerAliveInterval 30',
+        '    ServerAliveCountMax 3'
+    )
+
+    # WriteAllLines, а не Set-Content: у последнего в PowerShell 5.1 кодировка
+    # utf8 означает «с BOM», а три лишних байта перед первой строкой ssh считает
+    # неизвестной директивой и отказывается читать файл целиком.
+    [System.IO.File]::WriteAllLines($SshConfigPath, $lines, $utf8NoBom)
+}
+
+# Базовый вызов. Возвращает строки вывода, код — в $script:LastRc.
+#
+# -n закрывает ssh ввод с клавиатуры: команда неинтерактивная и подвиснуть в
+# ожидании ввода, которого никто не сделает, она не должна. BatchMode=yes — та
+# же мысль про пароль: ключ либо принят, либо честная ошибка, а не приглашение
+# к вводу в перехваченный поток, которого человек даже не увидит.
+function Invoke-Ssh {
+    param([string] $Command)
+
+    $out = Invoke-Native $ssh @(
+        '-F', $SshConfigPath,
+        '-n',
+        '-o', 'BatchMode=yes',
+        '-o', 'StrictHostKeyChecking=yes',
+        $SshAlias, $Command
+    )
     $script:LastRc = $LASTEXITCODE
     return $out
 }
 
-# Выполняет awg3.sh с аргументами. Возвращает строки вывода, код — в $script:LastRc.
+# Отличает подмену отпечатка от обычного отказа: ssh в этом случае печатает
+# заметный блок с этой строкой и не пробует подключиться дальше.
+function Test-HostKeyChanged {
+    param($Out)
+    return [bool]($Out | Select-String -SimpleMatch -Quiet 'REMOTE HOST IDENTIFICATION HAS CHANGED')
+}
+
+# Выполняет awg3.sh с аргументами. Возвращает строки вывода, код — в
+# $script:LastRc.
 function Invoke-Remote {
     # Не $Args: так называется автоматическая переменная PowerShell.
     param([string[]] $CmdArgs, [switch] $Quiet)
 
-    $out = Invoke-Helper (@($VpsHost, $VpsPort, $VpsUser, 'run', $RemoteScript) + $CmdArgs)
+    # sudo -n, а не -S: правило NOPASSWD выдано именно на awg3.sh, и если оно
+    # почему-то не сработало, пусть будет честное «требуется пароль» вместо
+    # молчаливого ожидания ввода, которого некому сделать.
+    $remote = 'sudo -n ' + (Quote-Sh $RemoteScript)
+    foreach ($arg in $CmdArgs) { $remote += ' ' + (Quote-Sh $arg) }
 
+    $out = Invoke-Ssh $remote
     if (-not $Quiet) {
         foreach ($line in $out) { Write-Host "  $line" }
     }
     return $out
 }
 
+# Скачивание conf и QR. Файлы приезжают одной строкой base64 — так они идут по
+# тому же текстовому каналу, что и остальной вывод, и не зависят от того, как
+# ssh и PowerShell обойдутся с сырыми байтами и переводами строк.
+#
+# Возвращает 0, если конфиг скачался.
 function Invoke-Fetch {
     param([string] $Name, [string] $OutDir)
 
-    $out = Invoke-Helper @($VpsHost, $VpsPort, $VpsUser, 'fetch', $RemoteDir, $Name, $OutDir)
-    foreach ($line in $out) { Write-Host "  $line" }
-    return $script:LastRc
+    $got = @()
+    foreach ($suffix in @('.conf', '.png')) {
+        $remoteFile = "$RemoteDir/$Name/$Name$suffix"
+        $quoted = Quote-Sh $remoteFile
+
+        # Сначала без sudo: каталог клиентов принадлежит самому пользователю, а
+        # правило NOPASSWD выдано только на awg3.sh — sudo cat под ключом просто
+        # не пройдёт. На sudo откатываемся ради root-установок, где данные лежат
+        # в /root/awg. Оба потока ошибок глушим: их текст всё равно смешался бы
+        # с base64 и испортил его.
+        $out = Invoke-Ssh "{ cat $quoted 2>/dev/null || sudo -n cat $quoted 2>/dev/null; } | base64 -w0"
+        $b64 = (@($out | ForEach-Object { "$_".Trim() }) -join '')
+
+        # Проверяем алфавит base64, а не просто непустоту: любой посторонний
+        # текст в ответе (баннер входа, предупреждение) иначе дошёл бы до
+        # раскодировщика и уронил панель исключением.
+        if ($script:LastRc -ne 0 -or $b64 -notmatch '^[A-Za-z0-9+/=]+$') {
+            Write-Dim "нет файла: $remoteFile"
+            continue
+        }
+
+        New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+        $local = Join-Path $OutDir ($Name + $suffix)
+        [System.IO.File]::WriteAllBytes($local, [Convert]::FromBase64String($b64))
+        Write-Host "  СКАЧАНО: $local"
+        $got += $local
+    }
+
+    if (-not (@($got) | Where-Object { $_.EndsWith('.conf') })) {
+        Write-Err 'Конфиг не скачался.'
+        return 1
+    }
+    return 0
+}
+
+# Разовая настройка сервера: открытая половина ключа уходит в authorized_keys, а
+# sudo получает право запускать без пароля ТОЛЬКО awg3.sh. Узко намеренно:
+# полный NOPASSWD: ALL отдал бы всю машину тому, кто украдёт ключ, тогда как
+# здесь потеря ограничена управлением VPN.
+#
+# Единственное место, где нужен пароль, — и спрашивает его сам ssh. Поэтому
+# вывод не перехватываем: приглашения и предупреждение о новом отпечатке должны
+# дойти до человека как есть. -t даёт удалённой стороне терминал, без него sudo
+# не сможет спросить пароль, а PubkeyAuthentication=no не даёт ssh тратить
+# попытки на ключ, которого на сервере ещё нет.
+function Invoke-Setup {
+    param([string] $PubKey)
+
+    # Имя файла в sudoers.d не может содержать точку — иначе он игнорируется.
+    #
+    # Правило сначала пишется во временный файл и проверяется visudo, и лишь
+    # затем встаёт на место. Обратный порядок — запись в /etc/sudoers.d с
+    # проверкой после — при любой ошибке оставил бы битый файл, а битый файл в
+    # sudoers.d ломает sudo целиком: чинить было бы уже нечем.
+    #
+    # Путь временного файла уходит внутрь sudo аргументом ($1), а не подстановкой
+    # в текст правила: подставлять пришлось бы в двойных кавычках, а их в этой
+    # команде нет ни одной (см. Quote-Sh). Само правило пробелы содержит, но оно
+    # уже завёрнуто в одинарные кавычки здесь, на нашей стороне.
+    $pub   = Quote-Sh $PubKey
+    $rule  = Quote-Sh ('{0} ALL=(root) NOPASSWD: {1}' -f $VpsUser, $RemoteScript)
+    $inner = Quote-Sh 'visudo -cf $1 >/dev/null && install -m 440 -o root -g root $1 /etc/sudoers.d/awg3-panel'
+    $keys  = '$HOME/.ssh/authorized_keys'
+
+    $remote = @(
+        'umask 077',
+        'install -d -m 700 $HOME/.ssh',
+        "touch $keys",
+        "chmod 600 $keys",
+        "{ grep -qxF $pub $keys || printf '%s\n' $pub >> $keys; }",
+        't=$(mktemp)',
+        # trap, а не rm в конце: на приглашении sudo человек может передумать и
+        # нажать Ctrl+C, и тогда оболочка на сервере умрёт, не дойдя до уборки.
+        # Ловим и обрыв связи (HUP), и Ctrl+C (INT), и обычный выход.
+        "trap 'rm -f `$t' EXIT HUP INT TERM",
+        "printf '%s\n' $rule > `$t",
+        "sudo sh -c $inner _ `$t"
+    ) -join ' && '
+
+    Invoke-Native $ssh @(
+        '-F', $SshConfigPath,
+        '-t',
+        '-o', 'PubkeyAuthentication=no',
+        '-o', 'StrictHostKeyChecking=ask',
+        $SshAlias, $remote
+    ) -Interactive
+    return $LASTEXITCODE
 }
 
 function Get-ClientNames {
@@ -498,8 +427,8 @@ function Ensure-PanelKey {
     New-Item -ItemType Directory -Force -Path $PanelDir | Out-Null
     # Именно "" (двойные), а не '""': одинарные кавычки в PowerShell дают
     # буквальные два символа кавычки, и они становятся ПАРОЛЬНОЙ ФРАЗОЙ.
-    # Ключ тогда создаётся зашифрованным, а paramiko открыть его не может и
-    # сообщает про неверный пароль — искать причину приходится долго.
+    # Ключ тогда создаётся зашифрованным, и ssh при каждом действии панели
+    # спрашивал бы фразу — а под BatchMode просто отказывал бы во входе.
     # Комментарий с именем машины: он же служит меткой при повторной
     # настройке — заменяем запись именно этого компьютера, не трогая ключи
     # других, с которых вы тоже могли подключаться.
@@ -525,7 +454,8 @@ function Ensure-PanelKey {
 }
 
 # Убирает запись о сервере, чтобы следующий вход запомнил новый отпечаток.
-# paramiko пишет "host" для порта 22 и "[host]:port" для остальных.
+# ssh пишет "host" для порта 22 и "[host]:port" для остальных; хеширование
+# имён отключено в нашем конфиге, иначе искать было бы нечего.
 function Remove-KnownHost {
     param([string] $ServerHost, [int] $ServerPort)
 
@@ -784,7 +714,9 @@ function Read-Connection {
     $script:RemoteScript = "$home_/awg/awg3.sh"
 }
 
-# Применяет профиль к переменным подключения.
+# Применяет профиль к переменным подключения. Конфиг ssh переписываем здесь же:
+# это единственное место, после которого меняется, куда пойдёт следующая
+# команда, и разъехаться эти два знания не должны.
 function Use-Profile {
     param($Item)
     $script:VpsHost = $Item.host
@@ -793,10 +725,12 @@ function Use-Profile {
     $home_ = if ($Item.user -eq 'root') { '/root' } else { "/home/$($Item.user)" }
     $script:RemoteDir    = "$home_/awg"
     $script:RemoteScript = "$home_/awg/awg3.sh"
+    Write-SshConfig
 }
 
-# Добавление сервера: один раз спрашиваем пароль, кладём ключ и настраиваем
-# sudo — дальше вход без вопросов.
+# Добавление сервера: кладём ключ и настраиваем sudo — дальше вход без
+# вопросов. Пароль спрашивает сам ssh, и это единственный раз, когда он вообще
+# нужен.
 function New-ServerProfile {
     Write-Head 'Новый сервер'
     Read-Connection
@@ -804,32 +738,27 @@ function New-ServerProfile {
 
     if (-not (Ensure-PanelKey)) { return $false }
 
-    $script:Password = Read-Password
-    if (-not $script:Password) { Write-Err 'Пароль не введён.'; return $false }
-
     Write-Host ''
-    Write-Host '  Настраиваю вход по ключу...' -ForegroundColor DarkGray
-    Set-AuthMode $false
+    Write-Dim 'Дальше спрашивает сам ssh — панель пароль не видит и не хранит:'
+    Write-Dim '  • отпечаток сервера, если подключаемся к нему впервые (ответ yes);'
+    Write-Dim '  • пароль пользователя — для входа;'
+    Write-Dim '  • его же ещё раз — для sudo на сервере.'
+    Write-Host ''
 
     $pub = (Get-Content "$KeyPath.pub" -Raw).Trim()
-    $out = Invoke-Helper @($VpsHost, $VpsPort, $VpsUser, 'setup', $pub, $RemoteScript)
-    $rc = $script:LastRc
+    $rc = Invoke-Setup -PubKey $pub
 
-    if ($rc -eq 4) {
-        foreach ($line in $out) { Write-Host "  $line" -ForegroundColor Yellow }
-        return $false
-    }
     if ($rc -ne 0) {
-        foreach ($line in $out) { Write-Host "  $line" -ForegroundColor Red }
+        Write-Host ''
         Write-Err 'Не удалось настроить вход по ключу.'
-        if ($rc -eq 2) { Write-Warn 'Проверьте пароль и имя пользователя.' }
+        # 255 — код самого ssh: до выполнения команды дело не дошло.
+        if ($rc -eq 255) {
+            Write-Warn 'Проверьте адрес, порт, логин и пароль. Несколько неверных попыток'
+            Write-Warn 'подряд — и fail2ban заблокирует ваш IP примерно на 10 минут.'
+        }
         return $false
     }
     Write-Ok 'Ключ добавлен, sudo настроен.'
-
-    # Пароль больше не нужен: дальше только ключ. Забываем его из памяти.
-    $script:Password = ''
-    Set-AuthMode $true
 
     Write-Host '  Проверяю вход по ключу...' -ForegroundColor DarkGray
     Invoke-Remote -CmdArgs @('names') -Quiet | Out-Null
@@ -906,8 +835,6 @@ function Select-Server {
                 $idx = [int]$choice
                 if ($idx -ge 1 -and $idx -le $items.Count) {
                     Use-Profile $items[$idx - 1]
-                    $script:Password = ''
-                    Set-AuthMode $true
                     return $true
                 }
                 Write-Err 'Нет такого номера.'
@@ -915,22 +842,6 @@ function Select-Server {
             default { Write-Err 'Не понял. Введите номер, N, D или Q.' }
         }
     }
-}
-
-function Read-Password {
-    Write-Host ''
-    Write-Host "  Сервер: $VpsUser@$VpsHost`:$VpsPort" -ForegroundColor DarkGray
-    $secure = Read-Host "  Пароль администратора ($VpsUser)" -AsSecureString
-
-    if ($PSVersionTable.PSVersion.Major -ge 7) {
-        $plain = ConvertFrom-SecureString $secure -AsPlainText
-    } else {
-        # Windows PowerShell 5.1: у ConvertFrom-SecureString нет -AsPlainText.
-        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
-        try   { $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
-        finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
-    }
-    return $plain
 }
 
 function Show-Banner {
@@ -978,11 +889,13 @@ try {
     # Смена отпечатка — не сбой входа, а предупреждение о возможной подмене
     # сервера. Предлагаем забыть старый ключ, но подтверждение строгое:
     # ответ «yes» целиком, как и при отключении root в bootstrap.sh. Беглое
-    # «y» здесь означало бы отдать пароль тому, кто выдаёт себя за сервер.
-    if ($script:LastRc -eq 4) {
+    # «y» здесь означало бы согласиться разговаривать с тем, кто выдаёт себя
+    # за ваш сервер.
+    if (Test-HostKeyChanged $probe) {
         Write-Host ''
         foreach ($line in $probe) { Write-Host "  $line" -ForegroundColor Yellow }
         Write-Host ''
+        Write-Warn 'Так выглядит и переустановка сервера, и попытка подмены.'
         Write-Warn 'Соглашайтесь ТОЛЬКО если сервер переустанавливали вы сами.'
         $answer = Read-Host '  Забыть прежний отпечаток и подключиться? Введите yes целиком'
         if ($answer -ne 'yes') {
@@ -1001,11 +914,11 @@ try {
         Write-Host ''
         foreach ($line in $probe) { Write-Host "  $line" -ForegroundColor Red }
         Write-Err 'Вход не удался.'
-        # На сервере включён fail2ban: несколько неверных попыток подряд
-        # заблокируют этот IP, и сервер просто перестанет отвечать.
-        if ($script:LastRc -eq 2) {
-            Write-Warn 'Проверьте пароль. Несколько неверных попыток подряд — и fail2ban'
-            Write-Warn 'заблокирует ваш IP примерно на 10 минут.'
+        # 255 — код самого ssh: до запуска awg3.sh дело не дошло. Причина почти
+        # всегда одна из двух: сервер не отвечает или не принял наш ключ.
+        if ($script:LastRc -eq 255) {
+            Write-Warn 'Сервер не ответил или не принял ключ панели. Если сервер'
+            Write-Warn 'переустанавливали, добавьте его заново — пункт N в списке.'
         }
         exit 1
     }
@@ -1035,12 +948,10 @@ try {
     }
 }
 finally {
-    # Ни пароль, ни помощник не должны пережить выход из панели.
-    Remove-Item -LiteralPath $helperPath -Force -ErrorAction SilentlyContinue
-    $script:Password = $null
-    [System.GC]::Collect()
+    # Панель не держит ни пароля, ни открытой сессии: чистить на выходе нечего,
+    # а сообщение нужно на любом пути выхода — в том числе через exit.
     Write-Host ''
-    Write-Host '  Панель закрыта, пароль из памяти убран.' -ForegroundColor DarkGray
+    Write-Host '  Панель закрыта.' -ForegroundColor DarkGray
 }
 
 
