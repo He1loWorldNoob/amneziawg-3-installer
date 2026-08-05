@@ -245,21 +245,134 @@ else:
     fail("Неизвестный режим: %s" % mode)
 '@
 
+# ── Каталоги ────────────────────────────────────────────────────────────────
+#
+# Состояние панели живёт в одном каталоге: отпечатки серверов, список профилей
+# и ключ для входа. Пароль не хранится нигде — вместо него панель заводит
+# SSH-ключ при добавлении сервера.
+#
+# Окружение Python — исключение: оно лежит в `.venv` рядом со скриптом, там же,
+# куда скачиваются готовые конфиги. Так всё, что панель принесла с собой,
+# удаляется вместе с её папкой и не остаётся в профиле пользователя.
+
+$PanelDir       = Join-Path $HOME '.awg-panel'
+$KnownHostsPath = Join-Path $PanelDir 'known_hosts'
+$ProfilesPath   = Join-Path $PanelDir 'servers.json'
+$KeyPath        = Join-Path $PanelDir 'id_ed25519'
+$VenvDir        = Join-Path $ScriptDir '.venv'
+
 # ── Окружение ───────────────────────────────────────────────────────────────
 
-$python = (Get-Command python -ErrorAction SilentlyContinue).Source
-if (-not $python) { $python = (Get-Command python3 -ErrorAction SilentlyContinue).Source }
-if (-not $python) {
-    Write-Err 'Не найден Python. Установите его с python.org и повторите.'
-    exit 1
+# Запуск внешней программы. Отдаёт её вывод (stdout и stderr вперемешку,
+# как их видит пользователь), код возврата — в $LASTEXITCODE.
+#
+# Присваивание $ErrorActionPreference здесь ЛОКАЛЬНОЕ и потому обязательное.
+# При 'Stop' PowerShell считает каждую строку, которую программа пишет в
+# stderr, терминирующей ошибкой — но только если stderr перенаправлен
+# (2>&1, 2>$null). Панель падала с NativeCommandError на проверке
+# `python -c 'import paramiko'`: ненайденная библиотека — это трассировка в
+# stderr, то есть ровно тот случай, ради которого проверка и написана. По
+# той же причине падал любой ответ помощника с текстом в stderr: вместо
+# понятного сообщения пользователь видел трассировку PowerShell.
+#
+# Внутри функции значение живёт только до возврата и восстанавливается само —
+# ни try/finally, ни ручного отката не нужно. Об успехе судим по коду
+# возврата, единственному надёжному признаку для внешних программ; заодно это
+# снимает $PSNativeCommandUseErrorActionPreference из PowerShell 7.3+, где
+# ненулевой код бросает исключение и вовсе без перенаправления.
+#
+# 'SilentlyContinue', а не 'Continue': программа может и вовсе не запуститься
+# (файла нет, нет прав), и тогда PowerShell пишет об этом своей ошибкой поверх
+# нашего сообщения. Текст самой программы при этом не теряется — его забирает
+# перенаправление 2>&1 в вывод, который возвращает функция.
+#
+# StdIn пишется в поток ввода программы.
+function Invoke-Native {
+    param([string] $Exe, [string[]] $ExeArgs, [string] $StdIn)
+
+    $ErrorActionPreference = 'SilentlyContinue'
+    # Если программа не запустилась, кода возврата не будет вовсе и в
+    # $LASTEXITCODE остался бы ответ прошлого вызова — возможно, нулевой.
+    # Ставим заранее 127: общепринятое «команду выполнить не удалось».
+    $global:LASTEXITCODE = 127
+    return $StdIn | & $Exe @ExeArgs 2>&1
 }
 
-& $python -c 'import paramiko' 2>$null
-if ($LASTEXITCODE -ne 0) {
-    Write-Host '  Ставлю библиотеку paramiko (нужна для SSH)...' -ForegroundColor Cyan
-    & $python -m pip install --quiet paramiko
-    if ($LASTEXITCODE -ne 0) { Write-Err 'Не удалось установить paramiko.'; exit 1 }
+# Путь к интерпретатору внутри окружения. Разложение по папкам у venv разное:
+# Windows кладёт python.exe в Scripts, остальные системы — python в bin.
+function Get-VenvPython {
+    foreach ($rel in 'Scripts\python.exe', 'bin/python') {
+        $path = Join-Path $VenvDir $rel
+        if (Test-Path -LiteralPath $path) { return $path }
+    }
+    return $null
 }
+
+# paramiko ставится в собственное окружение панели, а не в системный Python.
+# Так установка не требует прав администратора (системный Python на Windows
+# лежит в Program Files, куда обычной учётке не записать), не спорит с
+# пакетами системы (свежие сборки Python и Linux-дистрибутивы прямо запрещают
+# pip install мимо пакетного менеджера) и не зависит от того, какой Python
+# окажется первым в PATH завтра.
+#
+# Возвращает путь к интерпретатору с paramiko или $null, если не сложилось.
+function Initialize-Python {
+    $venvPython = Get-VenvPython
+    if ($venvPython) {
+        Invoke-Native $venvPython @('-c', 'import paramiko') | Out-Null
+        if ($LASTEXITCODE -eq 0) { return $venvPython }
+
+        # Окружение ссылается на конкретный exe: если системный Python удалили
+        # или обновили до другой версии, venv перестаёт запускаться целиком.
+        # Такое проще пересоздать с нуля, чем чинить.
+        Invoke-Native $venvPython @('-c', 'pass') | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Dim 'Окружение панели испорчено — создаю заново.'
+            Remove-Item -LiteralPath $VenvDir -Recurse -Force -ErrorAction SilentlyContinue
+            $venvPython = $null
+        }
+    }
+
+    $python = (Get-Command python -ErrorAction SilentlyContinue).Source
+    if (-not $python) { $python = (Get-Command python3 -ErrorAction SilentlyContinue).Source }
+    if (-not $python) {
+        Write-Err 'Не найден Python. Установите его с python.org и повторите.'
+        Write-Dim 'При установке отметьте «Add python.exe to PATH».'
+        return $null
+    }
+
+    if (-not $venvPython) {
+        Write-Host '  Готовлю окружение панели (разово)...' -ForegroundColor Cyan
+        $log = Invoke-Native $python @('-m', 'venv', $VenvDir)
+        # Судим по факту наличия интерпретатора, а не по коду возврата: venv
+        # умеет отчитаться об ошибке обновления pip, собрав при этом рабочее
+        # окружение, — а нам нужно именно оно.
+        $venvPython = Get-VenvPython
+        if (-not $venvPython) {
+            foreach ($line in $log) { Write-Dim $line }
+            Write-Err "Не удалось создать окружение в $VenvDir."
+            return $null
+        }
+    }
+
+    Write-Host '  Ставлю библиотеку paramiko (нужна для SSH)...' -ForegroundColor Cyan
+    $log = Invoke-Native $venvPython @('-m', 'pip', 'install', '--quiet', 'paramiko')
+
+    # Проверяем импортом, а не кодом pip: пакет мог поставиться, но не собраться
+    # (у paramiko есть модули на C), и тогда падало бы уже первое подключение.
+    Invoke-Native $venvPython @('-c', 'import paramiko') | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        foreach ($line in $log) { Write-Dim $line }
+        Write-Err 'Не удалось установить paramiko.'
+        Write-Dim "Удалите папку $VenvDir и запустите панель заново."
+        return $null
+    }
+
+    return $venvPython
+}
+
+$python = Initialize-Python
+if (-not $python) { exit 1 }
 
 $helperPath = Join-Path ([System.IO.Path]::GetTempPath()) ("awg-panel-{0}.py" -f [guid]::NewGuid())
 Set-Content -LiteralPath $helperPath -Value $helperCode -Encoding utf8
@@ -276,14 +389,23 @@ function Set-AuthMode {
     $env:AWG_PANEL_KEY = if ($UseKey) { $KeyPath } else { '' }
 }
 
+# Единственное место, откуда запускается помощник. Пароль уходит ему первой
+# строкой stdin, а не аргументом: аргументы видны в списке процессов.
+# Возвращает строки вывода, код — в $script:LastRc.
+function Invoke-Helper {
+    param([string[]] $HelperArgs)
+
+    $out = Invoke-Native $python (@($helperPath) + $HelperArgs) $script:Password
+    $script:LastRc = $LASTEXITCODE
+    return $out
+}
+
 # Выполняет awg3.sh с аргументами. Возвращает строки вывода, код — в $script:LastRc.
 function Invoke-Remote {
     # Не $Args: так называется автоматическая переменная PowerShell.
     param([string[]] $CmdArgs, [switch] $Quiet)
 
-    $all = @($VpsHost, $VpsPort, $VpsUser, 'run', $RemoteScript) + $CmdArgs
-    $out = $script:Password | & $python $helperPath @all 2>&1
-    $script:LastRc = $LASTEXITCODE
+    $out = Invoke-Helper (@($VpsHost, $VpsPort, $VpsUser, 'run', $RemoteScript) + $CmdArgs)
 
     if (-not $Quiet) {
         foreach ($line in $out) { Write-Host "  $line" }
@@ -294,9 +416,7 @@ function Invoke-Remote {
 function Invoke-Fetch {
     param([string] $Name, [string] $OutDir)
 
-    $all = @($VpsHost, $VpsPort, $VpsUser, 'fetch', $RemoteDir, $Name, $OutDir)
-    $out = $script:Password | & $python $helperPath @all 2>&1
-    $script:LastRc = $LASTEXITCODE
+    $out = Invoke-Helper @($VpsHost, $VpsPort, $VpsUser, 'fetch', $RemoteDir, $Name, $OutDir)
     foreach ($line in $out) { Write-Host "  $line" }
     return $script:LastRc
 }
@@ -339,15 +459,6 @@ function Confirm-Action {
 }
 
 # ── Профили серверов ────────────────────────────────────────────────────────
-#
-# Всё состояние панели живёт в одном каталоге: отпечатки серверов, список
-# профилей и ключ для входа. Пароль не хранится нигде — вместо него панель
-# заводит SSH-ключ при добавлении сервера.
-
-$PanelDir       = Join-Path $HOME '.awg-panel'
-$KnownHostsPath = Join-Path $PanelDir 'known_hosts'
-$ProfilesPath   = Join-Path $PanelDir 'servers.json'
-$KeyPath        = Join-Path $PanelDir 'id_ed25519'
 
 function Get-Profiles {
     if (-not (Test-Path $ProfilesPath)) { return @() }
@@ -370,6 +481,12 @@ function Save-Profiles {
 # Ключ создаётся один на все серверы: он нужен, чтобы не хранить пароль, а не
 # чтобы разграничивать доступ между ними.
 function Ensure-PanelKey {
+    # ssh-keygen тоже пишет в stderr в штатной работе — см. Invoke-Native.
+    # Здесь запускаем его напрямую, а не через неё: пустой аргумент («-N ""» —
+    # ключ без парольной фразы) PowerShell по дороге в массиве теряет, а
+    # потерянный -N превратил бы запуск в молчаливое ожидание ввода фразы.
+    $ErrorActionPreference = 'Continue'
+
     $keygen = (Get-Command ssh-keygen -ErrorAction SilentlyContinue).Source
     if (-not $keygen) {
         Write-Err 'Не найден ssh-keygen. Установите OpenSSH Client в компонентах Windows.'
@@ -695,9 +812,8 @@ function New-ServerProfile {
     Set-AuthMode $false
 
     $pub = (Get-Content "$KeyPath.pub" -Raw).Trim()
-    $all = @($VpsHost, $VpsPort, $VpsUser, 'setup', $pub, $RemoteScript)
-    $out = $script:Password | & $python $helperPath @all 2>&1
-    $rc = $LASTEXITCODE
+    $out = Invoke-Helper @($VpsHost, $VpsPort, $VpsUser, 'setup', $pub, $RemoteScript)
+    $rc = $script:LastRc
 
     if ($rc -eq 4) {
         foreach ($line in $out) { Write-Host "  $line" -ForegroundColor Yellow }
