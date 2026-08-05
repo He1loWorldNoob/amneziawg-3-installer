@@ -579,6 +579,33 @@ function Action-Migrate {
     Invoke-Remote -CmdArgs @('migrate', '-y') | Out-Null
 }
 
+function Action-Endpoint {
+    Write-Head 'Имя хоста для клиентов'
+
+    # Текущее значение показываем из list: там оно уже разобрано и заодно
+    # видно, откуда берётся адрес, если имя не задано.
+    $out = Invoke-Remote -CmdArgs @('list') -Quiet
+    $current = ($out | Select-String 'имя хоста для клиентов:').ToString()
+    if ($current) { Write-Dim ($current.Trim()) }
+
+    Write-Host ''
+    Write-Dim 'Этот адрес попадёт в Endpoint новых конфигов. DNS-имя лучше IP:'
+    Write-Dim 'при смене адреса сервера выданные конфиги продолжат работать.'
+    Write-Host ''
+    $name = (Read-Host '  Новое имя хоста (Enter — отмена)').Trim()
+    if (-not $name) { Write-Dim 'Отменено.'; return }
+    if ($name -notmatch '^[a-zA-Z0-9._-]+$') {
+        Write-Err "Недопустимое имя хоста '$name'."
+        return
+    }
+
+    Write-Host ''
+    Invoke-Remote -CmdArgs @('set-endpoint', $name) | Out-Null
+    if ($script:LastRc -eq 0) {
+        Write-Ok 'Готово. Уже выданные конфиги продолжат работать по прежнему адресу.'
+    }
+}
+
 function Action-ServerRekey {
     Write-Head 'Смена общих параметров сервера'
     Write-Warn 'ЭТО ОТКЛЮЧИТ ВСЕХ КЛИЕНТОВ РАЗОМ.'
@@ -812,6 +839,7 @@ function Show-Menu {
     Write-Host '    6  Состояние (awg show)'
     Write-Host '    7  Перезапустить сервис'
     Write-Host '    8  Резервная копия'
+    Write-Host '    9  Имя хоста для клиентов'
     Write-Host ''
     Write-Host '   ПРОЧЕЕ' -ForegroundColor DarkCyan
     Write-Host '    G  Показать набор параметров обфускации'
@@ -880,6 +908,7 @@ try {
             '^6$'    { Action-Show;        Pause-Panel }
             '^7$'    { Action-Restart;     Pause-Panel }
             '^8$'    { Action-Backup;      Pause-Panel }
+            '^9$'    { Action-Endpoint;    Pause-Panel }
             '^[gG]$' { Action-Gen;         Pause-Panel }
             '^[mM]$' { Action-Migrate;     Pause-Panel }
             '^[sS]$' { Action-ServerRekey; Pause-Panel }
