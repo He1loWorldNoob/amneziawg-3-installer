@@ -89,11 +89,43 @@ def fail(msg, code=1):
     sys.stderr.write(msg + "\n")
     sys.exit(code)
 
+# Отпечаток сервера запоминается при первом подключении и сверяется дальше.
+#
+# Это не формальность: вход идёт по паролю, и при подмене сервера пароль
+# уходит атакующему в первом же обмене — в отличие от ключей, где подмена
+# стоит ему лишь провала аутентификации. Проверка отпечатка остаётся
+# единственным, что удерживает пароль от утечки.
+#
+# load_host_keys, а не load_system_host_keys: только первый записывает файл
+# обратно при close(), иначе ключ не запоминался бы между запусками и
+# подмену не поймала бы даже вторая попытка.
+hostkeys = os.path.join(os.path.expanduser("~"), ".awg-panel", "known_hosts")
+os.makedirs(os.path.dirname(hostkeys), exist_ok=True)
+open(hostkeys, "a").close()
+
 client = paramiko.SSHClient()
+client.load_host_keys(hostkeys)
 client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 try:
     client.connect(host, port=int(port), username=user, password=password,
                    timeout=30, look_for_keys=False, allow_agent=False)
+except paramiko.BadHostKeyException as exc:
+    fail(
+        "ОТПЕЧАТОК СЕРВЕРА ИЗМЕНИЛСЯ.\n"
+        "\n"
+        "Ожидался: %s\n"
+        "Получен:  %s\n"
+        "\n"
+        "Так выглядит и переустановка сервера, и попытка перехвата: кто-то\n"
+        "может выдавать себя за него, чтобы получить ваш пароль. Пароль НЕ\n"
+        "был отправлен.\n"
+        "\n"
+        "Если сервер переустанавливали вы — удалите его строку из файла:\n"
+        "  %s\n"
+        "Если нет — не подключайтесь и разберитесь, что происходит."
+        % (exc.expected_key.get_base64(), exc.key.get_base64(), hostkeys),
+        4,
+    )
 except paramiko.AuthenticationException:
     fail("Неверный пароль или логин.", 2)
 except Exception as exc:
@@ -500,6 +532,12 @@ try {
     $probe = Invoke-Remote -CmdArgs @('names') -Quiet
     if ($script:LastRc -ne 0) {
         Write-Host ''
+        # Смена отпечатка — не сбой входа, а предупреждение о возможной
+        # подмене сервера, и выглядеть оно должно иначе.
+        if ($script:LastRc -eq 4) {
+            foreach ($line in $probe) { Write-Host "  $line" -ForegroundColor Yellow }
+            exit 4
+        }
         foreach ($line in $probe) { Write-Host "  $line" -ForegroundColor Red }
         Write-Err 'Вход не удался.'
         # На сервере включён fail2ban: несколько неверных попыток подряд
