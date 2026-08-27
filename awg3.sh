@@ -139,7 +139,6 @@ SRV_MTU="1280"
 SRV_ISOLATION="off"
 SRV_IPV6="off"
 SRV_IPV6_SUBNET="fddd:2c4:2c4:2c4::/64"
-SRV_FORCE=0
 
 # Параметры AmneziaWG 3.1. Выключателей у них нет намеренно: 3.0 из проекта
 # убран, и интерфейс либо 3.1, либо не наш.
@@ -1144,17 +1143,6 @@ derive_ipv6_server_addr() {
     printf '%s::1/%s' "$prefix" "$len"
 }
 
-# Все блоки [Peer] из файла: от первого до конца либо до следующего
-# [Interface], который в норме встречается только в начале.
-extract_peers() {
-    local f="$1"
-    [[ -f "$f" ]] || return 0
-    awk '
-        /^[[:space:]]*\[Peer\]/      { in_peer = 1 }
-        /^[[:space:]]*\[Interface\]/ { in_peer = 0 }
-        in_peer { print }
-    ' "$f"
-}
 
 # render_server_conf OUT PRIVKEY ADDRESS PORT MTU POSTUP POSTDOWN [PEERS_SRC]
 #
@@ -1162,11 +1150,11 @@ extract_peers() {
 # G_Jmin, G_Jmax, G_I1..G_I5, G_CPA, поэтому вызывающая сторона обязана
 # заранее вызвать gen_shared_params и gen_sender_params.
 #
-# Пиры дописываются во ВРЕМЕННЫЙ файл до mv: иначе сбой между записью конфига
-# и добавлением пиров оставил бы живой сервер без единого клиента.
+# Пиров здесь нет вовсе: конфиг пишется только при создании интерфейса, когда
+# клиентов ещё не существует. Дальше их дописывает cmd_add.
 render_server_conf() {
     local out="$1" privkey="$2" address="$3" port="$4" mtu="$5"
-    local postup="$6" postdown="$7" peers_src="${8:-}"
+    local postup="$6" postdown="$7"
 
     local dir tmp
     dir=$(dirname "$out")
@@ -1210,14 +1198,6 @@ render_server_conf() {
         printf 'RandomTrailers = on\n'
         printf 'DisableCookies = on\n'
     } > "$tmp"
-
-    if [[ -n "$peers_src" && -f "$peers_src" ]]; then
-        local peers
-        peers=$(extract_peers "$peers_src")
-        if [[ -n "$peers" ]]; then
-            printf '\n%s\n' "$peers" >> "$tmp"
-        fi
-    fi
 
     mv -f "$tmp" "$out" || { rm -f "$tmp"; die "не записан $out"; }
     chmod 600 "$out"
@@ -1521,9 +1501,12 @@ server_public_key() {
 # участвует — он остаётся только для уже существующих 2.0-серверов.
 
 guard_existing_server() {
-    if [[ -f "$SERVER_CONF" && "$SRV_FORCE" -ne 1 ]]; then
-        log_err "сервер уже существует: $SERVER_CONF"
-        log_err "Пересоздать с переносом пиров: $0 server-init --force"
+    if [[ -f "$SERVER_CONF" ]]; then
+        log_err "интерфейс ${AWG_IFACE} уже существует: $SERVER_CONF"
+        log_err "Пересоздать — это снести и создать заново:"
+        log_err "  $0 iface remove ${AWG_IFACE}"
+        log_err "  $0 iface add ${AWG_IFACE}"
+        log_err "Сменить только параметры обфускации: $0 --iface ${AWG_IFACE} server-rekey"
         return 1
     fi
     return 0
@@ -1677,44 +1660,16 @@ cmd_server_init() {
     case "$SRV_IPV6"      in on|off) ;; *) die "ipv6 ожидает on|off: $SRV_IPV6" ;; esac
     port_is_free "$SRV_PORT" || die "UDP-порт $SRV_PORT уже занят"
 
-    # Прежний порт нужен до перезаписи конфига: по нему снимается старое
-    # правило ufw, если порт сменился.
-    local old_port="" old_subnet=""
-    if [[ -f "$SERVER_CONF" ]]; then
-        old_port=$(_iface_value ListenPort)
-        old_subnet=$(_iface_value Address)
-        old_subnet="${old_subnet%%,*}"
-        old_subnet="${old_subnet//[[:space:]]/}"
-    fi
-
-    # Смена подсети при переносе пиров: адреса у них остаются прежние и в новую
-    # подсеть не попадают. Туннель для таких клиентов не поднимется, и по
-    # конфигу этого не видно — предупреждаем до записи, а не после.
-    if [[ -n "$old_subnet" && "$old_subnet" != "$SRV_SUBNET" ]] \
-       && grep -q '^[[:space:]]*\[Peer\]' "$SERVER_CONF" 2>/dev/null; then
-        log_warn "подсеть меняется: ${old_subnet} -> ${SRV_SUBNET}"
-        log_warn "Перенесённые пиры сохранят прежние адреса и окажутся вне новой подсети."
-        log_warn "Их придётся выдать заново: $0 --iface ${AWG_IFACE} remove ИМЯ, затем add ИМЯ"
-    fi
-
     local nic
     nic=$(get_main_nic) \
         || die "не определён внешний интерфейс — проверьте маршрут по умолчанию"
     log "внешний интерфейс: $nic"
 
-    local peers_src=""
-    if [[ -f "$SERVER_CONF" ]]; then
-        # Имя хоста переживает пересоздание сервера: клиенты продолжат
-        # подключаться по тому же адресу, если его не задали заново.
-        if [[ -z "${ENDPOINT_OVERRIDE:-}" ]]; then
-            ENDPOINT_OVERRIDE=$(server_endpoint_name)
-            [[ -z "$ENDPOINT_OVERRIDE" ]] || log "имя хоста сохранено: $ENDPOINT_OVERRIDE"
-        fi
-        _backup_file "$SERVER_CONF"
-        peers_src="$BACKUP_LAST"
-    fi
-
-    ROLLBACK_SERVER_BAK="$peers_src"
+    # Ни бэкапа, ни переноса пиров здесь нет намеренно: guard_existing_server
+    # не пускает сюда, пока конфиг существует. Пересоздание интерфейса — это
+    # iface remove и iface add, две явные команды вместо одной, которая молча
+    # решает за человека, что сохранить, а что выбросить.
+    ROLLBACK_SERVER_BAK=""
     ROLLBACK_ACTIVE=1
     trap '_rollback_server_init' EXIT
 
@@ -1737,7 +1692,7 @@ cmd_server_init() {
     privkey=$(tr -d '[:space:]' < "$AWG_DIR/server_private.key")
 
     render_server_conf "$SERVER_CONF" "$privkey" "$address" \
-        "$SRV_PORT" "$SRV_MTU" "$postup" "$postdown" "$peers_src"
+        "$SRV_PORT" "$SRV_MTU" "$postup" "$postdown"
 
     enable_forwarding "$SRV_IPV6" /etc/sysctl.d/99-awg3.conf \
         || log_warn "форвардинг не настроен"
@@ -1745,7 +1700,7 @@ cmd_server_init() {
     ROLLBACK_ACTIVE=0
     trap - EXIT
 
-    open_firewall_port "$SRV_PORT" "$old_port" "$nic"
+    open_firewall_port "$SRV_PORT" "" "$nic"
 
     if [[ "$DO_APPLY" -eq 1 ]]; then
         systemctl enable --now "awg-quick@${AWG_IFACE}" 2>/dev/null \
@@ -1786,8 +1741,8 @@ _rollback_server_init() {
 # ── Команда: set-endpoint ───────────────────────────────────────────────────
 #
 # Меняет имя хоста для клиентских Endpoint, не трогая ничего больше. Отдельная
-# команда нужна потому, что единственная альтернатива — server-init --force —
-# перегенерирует общие параметры и обесценит все выданные конфиги.
+# команда нужна потому, что иначе пришлось бы пересоздавать интерфейс — а это
+# новые ключи, новые параметры обфускации и потеря всех выданных конфигов.
 
 cmd_set_endpoint() {
     local name="$1"
@@ -2889,7 +2844,6 @@ awg3.sh ${SCRIPT_VERSION} — AmneziaWG ${AWG_PROTOCOL}: клиенты и па�
         --ipv6 on|off     (server-init) IPv6 в туннеле     (по умолч.: ${SRV_IPV6})
         --ipv6-subnet CIDR
                           (server-init) подсеть IPv6       (по умолч.: ${SRV_IPV6_SUBNET})
-        --force           (server-init) пересоздать сервер, перенеся пиров
         --iface NAME      серверный интерфейс    (по умолч.: awg0)
                           Принимается и перед командой: awg3 --iface awg1 list
         --to IFACE        (migrate-client) целевой интерфейс
@@ -2960,7 +2914,6 @@ main() {
             --isolation)    SRV_ISOLATION="${2:-}"; shift 2 ;;
             --ipv6)         SRV_IPV6="${2:-}"; shift 2 ;;
             --ipv6-subnet)  SRV_IPV6_SUBNET="${2:-}"; shift 2 ;;
-            --force)        SRV_FORCE=1; shift ;;
             --iface)        AWG_IFACE="${2:-}"; shift 2 ;;
             --to)           MIGRATE_TO="${2:-}"; shift 2 ;;
             -y|--yes)       ASSUME_YES=1; shift ;;

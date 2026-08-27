@@ -22,22 +22,24 @@ teardown() { teardown_awg3; }
 }
 
 @test "server-init отказывается работать при существующем конфиге" {
-    printf '[Interface]\n' > "$SERVER_CONF"
-    SRV_FORCE=0
+    printf '[Interface]' > "$SERVER_CONF"
     run guard_existing_server
     [ "$status" -ne 0 ]
     [[ "$output" == *"уже существует"* ]]
 }
 
-@test "с --force существующий конфиг не блокирует" {
-    printf '[Interface]\n' > "$SERVER_CONF"
-    SRV_FORCE=1
+@test "отказ подсказывает дорогу: снести и создать" {
+    # Обходного пути вроде --force больше нет намеренно: команда, которая
+    # «пересоздаёт с переносом пиров», меняла и ключи сервера, и параметры
+    # обфускации — перенесённые пиры были мёртвым списком.
+    printf '[Interface]' > "$SERVER_CONF"
     run guard_existing_server
-    [ "$status" -eq 0 ]
+    [[ "$output" == *"iface remove"* ]]
+    [[ "$output" == *"iface add"* ]]
+    ! grep -q "SRV_FORCE" "$REPO_ROOT/awg3.sh"
 }
 
 @test "на чистой системе guard пропускает" {
-    SRV_FORCE=0
     run guard_existing_server
     [ "$status" -eq 0 ]
 }

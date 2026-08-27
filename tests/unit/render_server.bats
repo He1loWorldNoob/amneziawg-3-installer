@@ -74,56 +74,14 @@ need_awg() {
     [ "$(stat -c '%a' "$OUT")" = "600" ]
 }
 
-@test "extract_peers достаёт оба блока Peer и не тащит Interface" {
-    cat > "$TEST_TMP/old.conf" <<'EOF'
-[Interface]
-PrivateKey = OLD
-ListenPort = 1
-
-[Peer]
-#_Name = alpha
-PublicKey = AAA
-AllowedIPs = 10.9.9.2/32
-
-[Peer]
-#_Name = beta
-PublicKey = BBB
-AllowedIPs = 10.9.9.3/32
-EOF
-    run extract_peers "$TEST_TMP/old.conf"
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"#_Name = alpha"* ]]
-    [[ "$output" == *"#_Name = beta"* ]]
-    [[ "$output" != *"PrivateKey = OLD"* ]]
-    [[ "$output" != *"ListenPort"* ]]
-}
-
-@test "extract_peers на файле без пиров возвращает пусто" {
-    printf '[Interface]\nPrivateKey = X\n' > "$TEST_TMP/nopeers.conf"
-    run extract_peers "$TEST_TMP/nopeers.conf"
-    [ -z "$output" ]
-}
-
-@test "пиры переносятся в новый конфиг" {
-    cat > "$TEST_TMP/old.conf" <<'EOF'
-[Interface]
-PrivateKey = OLD
-
-[Peer]
-#_Name = alpha
-PublicKey = AAA
-AllowedIPs = 10.9.9.2/32
-EOF
-    render_server_conf "$OUT" "PRIVKEY" "10.9.9.1/24" 48872 1280 "PU" "PD" "$TEST_TMP/old.conf"
-    grep -qx "#_Name = alpha" "$OUT"
-    grep -qx "PublicKey = AAA" "$OUT"
-    grep -qx "PrivateKey = PRIVKEY" "$OUT"
-    ! grep -qx "PrivateKey = OLD" "$OUT"
-}
-
-@test "без источника пиров секции Peer нет вовсе" {
+@test "пиров в свежем конфиге нет вовсе" {
+    # Конфиг пишется только при создании интерфейса, когда клиентов ещё не
+    # существует. Переносить их было нужно единственному вызывающему —
+    # server-init --force, а его больше нет: пересоздание интерфейса это
+    # iface remove и iface add.
     render_server_conf "$OUT" "PRIVKEY" "10.9.9.1/24" 48872 1280 "PU" "PD"
     ! grep -q "\[Peer\]" "$OUT"
+    ! grep -q "extract_peers" "$REPO_ROOT/awg3.sh"
 }
 
 @test "каталог конфига создаётся с правами 700" {
