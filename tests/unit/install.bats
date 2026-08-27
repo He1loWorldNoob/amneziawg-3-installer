@@ -360,3 +360,22 @@ Hit:7 https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu noble InRelease')
     # не того интерфейса, что показывает в списке.
     grep -q 'RemoteDir = "$($script:HomeDir)/awg/$Name"' "$REPO_ROOT/panel/awg-panel.ps1"
 }
+
+@test "панель построена на четырёх экранах с единым возвратом" {
+    # Серверы → интерфейсы → ключи → карточка ключа. Плоского меню больше нет:
+    # по нему, когда интерфейсов несколько, не понять, к чему относится
+    # «состояние» и «перезапустить».
+    local panel="$REPO_ROOT/panel/awg-panel.ps1"
+    grep -q "function Screen-Servers" "$panel"
+    grep -q "function Screen-Ifaces" "$panel"
+    grep -q "function Screen-Peers" "$panel"
+    grep -q "function Screen-Peer " "$panel"
+    ! grep -q "function Show-Menu" "$panel"
+    # Возврат и выход одинаковы на всех уровнях.
+    [ "$(grep -c "'\^0\\$'" "$panel")" -ge 3 ]
+}
+
+@test "панель берёт список ключей машиночитаемой командой" {
+    grep -q "CmdArgs @('peers')" "$REPO_ROOT/panel/awg-panel.ps1"
+    grep -qE "^ +peers\)" "$REPO_ROOT/awg3.sh"
+}

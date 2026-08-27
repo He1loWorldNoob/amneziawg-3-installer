@@ -661,6 +661,34 @@ require_iface_awg31() {
     exit 1
 }
 
+# client_version <конфиг> — 3.1, 3.0 или прочерк.
+#
+# На проводе 3.1 от 3.0 отличает только RandomTrailers; HeaderProtectionKey
+# говорит лишь о том, что это вообще AWG 3.x.
+client_version() {
+    local conf="$1"
+    if [[ "$(_conf_value "$conf" RandomTrailers interface)" == "on" ]]; then
+        printf '3.1'
+    elif [[ -n "$(_conf_value "$conf" HeaderProtectionKey interface)" ]]; then
+        printf '3.0'
+    else
+        printf '—'
+    fi
+}
+
+# client_matches_server <конфиг> — подключится ли этот клиент к интерфейсу.
+#
+# RandomTrailers сравнивается наравне с S1/H1/HeaderProtectionKey: рассинхрон по
+# нему рвёт туннель так же полно и так же молча, а выданный до перехода на 3.1
+# конфиг выглядит совершенно исправным. Требует загруженных S_* — вызывающая
+# сторона обязана сперва вызвать load_server_params.
+client_matches_server() {
+    local conf="$1" c_rtr
+    c_rtr=$(_conf_value "$conf" RandomTrailers interface)
+    [[ -n "$c_rtr" ]] || c_rtr="off"
+    [[ "$(_conf_value "$conf" S1 interface)" == "${S_S1}"        && "$(_conf_value "$conf" H1 interface)" == "${S_H1}"        && "$(_conf_value "$conf" HeaderProtectionKey interface)" == "${S_HPK}"        && "$c_rtr" == "${S_RTR:-off}" ]]
+}
+
 # ── Работа с IP ─────────────────────────────────────────────────────────────
 
 _ipv4_to_int() {
@@ -2035,7 +2063,7 @@ cmd_list() {
     printf '%s\n' "СОВМЕСТИМ"
     printf '%s\n' "-------------------------------------------------------------------------------------"
 
-    local name conf addr hpk ver match c_s1 c_h1 c_rtr layout
+    local name conf addr ver match layout
     while IFS= read -r name; do
         conf=$(client_conf_path "$name")
         if [[ "$conf" == "$AWG_DIR/$name/$name.conf" ]]; then
@@ -2044,21 +2072,8 @@ cmd_list() {
             layout="старая"
         fi
         addr=$(_conf_value "$conf" Address interface)
-        hpk=$(_conf_value "$conf" HeaderProtectionKey interface)
-        c_s1=$(_conf_value "$conf" S1 interface)
-        c_h1=$(_conf_value "$conf" H1 interface)
-
-        c_rtr=$(_conf_value "$conf" RandomTrailers interface)
-        [[ -n "$c_rtr" ]] || c_rtr="off"
-
-        if [[ "$c_rtr" == "on" ]]; then ver="3.1"
-        elif [[ -n "$hpk" ]]; then ver="3.0"
-        else ver="—"; fi
-
-        # RandomTrailers сравнивается наравне с S1/H1/HeaderProtectionKey:
-        # рассинхрон по нему рвёт туннель так же полно и так же молча, а
-        # выданный до перехода на 3.1 конфиг выглядит совершенно исправным.
-        if [[ "$c_s1" == "${S_S1}" && "$c_h1" == "${S_H1}"               && "$hpk" == "${S_HPK}" && "$c_rtr" == "${S_RTR:-off}" ]]; then
+        ver=$(client_version "$conf")
+        if client_matches_server "$conf"; then
             match="${C_GRN}да${C_OFF}"
         else
             match="${C_RED}нет — клиент не подключится${C_OFF}"
@@ -2223,7 +2238,11 @@ cmd_migrate() {
 # Первая строка описывает сам интерфейс и пропускается.
 
 # Заполняет ассоциативные массивы PK_HS, PK_RX, PK_TX, PK_EP (ключ — pubkey).
-declare -A PK_HS PK_RX PK_TX PK_EP
+#
+# declare -g, а не просто -A: тесты подключают скрипт через source из функции,
+# а там обычный declare создаёт ЛОКАЛЬНУЮ переменную — массив исчезал бы вместе
+# с вызовом, и первое же обращение падало на «unbound variable».
+declare -gA PK_HS PK_RX PK_TX PK_EP
 load_peer_dump() {
     local dump pk psk ep aips hs rx tx ka
     dump=$(awg show "$AWG_IFACE" dump 2>/dev/null) || return 0
@@ -2235,7 +2254,7 @@ load_peer_dump() {
 }
 
 # Имя клиента -> публичный ключ, по маркерам #_Name в серверном конфиге.
-declare -A NAME_PK
+declare -gA NAME_PK
 load_name_to_pk() {
     local line cur=""
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -2633,6 +2652,47 @@ cmd_ifaces() {
     [[ "$found" -eq 1 ]] || log_warn "ни одного интерфейса в /etc/amnezia/amneziawg не найдено"
 }
 
+# ── Команда: peers ──────────────────────────────────────────────────────────
+#
+# То же, что list, но колонками через табуляцию и без цвета — для панели и
+# скриптов. Разбирать выровненный вывод list значило бы угадывать ширину полей
+# и ломаться от первого длинного имени.
+#
+# Одна команда вместо двух запросов: панель показывает и состояние, и трафик на
+# одном экране, а каждое лишнее подключение упирается в `ufw limit` на SSH.
+cmd_peers() {
+    load_server_params
+    load_name_to_pk
+    load_peer_dump
+
+    printf 'ИМЯ\tАДРЕС\tВЕРСИЯ\tСОВМЕСТИМ\tСВЯЗЬ\tПРИНЯТО\tОТДАНО\tОТКУДА\n'
+
+    local name conf addr ver compat link rx tx ep pk
+    while IFS= read -r name; do
+        conf=$(client_conf_path "$name")
+        addr=$(_conf_value "$conf" Address interface)
+        addr="${addr%%,*}"
+
+        ver=$(client_version "$conf")
+        if client_matches_server "$conf"; then compat="да"; else compat="нет"; fi
+
+        pk="${NAME_PK[$name]:-}"
+        if [[ -n "$pk" ]]; then
+            link=$(peer_status "${PK_HS[$pk]:-0}")
+            rx="${PK_RX[$pk]:-0}"; tx="${PK_TX[$pk]:-0}"
+            [[ "$rx" =~ ^[0-9]+$ ]] || rx=0
+            [[ "$tx" =~ ^[0-9]+$ ]] || tx=0
+            rx=$(format_bytes "$rx"); tx=$(format_bytes "$tx")
+            ep="${PK_EP[$pk]:-}"
+            [[ -n "$ep" && "$ep" != "(none)" ]] || ep="-"
+        else
+            link="нет пира"; rx="-"; tx="-"; ep="-"
+        fi
+
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n'             "$name" "${addr:-?}" "$ver" "$compat" "$link" "$rx" "$tx" "$ep"
+    done < <(list_client_names)
+}
+
 # ── Команда: iface ──────────────────────────────────────────────────────────
 #
 # Интерфейсами управляют одним набором: iface / iface add / iface remove.
@@ -2806,6 +2866,8 @@ awg3.sh ${SCRIPT_VERSION} — AmneziaWG ${AWG_PROTOCOL}: клиенты и па�
                           ещё и печатается)
     list                  клиенты: адрес, связь, совместимость с сервером
     names                 только имена клиентов, по одному в строке (для скриптов)
+    peers                 то же, что list, но колонками через табуляцию —
+                          для панели и скриптов
     stats                 трафик и последняя активность по клиентам
     show                  вывод 'awg show' по интерфейсу
     restart               перезапустить awg-quick@ИНТЕРФЕЙС
@@ -2890,7 +2952,7 @@ main() {
     local cmd="$1"; shift
     case "$cmd" in
         -h|--help|help) usage; exit 0 ;;
-        add|remove|link|list|names|stats|show|restart|backup|gen|migrate|server-rekey|server-init|set-endpoint|iface|ifaces|migrate-client) ;;
+        add|remove|link|list|names|peers|stats|show|restart|backup|gen|migrate|server-rekey|server-init|set-endpoint|iface|ifaces|migrate-client) ;;
         server-upgrade) cmd=server-rekey ;;
         *) die "неизвестная команда: ${cmd}  (см. --help)" ;;
     esac
@@ -2961,6 +3023,7 @@ main() {
         link)           cmd_link "${positional[@]+"${positional[@]}"}" ;;
         list)           cmd_list ;;
         names)          list_client_names ;;
+        peers)          cmd_peers ;;
         stats)          cmd_stats ;;
         show)           cmd_show ;;
         restart)        cmd_restart ;;

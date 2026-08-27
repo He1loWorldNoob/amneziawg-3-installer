@@ -430,22 +430,58 @@ need_awg() { command -v awg >/dev/null 2>&1 || skip "awg не установле
 
 # ── Колонка версии и совместимости в list ───────────────────────────────────
 
-@test "клиент 3.1 показывается как 3.1, а не как 3.0" {
+@test "клиент 3.1 определяется как 3.1, а не как 3.0" {
     # Колонка досталась от времён, когда 2.0 и 3.0 сосуществовали, и печатала
     # 3.0 для любого клиента с HeaderProtectionKey — включая свежий 3.1.
-    local body
-    body=$(sed -n '/^cmd_list() {/,/^}/p' "$REPO_ROOT/awg3.sh")
-    [[ "$body" == *'ver="3.1"'* ]]
-    [[ "$body" != *'ver="2.0"'* ]]
+    local conf="$TEST_TMP/c.conf"
+
+    cat > "$conf" <<EOF
+[Interface]
+HeaderProtectionKey = KEY
+RandomTrailers = on
+EOF
+    [ "$(client_version "$conf")" = "3.1" ]
+
+    cat > "$conf" <<EOF
+[Interface]
+HeaderProtectionKey = KEY
+EOF
+    [ "$(client_version "$conf")" = "3.0" ]
+
+    cat > "$conf" <<EOF
+[Interface]
+Address = 10.9.9.2/32
+EOF
+    [ "$(client_version "$conf")" = "—" ]
 }
 
-@test "совместимость учитывает RandomTrailers" {
+@test "совместимость учитывает RandomTrailers наравне с S1" {
     # Рассинхрон по нему рвёт туннель так же полно и так же молча, как
     # разошедшийся S1 — а конфиг, выданный до перехода на 3.1, выглядит
     # совершенно исправным.
-    local body
-    body=$(sed -n '/^cmd_list() {/,/^}/p' "$REPO_ROOT/awg3.sh")
-    [[ "$body" == *'c_rtr" == "${S_RTR:-off}"'* ]]
+    write_server_conf "RandomTrailers = on"
+    load_server_params
+
+    local conf="$TEST_TMP/c.conf"
+    cat > "$conf" <<EOF
+[Interface]
+S1 = ${S_S1}
+H1 = ${S_H1}
+HeaderProtectionKey = ${S_HPK}
+RandomTrailers = on
+EOF
+    run client_matches_server "$conf"
+    [ "$status" -eq 0 ]
+
+    # Тот же конфиг, но без RandomTrailers — интерфейс его не примет.
+    cat > "$conf" <<EOF
+[Interface]
+S1 = ${S_S1}
+H1 = ${S_H1}
+HeaderProtectionKey = ${S_HPK}
+EOF
+    run client_matches_server "$conf"
+    [ "$status" -ne 0 ]
 }
 
 # ── Перенос на раскладку по интерфейсам ─────────────────────────────────────
@@ -533,4 +569,69 @@ need_awg() { command -v awg >/dev/null 2>&1 || skip "awg не установле
     local body
     body=$(sed -n '/^open_firewall_port() {/,/^}/p' "$REPO_ROOT/awg3.sh")
     [[ "$body" == *'"$old" != "$port"'* ]]
+}
+
+# ── Машиночитаемый список ключей ────────────────────────────────────────────
+
+@test "peers печатает колонки через табуляцию" {
+    # Панель разбирает вывод по табуляции: выровненный list пришлось бы
+    # угадывать по ширине полей и ломаться от первого длинного имени.
+    write_server_conf "RandomTrailers = on"
+    run cmd_peers
+    [ "$status" -eq 0 ]
+    local header
+    header=$(printf '%s\n' "$output" | head -1)
+    [ "$(printf '%s' "$header" | tr -cd '\t' | wc -c)" -eq 7 ]
+    [[ "$header" == "ИМЯ"* ]]
+    [[ "$header" == *"СОВМЕСТИМ"* ]]
+    [[ "$header" == *"ОТКУДА" ]]
+}
+
+@test "на интерфейсе без ключей остаётся только заголовок" {
+    write_server_conf "RandomTrailers = on"
+    run cmd_peers
+    [ "$(printf '%s\n' "$output" | wc -l)" -eq 1 ]
+}
+
+@test "peers показывает версию и совместимость клиента" {
+    write_server_conf "RandomTrailers = on"
+    load_server_params
+    mkdir -p "$AWG_DIR/ivan"
+    render_client_conf "$AWG_DIR/ivan/ivan.conf" "PRIV" "10.9.9.2/32" \
+        "SRVPUB" "vpn.example.com" 48872
+
+    run cmd_peers
+    [ "$status" -eq 0 ]
+    local row
+    row=$(printf '%s\n' "$output" | grep "^ivan")
+    [[ "$row" == *"3.1"* ]]
+    [[ "$row" == *"да"* ]]
+}
+
+@test "клиент с чужими параметрами помечается несовместимым" {
+    # Ровно тот случай, ради которого колонка и нужна: конфиг выглядит
+    # исправным, а туннель по нему молча не встанет.
+    write_server_conf "RandomTrailers = on"
+    load_server_params
+    mkdir -p "$AWG_DIR/ivan"
+    render_client_conf "$AWG_DIR/ivan/ivan.conf" "PRIV" "10.9.9.2/32" \
+        "SRVPUB" "vpn.example.com" 48872
+    sed -i 's/^S1 = .*/S1 = 199/' "$AWG_DIR/ivan/ivan.conf"
+
+    run cmd_peers
+    local row
+    row=$(printf '%s\n' "$output" | grep "^ivan")
+    [[ "$row" == *"нет"* ]]
+}
+
+@test "версия и совместимость считаются одной парой функций" {
+    # list и peers обязаны отвечать одинаково: два места, считающие
+    # совместимость по-своему, рано или поздно разойдутся.
+    local body
+    body=$(sed -n '/^cmd_list() {/,/^}/p' "$REPO_ROOT/awg3.sh")
+    [[ "$body" == *client_version* ]]
+    [[ "$body" == *client_matches_server* ]]
+    body=$(sed -n '/^cmd_peers() {/,/^}/p' "$REPO_ROOT/awg3.sh")
+    [[ "$body" == *client_version* ]]
+    [[ "$body" == *client_matches_server* ]]
 }
