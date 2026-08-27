@@ -401,3 +401,29 @@ Hit:7 https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu noble InRelease')
     body=$(sed -n "/'\^\[Nn\]\\$' {/,/^            }/p" "$REPO_ROOT/panel/awg-panel.ps1" | head -12)
     [[ "$body" == *"Pause-Panel"* ]]
 }
+
+@test "панель ставит свой ключ существующим доступом, а не только паролем" {
+    # PubkeyAuthentication=no запрещал вход по ключу и требовал пароль. На
+    # сервере с PasswordAuthentication no — а это умолчание облачных образов
+    # Debian и Ubuntu — не оставалось ни одного способа войти: панель упиралась
+    # в «Permission denied (publickey)» на сервере, куда человек прекрасно
+    # заходит своим ключом.
+    local body
+    body=$(sed -n '/^function Invoke-Setup/,/^}/p' "$REPO_ROOT/panel/awg-panel.ps1")
+    # Ищем аргумент в коде, а не упоминание: в комментарии рядом объяснено,
+    # почему прежний флаг убран, и по голой строке тест ловил бы его.
+    [[ "$body" != *"'PubkeyAuthentication=no'"* ]]
+    # Конфиг панели тоже не подставляется: в ~/.ssh/config человека может быть
+    # описан рабочий доступ именно к этому серверу.
+    [[ "$body" != *"'-F',"* ]]
+}
+
+@test "неудача добавления сервера показывает, что сделать руками" {
+    # Тупика быть не должно: человек заходит на сервер как-то иначе, и двух
+    # команд достаточно, чтобы панель заработала.
+    grep -q "function Show-ManualSetup" "$REPO_ROOT/panel/awg-panel.ps1"
+    local body
+    body=$(sed -n '/^function Show-ManualSetup/,/^}/p' "$REPO_ROOT/panel/awg-panel.ps1")
+    [[ "$body" == *"authorized_keys"* ]]
+    [[ "$body" == *"sudoers.d/awg3-panel"* ]]
+}

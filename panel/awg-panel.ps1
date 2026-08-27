@@ -451,12 +451,25 @@ function Invoke-Setup {
         "sudo sh -c $inner _ `$t"
     ) -join ' && '
 
+    # Ключ панели ставится тем доступом, который у человека УЖЕ есть: своим
+    # ключом из агента, ключом по умолчанию, а если сервер разрешает — паролем.
+    #
+    # Раньше здесь стояло PubkeyAuthentication=no вместе с конфигом панели
+    # (IdentitiesOnly и единственный, ещё не установленный ключ). На сервере,
+    # где вход по паролю выключен — а это умолчание облачных образов Debian и
+    # Ubuntu, — не оставалось ни одного способа войти, и панель упиралась в
+    # «Permission denied (publickey)» на сервере, куда сам человек прекрасно
+    # заходит.
+    #
+    # Свой ssh_config тоже не подставляется: у человека в ~/.ssh/config может
+    # быть описан рабочий доступ именно к этому серверу.
     Invoke-Native $ssh @(
-        '-F', $SshConfigPath,
         '-t',
-        '-o', 'PubkeyAuthentication=no',
+        '-p', "$VpsPort",
+        '-o', "UserKnownHostsFile=`"$KnownHostsPath`"",
+        '-o', 'HashKnownHosts=no',
         '-o', 'StrictHostKeyChecking=ask',
-        $SshAlias, $remote
+        "$VpsUser@$VpsHost", $remote
     ) -Interactive
     return $LASTEXITCODE
 }
@@ -1056,6 +1069,36 @@ function Use-Profile {
 # Добавление сервера: кладём ключ и настраиваем sudo — дальше вход без
 # вопросов. Пароль спрашивает сам ssh, и это единственный раз, когда он вообще
 # нужен.
+# Что делать, когда панель не смогла войти сама.
+#
+# Такое бывает не от ошибки: на сервере может быть выключен вход по паролю (по
+# умолчанию так в облачных образах Debian и Ubuntu), а ключа панели там ещё
+# нет. Тупик из этого делать незачем — человек заходит на сервер как-то иначе,
+# и двух команд достаточно.
+function Show-ManualSetup {
+    param([string] $PubKey, [int] $Rc)
+
+    Write-Host ''
+    if ($Rc -eq 255) {
+        # 255 — код самого ssh: до выполнения команды дело не дошло.
+        Write-Dim 'Похоже, войти было нечем: вход по паролю на сервере может быть'
+        Write-Dim 'выключен, а ключа панели там ещё нет.'
+    } else {
+        Write-Dim 'Войти удалось, но настройка не закончилась — обычно на sudo.'
+    }
+    Write-Dim 'Сделайте это сами любым доступом, который у вас к серверу работает:'
+    Write-Host ''
+    Write-Host '  Ключ панели:' -ForegroundColor Cyan
+    Write-Host "  $PubKey"
+    Write-Host ''
+    Write-Host '  Одной командой на сервере:' -ForegroundColor Cyan
+    Write-Host ("  mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '{0}' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" -f $PubKey)
+    Write-Host ''
+    Write-Host '  И право запускать awg3 без пароля:' -ForegroundColor Cyan
+    Write-Host ("  echo '{0} ALL=(root) NOPASSWD: {1}' | sudo tee /etc/sudoers.d/awg3-panel && sudo chmod 440 /etc/sudoers.d/awg3-panel" -f $VpsUser, $RemoteScript)
+    Write-Host ''
+}
+
 function New-ServerProfile {
     Write-Head 'Новый сервер'
     Read-Connection
@@ -1064,10 +1107,12 @@ function New-ServerProfile {
     if (-not (Ensure-PanelKey)) { return $false }
 
     Write-Host ''
-    Write-Dim 'Дальше спрашивает сам ssh — панель пароль не видит и не хранит:'
+    Write-Dim 'Панель войдёт тем доступом, который у вас уже есть: ключом из агента,'
+    Write-Dim 'ключом по умолчанию, а если сервер разрешает — по паролю. Дальше'
+    Write-Dim 'спрашивает сам ssh — панель пароль не видит и не хранит:'
     Write-Dim '  • отпечаток сервера, если подключаемся к нему впервые (ответ yes);'
-    Write-Dim '  • пароль пользователя — для входа;'
-    Write-Dim '  • его же ещё раз — для sudo на сервере.'
+    Write-Dim '  • пароль, если вход по ключу не сработал;'
+    Write-Dim '  • пароль для sudo на сервере.'
     Write-Host ''
 
     $pub = (Get-Content "$KeyPath.pub" -Raw).Trim()
@@ -1078,13 +1123,23 @@ function New-ServerProfile {
         Write-Err 'Не удалось настроить вход по ключу.'
         # 255 — код самого ssh: до выполнения команды дело не дошло.
         if ($rc -eq 255) {
-            Write-Warn 'Проверьте адрес, порт, логин и пароль. Несколько неверных попыток'
-            Write-Warn 'подряд — и fail2ban заблокирует ваш IP примерно на 10 минут.'
+            Write-Warn 'Проверьте адрес, порт и логин. Несколько неверных попыток подряд —'
+            Write-Warn 'и fail2ban заблокирует ваш IP примерно на 10 минут.'
         }
-        return $false
+        Show-ManualSetup -PubKey $pub -Rc $rc
+        if (Confirm-Action 'Сделано — проверить ещё раз?') {
+            Invoke-Remote -CmdArgs @('names') -Quiet | Out-Null
+            if ($script:LastRc -ne 0) {
+                Write-Err 'Всё ещё не пускает.'
+                return $false
+            }
+            Write-Ok 'Теперь пускает.'
+        } else {
+            return $false
+        }
+    } else {
+        Write-Ok 'Ключ добавлен, sudo настроен.'
     }
-    Write-Ok 'Ключ добавлен, sudo настроен.'
-
     Write-Host '  Проверяю вход по ключу...' -ForegroundColor DarkGray
     Invoke-Remote -CmdArgs @('names') -Quiet | Out-Null
     if ($script:LastRc -ne 0) {
