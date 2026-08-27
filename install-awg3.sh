@@ -6,7 +6,7 @@ if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
 fi
 
 # ==============================================================================
-# install-awg3.sh — установка AmneziaWG 3.0 на Debian/Ubuntu.
+# install-awg3.sh — установка AmneziaWG 3.1 на Debian/Ubuntu.
 #
 # Форк bivlked/amneziawg-installer v5.23.0 (2026-07-31), MIT.
 # Что изменено относительно апстрима — docs/upstream.md.
@@ -62,16 +62,6 @@ prepare_awg_dir() {
             || log_warn "не сменился владелец $dir"
     fi
 }
-
-# AmneziaWG 2.0 pin (H0, 31 jul 2026). Upstream merged AmneziaWG 3.0 into the
-# amneziawg-linux-kernel-module default branch and the PPA switched to it. The 3.0
-# module needs kernel >= 6.7 (nla_put_uint), so on older kernels (Debian 12 = 6.1)
-# the PPA DKMS build fails. On such kernels we build the last pinned 2.0 module
-# (the 1.0.x line) from source. AWG2_PIN_COMMIT is checked after clone (integrity:
-# more robust than a fragile tarball SHA - a tag can be moved, an immutable commit
-# cannot).
-AWG2_PIN_TAG="v1.0.20260725"
-AWG2_PIN_COMMIT="ae0924ca700520ca34c5bdbcfd05b2f683ea9353"
 
 # CLI flags
 UNINSTALL=0; HELP=0; HELP_EXIT_RC=0; DIAGNOSTIC=0; VERBOSE=0; NO_COLOR=0; AUTO_YES=0; NO_TWEAKS=0; NO_CPS=0
@@ -416,45 +406,41 @@ check_os_version() {
     fi
 }
 
+# check_kernel_version - an EARLY advisory check, before system prep and the
+# reboot. The load-bearing gate is in install_amneziawg_stack: it runs after the
+# upgrade and reboot, when uname -r is the kernel the module is built against.
+# Here we only warn, because a staged kernel does become the running one after
+# step 1 - dying now would refuse a machine that would have worked.
 check_kernel_version() {
-    # The AmneziaWG 2.0 module is built via DKMS against the host kernel. On
-    # kernels older than 5.15 (Ubuntu < 22.04, e.g. 5.4 on 20.04) the build
-    # usually fails at step 2 with an opaque package-failure. Warn EXPLICITLY and
-    # early, before updates and reboots (issue #163). Not a die: on some older
-    # kernels the module still builds (HWE and such), so WARN + confirm.
-    local kver kmaj kmin
+    local kver
     kver=$(uname -r)
-    if [[ "$kver" =~ ^([0-9]+)\.([0-9]+) ]]; then
-        kmaj=${BASH_REMATCH[1]}; kmin=${BASH_REMATCH[2]}
-    else
-        log_warn "Could not parse the kernel version ('$kver') - skipping the minimum-version check."
+    if _kernel_supports_awg3 "$kver"; then
+        log "Kernel $kver (OK for the AmneziaWG module)."
         return 0
     fi
-    if (( kmaj < 5 || (kmaj == 5 && kmin < 15) )); then
-        log_warn "Kernel $kver is older than 5.15 - usually too old for the AmneziaWG 2.0 module."
-        log_warn "The DKMS module build on such a kernel most often fails. Reinstall the VPS on Ubuntu 24.04 LTS or Debian 12 (or newer). Matrix: Ubuntu 24.04/25.10/26.04, Debian 12/13."
-        if [[ "$AUTO_YES" -eq 0 ]]; then
-            read -rp "Continue anyway? [y/N]: " confirm < /dev/tty
-            if ! [[ "$confirm" =~ ^[[:space:]]*[Yy]([Ee][Ss])?[[:space:]]*$ ]]; then die "Cancelled: kernel $kver is too old for the AmneziaWG 2.0 module."; fi
-        else
-            log "Continuing on kernel $kver (--yes)."
+    log_warn "Kernel $kver is not recognised as 6.7 or newer - the AmneziaWG module cannot be built on it."
+    log_warn "If the system has a newer kernel staged, it will be picked up after the reboot in step 1."
+    log_warn "Otherwise install a 6.7+ kernel (on Debian 12 - from bookworm-backports) or reinstall"
+    log_warn "the VPS on Ubuntu 24.04/25.10/26.04 or Debian 13."
+    if [[ "$AUTO_YES" -eq 0 ]]; then
+        local confirm
+        read -rp "Continue anyway? [y/N]: " confirm < /dev/tty
+        if ! [[ "$confirm" =~ ^[[:space:]]*[Yy]([Ee][Ss])?[[:space:]]*$ ]]; then
+            die "Cancelled: kernel $kver is too old for the AmneziaWG module."
         fi
     else
-        log "Kernel $kver (OK for the AmneziaWG 2.0 module)."
+        log "Continuing on kernel $kver (--yes)."
     fi
 }
 
-# shellcheck disable=SC2120  # called without args in the installer (uses uname -r); bats passes versions
 _kernel_supports_awg3() {
     # Returns 0 if the kernel version is >= 6.7 - i.e. the kernel can build the
-    # AmneziaWG 3.0 module. Returns 1 if the kernel is older than 6.7 (a pinned
-    # 2.0 module is needed). Threshold 6.7: nla_put_uint, which the 3.0 code uses,
+    # AmneziaWG 3.x module. Threshold 6.7: nla_put_uint, which the 3.x code uses,
     # first appeared in mainline kernel v6.7 (it is absent in 6.6); on 6.1
-    # (Debian 12) the 3.0 build fails with 'implicit declaration of nla_put_uint'.
-    # Arg $1: kernel release (default uname -r). An unparseable version is treated
-    # as "NOT supported" -> pinned 2.0 (it builds on ANY of our kernels, so the
-    # conservative choice never breaks connectivity, it only withholds 3.0 features
-    # which H0 does not ship anyway).
+    # (Debian 12) the build fails with 'implicit declaration of nla_put_uint'.
+    # Arg $1: kernel release (default uname -r). A version that does not parse is
+    # reported as NOT supported - callers word it as "not recognised as 6.7+"
+    # rather than "older than 6.7", so the message stays true either way.
     # Pure function with no external deps (bats: extracted via sed-range + source).
     local kver="${1:-$(uname -r)}" kmaj kmin
     local min_maj=6 min_min=7
@@ -1209,7 +1195,7 @@ setup_advanced_sysctl() {
     fi
 
     cat > "$f" << EOF
-# AmneziaWG 2.0 Security/Performance Settings - $(date)
+# AmneziaWG Security/Performance Settings - $(date)
 # Auto-generated by install_amneziawg_en.sh v${SCRIPT_VERSION}
 
 # --- IP Forwarding ---
@@ -1571,11 +1557,11 @@ check_service_status() {
         fi
     fi
 
-    # AWG 2.0 parameter check
+    # Obfuscation parameter check
     if awg show awg0 2>/dev/null | grep -q "jc:"; then
-        log "AWG 2.0 parameters active."
+        log "AWG obfuscation parameters active."
     else
-        log_warn "AWG 2.0 parameters not detected in awg show."
+        log_warn "AWG obfuscation parameters not detected in awg show."
     fi
 
     if [[ "$ok" -eq 1 ]]; then
@@ -1599,7 +1585,7 @@ create_diagnostic_report() {
     local rf
     rf="$AWG_DIR/diag_$(date +%F_%T).txt"
     {
-        echo "=== AMNEZIAWG 2.0 DIAGNOSTIC REPORT ==="
+        echo "=== AMNEZIAWG DIAGNOSTIC REPORT ==="
         echo ""
         echo "!!! WARNING: This report contains IP addresses, ports and routes."
         echo "!!! Review and redact private data before posting to public issues."
@@ -1780,7 +1766,7 @@ step_uninstall() {
         log "Skipping UFW/Fail2Ban (installed with --no-tweaks)."
     fi
     log "Removing packages..."
-    # Clear the hold on the PPA packages (set by the H0 pinned path) BEFORE the PPA
+    # Clear the hold on the PPA packages (older installers pinned them) BEFORE the PPA
     # is removed: `apt-mark unhold` needs an installed or candidate version, and once
     # the PPA (below) is gone the candidate disappears and apt-mark fails with
     # 'Can't select ... version', leaving the hold in dpkg selections -> that blocks
@@ -1952,176 +1938,6 @@ step1_update_and_optimize() {
     fi
     log "Перезагрузка не требуется, продолжаю."
     update_state 2
-}
-
-# ==============================================================================
-# ARM prebuilt support
-# ==============================================================================
-
-# _try_install_prebuilt_arm — download and install a prebuilt amneziawg .deb
-# for the current ARM kernel from the arm-packages GitHub release.
-#
-# Returns 0 if a matching prebuilt was installed successfully.
-# Returns 1 if no match was found or installation failed (caller falls back to DKMS).
-#
-# Prebuilt packages are built by .github/workflows/arm-build.yml and published
-# to the arm-packages release tag. The filename encodes both the target ID and
-# the exact kernel version: amneziawg-kmod-<target-id>_<kernel-version>_<arch>.deb
-#
-# Kernel version matching is exact — the module vermagic must match uname -r.
-# DKMS is the preferred path for kernels that haven't been pre-built yet.
-_try_install_prebuilt_arm() {
-    local kernel arch target_id asset_name asset_url tmpfile tmpsha expected_sha actual_sha
-    kernel="$(uname -r)"
-    arch="$(dpkg --print-architecture)"
-
-    # Map kernel string to a build target ID
-    if [[ "$kernel" == *+rpt-rpi-2712* ]]; then
-        target_id="rpi5-bookworm-arm64"
-    elif [[ "$kernel" == *+rpt* && "$arch" == "arm64" ]]; then
-        target_id="rpi-bookworm-arm64"
-    elif [[ "$kernel" == *+rpt* && "$arch" == "armhf" ]]; then
-        target_id="rpi-bookworm-armhf"
-    elif [[ "$kernel" == *-generic* && "${OS_VERSION:-}" == "24.04" ]]; then
-        target_id="ubuntu-2404-arm64"
-    elif [[ "$kernel" == *-generic* && "${OS_VERSION:-}" == "25.10" ]]; then
-        target_id="ubuntu-2510-arm64"
-    elif [[ "$kernel" == *-arm64* && "${OS_ID:-}" == "debian" && "${OS_VERSION:-}" == "13" ]]; then
-        target_id="debian-trixie-arm64"
-    elif [[ "$kernel" == *-arm64* && "${OS_ID:-}" == "debian" ]]; then
-        target_id="debian-bookworm-arm64"
-    else
-        log "No prebuilt target for kernel $kernel ($arch)"
-        return 1
-    fi
-
-    # Asset filename encodes the exact kernel version
-    asset_name="amneziawg-kmod-${target_id}_${kernel}_${arch}.deb"
-    asset_url="https://github.com/bivlked/amneziawg-installer/releases/download/arm-packages/${asset_name}"
-
-    log "Trying prebuilt: $asset_name"
-    tmpfile="$(mktemp /tmp/amneziawg-prebuilt-XXXXXX.deb)"
-    tmpsha="$(mktemp /tmp/amneziawg-prebuilt-XXXXXX.deb.sha256)"
-
-    # Download SHA256 checksum first
-    if ! curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 \
-            -o "$tmpsha" "${asset_url}.sha256" 2>/dev/null; then
-        log "Prebuilt not available for $kernel — using DKMS"
-        rm -f "$tmpfile" "$tmpsha"
-        return 1
-    fi
-
-    if curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 \
-            -o "$tmpfile" "$asset_url" 2>/dev/null; then
-        # Verify integrity before installing a kernel module
-        expected_sha="$(cat "$tmpsha")"
-        actual_sha="$(sha256sum "$tmpfile" | awk '{print $1}')"
-        rm -f "$tmpsha"
-        if [[ "$expected_sha" != "$actual_sha" ]]; then
-            log_warn "Prebuilt SHA256 mismatch — discarding download"
-            rm -f "$tmpfile"
-            return 1
-        fi
-
-        log "Downloaded prebuilt (SHA256 OK), installing..."
-        if dpkg -i "$tmpfile" 2>/dev/null; then
-            rm -f "$tmpfile"
-            log "Prebuilt installed: $asset_name"
-            return 0
-        else
-            log_warn "Prebuilt install failed (vermagic mismatch or corrupt package)"
-            rm -f "$tmpfile"
-            return 1
-        fi
-    else
-        log "Prebuilt not available for $kernel — using DKMS"
-        rm -f "$tmpfile" "$tmpsha"
-        return 1
-    fi
-}
-
-# H0 (AWG 3.0, 31 jul 2026): on kernels < 6.7 the current PPA module is AmneziaWG
-# 3.0, which does not build (nla_put_uint only appeared in kernel 6.7). We install
-# the last pinned 2.0 module (the 1.0.x line) from source via DKMS:
-#   1. git clone the pinned tag --depth=1;
-#   2. VERIFY the commit against AWG2_PIN_COMMIT (integrity: an immutable commit is
-#      more robust than the GitHub auto-tarball SHA, which changes on recompression);
-#   3. the upstream `make dkms-install` mechanism (lays it into /usr/src/amneziawg-1.0.0);
-#   4. dkms add/build/install for the current kernel;
-#   5. a modprobe check (built != loadable: Secure Boot may block it).
-# The source dkms.conf carries AUTOINSTALL=yes, so our amneziawg-ensure-module helper
-# (apt hook + systemd) rebuilds the pinned module on a kernel upgrade by itself - no
-# separate maintenance code is needed. Returns: 0 success, 1 failure (logged to ERROR).
-_install_pinned_awg2_module() {
-    local repo="https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git"
-    local kver work got_commit
-    local dkms_ver="1.0.0"   # WIREGUARD_VERSION in the upstream Makefile (name of /usr/src/amneziawg-<ver>)
-    kver="$(uname -r)"
-
-    if ! command -v git >/dev/null 2>&1; then
-        log_error "git is not installed - cannot fetch the pinned module source."
-        return 1
-    fi
-
-    work="$(mktemp -d /tmp/awg2-pin-XXXXXX)" || { log_error "mktemp -d failed."; return 1; }
-
-    log "Cloning the pinned AmneziaWG 2.0 source ($AWG2_PIN_TAG)..."
-    if ! git clone --depth=1 --branch "$AWG2_PIN_TAG" "$repo" "$work/src" >/dev/null 2>&1; then
-        log_error "Failed to clone $repo (tag $AWG2_PIN_TAG). Check access to github.com."
-        rm -rf "$work"; return 1
-    fi
-
-    got_commit="$(git -C "$work/src" rev-parse HEAD 2>/dev/null || echo "")"
-    if [[ "$got_commit" != "$AWG2_PIN_COMMIT" ]]; then
-        log_error "Pin check failed: tag $AWG2_PIN_TAG -> commit '${got_commit:-<empty>}',"
-        log_error "expected $AWG2_PIN_COMMIT. Refusing (the tag may have been moved/tampered with)."
-        rm -rf "$work"; return 1
-    fi
-    log "Pinned commit confirmed: $got_commit"
-
-    # Lay out the DKMS source via the upstream mechanism (the Makefile is in src/).
-    # Save make output to a log: otherwise the real cause of a failure (environment /
-    # coreutils) is invisible - unlike the dkms build path, no make.log is created here.
-    local _mklog="/var/log/amneziawg-pin-dkms-install.log"
-    if ! make -C "$work/src/src" dkms-install PREFIX=/usr >"$_mklog" 2>&1; then
-        log_error "make dkms-install failed. Details: $_mklog"
-        rm -rf "$work"; return 1
-    fi
-    rm -rf "$work"
-
-    if [[ ! -f "/usr/src/amneziawg-${dkms_ver}/dkms.conf" ]]; then
-        log_error "/usr/src/amneziawg-${dkms_ver}/dkms.conf did not appear after dkms-install."
-        return 1
-    fi
-
-    # add is idempotent: on a re-run it is already added -> not fatal.
-    dkms add -m amneziawg -v "$dkms_ver" >/dev/null 2>&1 || true
-    # Idempotency (the installer is a resumable state machine): dkms build errors
-    # with "already built" for a kernel already done -> build ONLY if there is no
-    # build for this kernel yet. install --force below is idempotent by itself.
-    if dkms status -m amneziawg -v "$dkms_ver" -k "$kver" 2>/dev/null | grep -qE ': (built|installed)'; then
-        log "The pinned 2.0 module is already built for kernel $kver - skipping dkms build."
-    else
-        log "Building the pinned 2.0 module via DKMS (kernel $kver)..."
-        if ! dkms build -m amneziawg -v "$dkms_ver" -k "$kver" >/dev/null 2>&1; then
-            log_error "DKMS build of the pinned 2.0 module failed. See /var/lib/dkms/amneziawg/${dkms_ver}/${kver}/*/log/make.log"
-            return 1
-        fi
-    fi
-    if ! dkms install -m amneziawg -v "$dkms_ver" -k "$kver" --force >/dev/null 2>&1; then
-        log_error "DKMS install of the pinned 2.0 module failed."
-        return 1
-    fi
-
-    # Built != loadable: with Secure Boot enabled an unsigned module will not load.
-    if ! modprobe amneziawg 2>/dev/null; then
-        log_error "The module was built but modprobe amneziawg did not load it."
-        log_error "The likely cause is Secure Boot: an unsigned DKMS module is blocked."
-        log_error "Disable Secure Boot in the VPS BIOS/UEFI or enroll a MOK key."
-        return 1
-    fi
-    log "The pinned AmneziaWG 2.0 module is built and loaded (DKMS $dkms_ver, kernel $kver)."
-    return 0
 }
 
 # ==============================================================================
@@ -2349,81 +2165,31 @@ PPASRC
     # AmneziaWG + qrencode packages (NO Python!)
     log "Installing AmneziaWG packages..."
 
-    # H0 (AWG 3.0, 31 jul 2026): decide the pinned 2.0 module path BEFORE installing
-    # any package - the hold must be in place before even the ARM prebuilt path, where
-    # install_packages installs amneziawg-tools whose Recommends would otherwise pull
-    # the incompatible 3.0 module. On kernels < 6.7 the PPA module is AmneziaWG 3.0
-    # (does not build: nla_put_uint), so we do not install it and build the pinned 2.0
-    # from source instead; only tools come from the PPA (version-aware, 2.0-compatible).
-    local use_pinned_awg2=0
+    # H1 (AWG 3.1): a kernel older than 6.7 cannot build the AmneziaWG 3.x
+    # module - it uses nla_put_uint, which first appeared in mainline 6.7 (it
+    # is absent in 6.6). The pinned 2.0 module we used to build from source on
+    # such kernels is gone: the PPA tools are 3.1 now and do not drive the
+    # 1.0.0 module, so that path produced a server that came up but refused
+    # every 3.x parameter. One protocol, one module.
+    #
+    # The gate lives here rather than among the early checks on purpose: by
+    # this point the system has been upgraded and rebooted, so uname -r is the
+    # kernel the module will actually be built against.
     if ! _kernel_supports_awg3; then
-        use_pinned_awg2=1
-        log "Kernel $(uname -r) is older than 6.7 - the PPA module (AmneziaWG 3.0) will not build here."
-        log "Activated the pinned AmneziaWG 2.0 module path from source ($AWG2_PIN_TAG)."
-        # Re-entry: if a prior run / the stock installer already installed (or left
-        # half-configured) the 3.0 package - remove it and its source, otherwise its
-        # failing postinst and /usr/src/amneziawg-* ownership conflict with the build.
-        if dpkg -l amneziawg-dkms 2>/dev/null | grep -qE '^(ii|iU|iF|iH|rc)'; then
-            log "Found a previously installed amneziawg-dkms (AmneziaWG 3.0) - removing it before the pinned build."
-            DEBIAN_FRONTEND=noninteractive apt-get purge -y amneziawg-dkms amneziawg >/dev/null 2>&1 \
-                || dpkg --purge --force-all amneziawg-dkms amneziawg >/dev/null 2>&1 \
-                || log_warn "Could not fully remove the previously installed amneziawg-dkms - the install below may fail."
-            command -v dkms >/dev/null 2>&1 && dkms remove -m amneziawg -v 1.0.0 --all >/dev/null 2>&1 || true
-            rm -rf /var/lib/dkms/amneziawg* /usr/src/amneziawg-* 2>/dev/null || true
-        fi
-        # ⚠️ Hold BEFORE any install: amneziawg-tools RECOMMENDS amneziawg-dkms, apt
-        # installs recommends by default -> without a hold, installing tools (incl. on
-        # the ARM path) would pull the 3.0 dkms and fail on its build. This is a safety
-        # mechanism, so its failure is fatal (we verify the hold actually took effect).
-        apt-mark hold amneziawg-dkms amneziawg >/dev/null 2>&1 || true
-        # We verify amneziawg-dkms specifically - it is the load-bearing package: it
-        # is what amneziawg-tools Recommends and what carries the 3.0 module. The
-        # metapackage amneziawg need not be held (its Depends: amneziawg-dkms is held
-        # anyway), so we do not verify it separately.
-        if ! apt-mark showhold 2>/dev/null | grep -qx "amneziawg-dkms"; then
-            die "Failed to hold amneziawg-dkms. Without it, installing amneziawg-tools would pull the incompatible AmneziaWG 3.0 module. Aborted (check for an apt/dpkg lock)."
-        fi
-    else
-        # Kernel >= 6.7: the normal path installs amneziawg-dkms from the PPA. Clear a
-        # possible hold left by an earlier pinned run (else apt install -y aborts on hold).
-        apt-mark unhold amneziawg-dkms amneziawg >/dev/null 2>&1 || true
+        log_error "Kernel $(uname -r) is not recognised as 6.7 or newer - the AmneziaWG module will not build here."
+        log_error "Options: install a 6.7+ kernel (on Debian 12 - from bookworm-backports)"
+        log_error "or reinstall the VPS on Ubuntu 24.04/25.10/26.04 or Debian 13."
+        die "Kernel $(uname -r) is not supported by AmneziaWG 3.x."
     fi
 
-    # On ARM: try prebuilt .deb first (no build tools or headers required).
-    # Falls back to DKMS if no matching prebuilt is available or download fails.
-    # ⚠️ On a kernel < 6.7 (use_pinned_awg2=1) using the prebuilt .deb is SAFE: our ARM
-    # prebuilts are built from scripts/arm-module-version.txt, pinned to the same 2.0
-    # tag (v1.0.20260725) and locked by a test, so it is a KNOWN 2.0 module, not 3.0.
-    # And 3.0 physically cannot compile for a kernel < 6.7, so a 3.0 asset for such a
-    # target (e.g. debian-bookworm-arm64) cannot exist in the release - on no match
-    # _try_install_prebuilt_arm returns 1 and we fall through to the verified source
-    # build below. The hold set above also applies here (keeps tools from pulling the
-    # 3.0 dkms via Recommends).
-    local arch
-    arch="$(uname -m)"
-    if [[ "$arch" == "aarch64" || "$arch" == "armv7l" ]]; then
-        if _try_install_prebuilt_arm; then
-            log "Prebuilt kernel module installed. Installing userspace tools from PPA..."
-            install_packages "amneziawg-tools" "wireguard-tools" "qrencode"
-            log "Step 2 completed (prebuilt ARM)."
-            # request_reboot always terminates the process (exit), we never return here.
-            request_reboot 3
-        fi
-        log "No matching prebuilt — falling back to DKMS build."
-    fi
+    # Drop a hold a previous version of this installer could have left behind:
+    # it used to pin amneziawg-dkms so that apt would not pull the 3.0 module
+    # onto an old kernel. `apt install -y` refuses to proceed on a held package.
+    apt-mark unhold amneziawg-dkms amneziawg >/dev/null 2>&1 || true
 
-    # Packages: on the pinned path (kernel < 6.7) we do NOT install amneziawg-dkms
-    # (it would be the 3.0 module); git is added instead to build the pinned 2.0
-    # source. The gate, hold and cleanup of a previously installed 3.0 were done
-    # above (before the ARM block).
     local packages
-    if [[ "$use_pinned_awg2" -eq 1 ]]; then
-        packages=("amneziawg-tools" "wireguard-tools" "dkms"
-                  "build-essential" "dpkg-dev" "git" "qrencode")
-    else
-        packages=("amneziawg-dkms" "amneziawg-tools" "wireguard-tools" "dkms"
-                  "build-essential" "dpkg-dev" "qrencode")
-    fi
+    packages=("amneziawg-dkms" "amneziawg-tools" "wireguard-tools" "dkms"
+              "build-essential" "dpkg-dev" "qrencode")
 
     # Linux headers: on Debian, exact linux-headers-$(uname -r) may not be available
     local current_headers
@@ -2483,21 +2249,6 @@ PPASRC
         fi
     fi
     install_packages "${packages[@]}"
-
-    # H0: pinned path - build the 2.0 module from source INSTEAD of PPA amneziawg-dkms.
-    # Headers for the current kernel are already installed above (in packages); the
-    # hold was set earlier.
-    if [[ "$use_pinned_awg2" -eq 1 ]]; then
-        if ! _install_pinned_awg2_module; then
-            log_error "Failed to install the pinned AmneziaWG 2.0 module."
-            log_error "Kernel $(uname -r) is older than 6.7, and the current PPA module is"
-            log_error "AmneziaWG 3.0, which does not build on this kernel. Options: upgrade the"
-            log_error "kernel to 6.7+ (on Debian 12 via bookworm-backports) or reinstall the VPS"
-            log_error "on Ubuntu 24.04/25.10 or Debian 13. See README/INSTALL_VPS for details."
-            die "The pinned AmneziaWG 2.0 module was not installed."
-        fi
-        log "The pinned AmneziaWG 2.0 module is installed; PPA dkms is held (3.0 protection)."
-    fi
 
     # v5.12.0: install a kernel-headers meta-package so apt automatically
     # pulls matching headers on every kernel upgrade. Without the meta only
@@ -2955,7 +2706,7 @@ step7_start_service() {
 step99_finish() {
     log "### УСТАНОВКА ЗАВЕРШЕНА ###"
     log "=============================================================================="
-    log "AmneziaWG 3.0 развёрнут."
+    log "AmneziaWG 3.1 развёрнут."
     log " "
     log "КЛИЕНТЫ:"
     log "  каждый живёт в своём каталоге ${AWG_DIR}/ИМЯ/ — conf, QR, ссылка vpn://"
@@ -2969,7 +2720,7 @@ step99_finish() {
     log "  systemctl status awg-quick@awg0       состояние сервиса"
     log "  ufw status verbose                    состояние фаервола"
     log " "
-    log "ВАЖНО: нужен клиент Amnezia VPN с поддержкой AWG 3.0."
+    log "ВАЖНО: нужен клиент Amnezia VPN 5.0.1.5 или новее — с поддержкой AWG 3.1."
     log " "
     cleanup_apt
     log " "
@@ -3009,7 +2760,7 @@ BOOTSTRAP_USER=""
 
 show_help() {
     cat <<EOF
-install-awg3.sh ${SCRIPT_VERSION} — развёртывание AmneziaWG 3.0
+install-awg3.sh ${SCRIPT_VERSION} — развёртывание AmneziaWG 3.1
 (форк bivlked/amneziawg-installer ${UPSTREAM_VERSION})
 
 ИСПОЛЬЗОВАНИЕ
@@ -3018,9 +2769,8 @@ install-awg3.sh ${SCRIPT_VERSION} — развёртывание AmneziaWG 3.0
 Без опций выводится меню сценариев.
 
 СЦЕНАРИИ
-    --mode full           подготовка системы + AmneziaWG 3.0
-    --mode awg-only       только AmneziaWG 3.0, система уже подготовлена
-    --mode upgrade        перевести существующий 2.0-сервер на 3.0
+    --mode full           подготовка системы + AmneziaWG 3.1
+    --mode awg-only       только AmneziaWG 3.1, система уже подготовлена
     --mode reinstall      пересоздать сервер, сохранив пиров
     --mode uninstall      снести AmneziaWG (то же, что --uninstall)
 
@@ -3067,9 +2817,18 @@ EOF
     exit "${HELP_EXIT_RC:-0}"
 }
 
+# Режима upgrade больше нет: он переводил 2.0-сервер на 3.0, а 2.0 из проекта
+# ушёл целиком. Пересоздание сервера с новыми параметрами — это reinstall.
 validate_mode() {
     case "${1:-}" in
-        full|awg-only|upgrade|reinstall|uninstall) return 0 ;;
+        full|awg-only|reinstall|uninstall) return 0 ;;
+        # Режим был, и в чужих заметках он ещё встречается: подсказываем, чем
+        # он заменён, вместо глухого «неизвестный режим».
+        upgrade)
+            log_error "режима 'upgrade' больше нет: AmneziaWG 2.0 из проекта убран."
+            log_error "Сменить общие параметры сервера: sudo awg3 server-rekey"
+            log_error "Пересоздать сервер, сохранив пиров: $0 --mode reinstall"
+            return 1 ;;
         *) log_error "неизвестный режим: '${1:-}'"; return 1 ;;
     esac
 }
@@ -3078,9 +2837,8 @@ mode_from_choice() {
     case "${1:-}" in
         1) printf 'full' ;;
         2) printf 'awg-only' ;;
-        3) printf 'upgrade' ;;
-        4) printf 'reinstall' ;;
-        5) printf 'uninstall' ;;
+        3) printf 'reinstall' ;;
+        4) printf 'uninstall' ;;
         *) return 1 ;;
     esac
 }
@@ -3090,15 +2848,14 @@ show_menu() {
 
 Что делаем?
 
-  1) Полное развёртывание с нуля     подготовка системы + AmneziaWG 3.0
-  2) Только AmneziaWG 3.0            система уже подготовлена
-  3) Перевести 2.0-сервер на 3.0     клиентов придётся создать заново
-  4) Переустановить поверх           пиры сохраняются, параметры новые
-  5) Удалить                         снести AmneziaWG
+  1) Полное развёртывание с нуля     подготовка системы + AmneziaWG
+  2) Только AmneziaWG                система уже подготовлена
+  3) Переустановить поверх           пиры сохраняются, параметры новые
+  4) Удалить                         снести AmneziaWG
 
 EOF
     local choice
-    read -rp "Пункт [1-5]: " choice < /dev/tty
+    read -rp "Пункт [1-4]: " choice < /dev/tty
     MODE=$(mode_from_choice "$choice") || die "недопустимый пункт: $choice"
 }
 
@@ -3140,7 +2897,7 @@ install_awg3_script() {
 run_server_init() {
     local args
     args=$(build_server_init_args)
-    log "Создание сервера AWG 3.0: $args"
+    log "Создание сервера AWG 3.1: $args"
     # Сервис поднимет step7_start_service — там же и проверки состояния,
     # поэтому server-init работает с --no-apply.
     # shellcheck disable=SC2086
@@ -3343,6 +3100,7 @@ main() {
 
     check_container
     check_os_version
+    check_kernel_version
     check_free_space
 
     if [[ "${AWG_FORCE_REINSTALL:-0}" == "1" ]]; then FORCE_REINSTALL=1; fi
@@ -3405,21 +3163,6 @@ main() {
             ask_params; validate_params; resolve_awg_port
             install_amneziawg_stack
             deploy_server
-            ;;
-        upgrade)
-            [[ -f "$SERVER_CONF_FILE" ]] \
-                || die "переводить нечего: $SERVER_CONF_FILE не найден"
-            log_warn "После перевода на 3.0 все выданные клиентские конфиги перестанут"
-            log_warn "подключаться — каждого клиента придётся создать заново."
-            if [[ "$AUTO_YES" -eq 0 ]]; then
-                local ans
-                read -rp "Продолжить? [y/N]: " ans < /dev/tty
-                [[ "$ans" =~ ^[Yy] ]] || die "отменено"
-            fi
-            install_awg3_script
-            AWG3_DIR="$AWG_DIR" "$AWG_DIR/awg3.sh" server-upgrade -y \
-                || die "server-upgrade не отработал"
-            log_warn "прежние клиентские конфиги больше не подключатся — пересоздайте их"
             ;;
         uninstall)
             step_uninstall

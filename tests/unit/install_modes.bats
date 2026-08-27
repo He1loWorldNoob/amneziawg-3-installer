@@ -36,6 +36,42 @@ run_isolated() {
     ! grep -q "safe_load_config" "$SCRIPT"
 }
 
+@test "путь закреплённого модуля 2.0 удалён" {
+    # tools 3.1 из PPA не работают с модулем 1.0.0: интерфейс поднимался, но
+    # параметры 3.x не принимал. Держать в проекте два протокола незачем.
+    ! grep -q "AWG2_PIN_TAG" "$SCRIPT"
+    ! grep -q "AWG2_PIN_COMMIT" "$SCRIPT"
+    ! grep -q "_install_pinned_awg2_module" "$SCRIPT"
+    ! grep -q "use_pinned_awg2" "$SCRIPT"
+}
+
+@test "готовые ARM-пакеты из чужого релиза больше не скачиваются" {
+    ! grep -q "_try_install_prebuilt_arm" "$SCRIPT"
+    ! grep -q "releases/download/arm-packages" "$SCRIPT"
+}
+
+@test "ядро младше 6.7 не поддерживается" {
+    run _kernel_supports_awg3 "6.1.0-18-amd64"
+    [ "$status" -ne 0 ]
+    run _kernel_supports_awg3 "6.6.99-generic"
+    [ "$status" -ne 0 ]
+    run _kernel_supports_awg3 "6.7.0-generic"
+    [ "$status" -eq 0 ]
+    run _kernel_supports_awg3 "6.8.0-51-generic"
+    [ "$status" -eq 0 ]
+    run _kernel_supports_awg3 "7.0.1"
+    [ "$status" -eq 0 ]
+}
+
+@test "неразбираемая версия ядра считается неподдерживаемой" {
+    run _kernel_supports_awg3 "какая-то-ерунда"
+    [ "$status" -ne 0 ]
+}
+
+@test "установка стека падает на старом ядре, а не собирает 2.0" {
+    grep -q 'die "Kernel $(uname -r) is not supported by AmneziaWG 3.x."' "$SCRIPT"
+}
+
 @test "генерация параметров 2.0 удалена" {
     ! grep -q "generate_awg_params" "$SCRIPT"
     ! grep -q "generate_awg_h_ranges" "$SCRIPT"
@@ -70,12 +106,19 @@ run_isolated() {
 
 # ── Режимы ──────────────────────────────────────────────────────────────────
 
-@test "все пять режимов валидны" {
+@test "все четыре режима валидны" {
     local m
-    for m in full awg-only upgrade reinstall uninstall; do
+    for m in full awg-only reinstall uninstall; do
         run validate_mode "$m"
         [ "$status" -eq 0 ]
     done
+}
+
+@test "режим upgrade больше не принимается" {
+    # 2.0 из проекта ушёл целиком: переводить с него нечего, а пересоздание
+    # сервера — это reinstall.
+    run validate_mode upgrade
+    [ "$status" -ne 0 ]
 }
 
 @test "невалидный режим отвергается" {
@@ -93,12 +136,21 @@ run_isolated() {
     [ "$output" = "full" ]
     run mode_from_choice 2
     [ "$output" = "awg-only" ]
-    run mode_from_choice 5
+    run mode_from_choice 3
+    [ "$output" = "reinstall" ]
+    run mode_from_choice 4
     [ "$output" = "uninstall" ]
 }
 
 @test "недопустимый номер пункта отвергается" {
     run mode_from_choice 9
+    [ "$status" -ne 0 ]
+}
+
+@test "пятого пункта меню больше нет" {
+    # Пункты сдвинулись после удаления upgrade: если 5 снова начнёт что-то
+    # значить, человек по привычке выберет не то, что думает.
+    run mode_from_choice 5
     [ "$status" -ne 0 ]
 }
 
