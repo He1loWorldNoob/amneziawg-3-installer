@@ -64,15 +64,11 @@ prepare_awg_dir() {
 }
 
 # CLI flags
-UNINSTALL=0; HELP=0; HELP_EXIT_RC=0; DIAGNOSTIC=0; VERBOSE=0; NO_COLOR=0; AUTO_YES=0; NO_TWEAKS=0; NO_CPS=0
-FORCE_REINSTALL=0
+UNINSTALL=0; HELP=0; HELP_EXIT_RC=0; DIAGNOSTIC=0; VERBOSE=0; NO_COLOR=0; AUTO_YES=0; NO_TWEAKS=0
 _APT_UPDATED=0
-CLI_PORT=""; CLI_SUBNET=""; CLI_DISABLE_IPV6="default"; CLI_SSH_PORT=""
-CLI_ROUTING_MODE="default"; CLI_CUSTOM_ROUTES=""; CLI_ENDPOINT=""; CLI_NO_TWEAKS=0; CLI_NO_CPS=0
-CLI_ALLOW_IPV6_TUNNEL=0
-CLI_ISOLATION="default"
-CLI_SERVER_NAME=""
-CLI_MOBILE=0
+# CLI_SSH_PORT — порт SSH для правила ufw, если автоопределение ошибается.
+# CLI_NO_TWEAKS дублирует NO_TWEAKS ради кода, унаследованного от апстрима.
+CLI_SSH_PORT=""; CLI_NO_TWEAKS=0
 
 # --- Auto-cleanup of temporary files ---
 _install_temp_files=()
@@ -477,19 +473,6 @@ check_free_space() {
     fi
 }
 
-check_port_availability() {
-    local port=$1
-    log "Checking port $port..."
-    local proc
-    proc=$(ss -lunp | grep ":${port} ")
-    if [[ -n "$proc" ]]; then
-        log_error "Port ${port}/udp already in use! Process: $proc"
-        return 1
-    else
-        log "Port $port/udp is free."
-        return 0
-    fi
-}
 
 install_packages() {
     local packages=("$@")
@@ -547,119 +530,14 @@ cleanup_apt() {
     log "apt cache cleared."
 }
 
-configure_ipv6() {
-    if [[ "$CLI_DISABLE_IPV6" != "default" ]]; then
-        DISABLE_IPV6=$CLI_DISABLE_IPV6
-        log "IPv6 from CLI: $DISABLE_IPV6"
-    elif [[ "$AUTO_YES" -eq 1 ]]; then
-        DISABLE_IPV6=1
-        log "IPv6 disabled (--yes, default)."
-    else
-        read -rp "Disable IPv6 (recommended)? [Y/n]: " dis_ipv6 < /dev/tty
-        if [[ "$dis_ipv6" =~ ^[Nn]$ ]]; then
-            DISABLE_IPV6=0
-        else
-            DISABLE_IPV6=1
-        fi
-    fi
-    export DISABLE_IPV6
-    log "IPv6 disable: $(if [ "$DISABLE_IPV6" -eq 1 ]; then echo 'Yes'; else echo 'No'; fi)"
-}
-
-# Detect whether the VPS has native IPv6.
-# Native IPv6 = a globally routable address (NOT ULA fc00::/7, NOT link-local
-# fe80::) AND a default IPv6 route. Either condition alone is insufficient:
-#   - a global address without a default route -> no IPv6 internet egress (a client
-#     with ::/0 would black-hole);
-#   - a ULA (fddd::/...) has global scope to `ip` but is not internet-routable.
-# Echo 1 only when both conditions hold, otherwise 0.
-detect_native_ipv6() {
-    local have_addr=0 have_route=0
-    if ip -6 addr show scope global 2>/dev/null \
-        | grep -oP 'inet6\s+\K[0-9a-fA-F:]+' \
-        | grep -qviE '^(fc|fd)'; then
-        have_addr=1
-    fi
-    if ip -6 route show default 2>/dev/null | grep -q .; then
-        have_route=1
-    fi
-    if [[ "$have_addr" -eq 1 && "$have_route" -eq 1 ]]; then
-        echo 1
-    else
-        echo 0
-    fi
-}
-
-configure_ipv6_tunnel() {
-    if [[ "$CLI_ALLOW_IPV6_TUNNEL" -eq 1 ]]; then
-        ALLOW_IPV6_TUNNEL=1
-    elif [[ -z "${ALLOW_IPV6_TUNNEL:-}" ]]; then
-        ALLOW_IPV6_TUNNEL=0
-    fi
-    : "${IPV6_SUBNET:=fddd:2c4:2c4:2c4::/64}"
-    # The IPv6 tunnel requires host IPv6 enabled. Override --disallow-ipv6 AND
-    # actively re-enable IPv6 at runtime BEFORE detection/render: on an upgrade
-    # from a default past install (IPv6 was runtime-disabled), the kernel hides
-    # all IPv6 addresses, so detect_native_ipv6 would false-negative and a client
-    # would be rendered with an IPv6 Address while the kernel has IPv6 off
-    # (awg-quick restart can fail). weaq P1.
-    if [[ "$ALLOW_IPV6_TUNNEL" -eq 1 ]]; then
-        if [[ "$DISABLE_IPV6" -eq 1 ]]; then
-            log_warn "--allow-ipv6-tunnel requires host IPv6 forwarding; overriding --disallow-ipv6 (DISABLE_IPV6=0)"
-            DISABLE_IPV6=0
-        fi
-        sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1 || true
-        sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1 || true
-        sysctl -w net.ipv6.conf.lo.disable_ipv6=0 >/dev/null 2>&1 || true
-    fi
-    # Detect native IPv6 AFTER the runtime re-enable (cached in init for client render in Phase 4).
-    SERVER_HAS_NATIVE_IPV6=$(detect_native_ipv6)
-    if [[ "$ALLOW_IPV6_TUNNEL" -eq 1 && "$SERVER_HAS_NATIVE_IPV6" -eq 0 ]]; then
-        log_warn "Native IPv6 not detected on VPS - the IPv6 tunnel will work peer-to-peer only, without IPv6 internet egress."
-    fi
-    export ALLOW_IPV6_TUNNEL IPV6_SUBNET SERVER_HAS_NATIVE_IPV6 DISABLE_IPV6
-}
 
 
 
 
 
-validate_port() {
-    local port="$1"
-    # ^[1-9][0-9]{0,4}$ forbids leading zeros ('0080' would otherwise be parsed as
-    # octal in arithmetic and slip past the range check) and bounds the length:
-    # without a limit 64-bit (( )) arithmetic wraps, so 2^64+51820 would pass the
-    # range check. Comparison uses plain decimal.
-    if ! [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] || (( port > 65535 )); then
-        die "Invalid port: '$port'. Allowed range: 1-65535."
-    fi
-}
 
-validate_subnet() {
-    local subnet="$1" o
-    # Самодостаточно: не использует
-    # _valid_ipv4/_cidr_bounds. Octets without leading zeros ('010...' would
-    # otherwise be parsed as octal).
-    if ! [[ "$subnet" =~ ^(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})/([0-9]{1,2})$ ]]; then
-        die "Invalid subnet: '$subnet'. Expected CIDR /16-/30, e.g. 10.9.0.0/16."
-    fi
-    local a="${BASH_REMATCH[1]}" b="${BASH_REMATCH[2]}" c="${BASH_REMATCH[3]}" d="${BASH_REMATCH[4]}" prefix="${BASH_REMATCH[5]}"
-    for o in "$a" "$b" "$c" "$d"; do
-        (( 10#$o <= 255 )) || die "Invalid subnet: '$subnet'. Octet out of range 0-255."
-    done
-    (( 10#$prefix >= 16 && 10#$prefix <= 30 )) || die "Invalid subnet: '$subnet'. Only /16-/30 masks are supported."
-    # Inline arithmetic: the address must be network or network+1.
-    local ip=$(( (10#$a << 24) | (10#$b << 16) | (10#$c << 8) | 10#$d ))
-    local mask=$(( (0xFFFFFFFF << (32 - 10#$prefix)) & 0xFFFFFFFF ))
-    local network=$(( ip & mask ))
-    local n1=$(( network + 1 ))
-    local srv="$(( (n1 >> 24) & 255 )).$(( (n1 >> 16) & 255 )).$(( (n1 >> 8) & 255 )).$(( n1 & 255 ))"
-    if (( ip != network && ip != n1 )); then
-        die "Invalid subnet: '$subnet'. Server address must be ${srv} (network+1), or specify the network."
-    fi
-    # Normalize the global to <network+1>/<prefix> (server = network+1).
-    AWG_TUNNEL_SUBNET="${srv}/${prefix}"
-}
+
+
 
 # Tunnel network from a CIDR string (<network+1>/<prefix> -> <network>/<prefix>).
 # Needed for client isolation (issue #178): with isolation disabled, it is the
@@ -681,102 +559,7 @@ tunnel_network_cidr() {
     echo "$(( (net >> 24) & 255 )).$(( (net >> 16) & 255 )).$(( (net >> 8) & 255 )).$(( net & 255 ))/${prefix}"
 }
 
-# Explicit client isolation choice (issue #178). Priority:
-# CLI flag > saved config > interactive question (first run only, no --yes) >
-# 1 (isolated). An old config without the key = 1: before this feature,
-# split modes were isolated de facto, so the behaviour is preserved.
-configure_client_isolation() {
-    case "$CLI_ISOLATION" in
-        on)  CLIENT_ISOLATION=1; log "Client isolation from CLI: enabled." ;;
-        off) CLIENT_ISOLATION=0; log "Client isolation from CLI: disabled." ;;
-        default)
-            if [[ -n "${CLIENT_ISOLATION:-}" ]]; then
-                log "Client isolation (from config): $( [[ "$CLIENT_ISOLATION" -eq 1 ]] && echo enabled || echo disabled )."
-            elif [[ "${config_exists:-0}" -eq 1 ]]; then
-                CLIENT_ISOLATION=1
-                log "Client isolation: enabled (pre-v5.20 config - previous behaviour)."
-            elif [[ "$AUTO_YES" -eq 1 ]]; then
-                CLIENT_ISOLATION=1
-                log "Client isolation: enabled (--yes, default)."
-            else
-                local r_iso
-                read -rp "Isolate VPN clients from each other? [Y/n]: " r_iso < /dev/tty
-                case "$r_iso" in
-                    [nN]*) CLIENT_ISOLATION=0; log "Client isolation disabled: clients will see each other inside the VPN." ;;
-                    *)     CLIENT_ISOLATION=1; log "Client isolation enabled." ;;
-                esac
-            fi
-            ;;
-        *) die "Invalid --isolation='$CLI_ISOLATION'. Allowed: on|off." ;;
-    esac
-    export CLIENT_ISOLATION
-}
 
-# Brings ALLOWED_IPS in line with CLIENT_ISOLATION (idempotent, called on every
-# run after the routing mode is determined). Isolation OFF: the tunnel subnet
-# is appended to the list (modes 2/3; in mode 1, 0.0.0.0/0 already covers it).
-# Isolation ON: our token is removed from mode 2 (off->on round-trip); mode 3
-# is left untouched - the custom list belongs to the user, and isolation is
-# enforced by the server-side DROP rule regardless.
-# CLIENT_ISOLATION_NET tracks ownership of our token (empty if the token is
-# user-owned or isolation is enabled) - needed to clean up the previous route
-# when the tunnel subnet changes (issue #178, final audit).
-_apply_isolation_to_allowed_ips() {
-    local net
-    net=$(tunnel_network_cidr "$AWG_TUNNEL_SUBNET") || return 0
-    # Strip ALL whitespace, not just spaces: validate_cidr_list accepts tabs
-    # as separators, and a tab-carrying token would otherwise slip past the
-    # pattern match below - duplicating instead of a no-op (PR #179 review).
-    local compact=",${ALLOWED_IPS//[[:space:]]/},"
-
-    # Tunnel subnet changed: our previous token (persisted CLIENT_ISOLATION_NET)
-    # differs from the current network - remove it in any mode and regardless
-    # of the isolation state: by construction the token was added by us, not
-    # the user.
-    if [[ -n "${CLIENT_ISOLATION_NET:-}" && "$CLIENT_ISOLATION_NET" != "$net" ]]; then
-        if [[ "$compact" == *",${CLIENT_ISOLATION_NET},"* ]]; then
-            # A loop, not a single replace: a corrupted list may carry the
-            # token more than once - purge every copy (PR #179 review).
-            while [[ "$compact" == *",${CLIENT_ISOLATION_NET},"* ]]; do
-                compact="${compact/,${CLIENT_ISOLATION_NET},/,}"
-            done
-            compact="${compact#,}"; compact="${compact%,}"
-            ALLOWED_IPS="${compact//,/, }"
-            log "Tunnel subnet changed: previous route ${CLIENT_ISOLATION_NET} removed from client AllowedIPs."
-            compact=",${ALLOWED_IPS// /},"
-        fi
-        CLIENT_ISOLATION_NET=""
-    fi
-
-    if [[ "${CLIENT_ISOLATION:-1}" -eq 0 ]]; then
-        if [[ "$ALLOWED_IPS_MODE" == "1" ]]; then
-            CLIENT_ISOLATION_NET=""
-        elif [[ "$compact" == *",${net},"* ]]; then
-            # Already present: our previous token (CLIENT_ISOLATION_NET==net kept)
-            # or a user-owned one (CLIENT_ISOLATION_NET empty) - ownership unchanged.
-            :
-        else
-            ALLOWED_IPS="${ALLOWED_IPS}, ${net}"
-            CLIENT_ISOLATION_NET="$net"
-            log "Isolation disabled: tunnel subnet ${net} added to client AllowedIPs."
-        fi
-    else
-        # Isolation ON: mode 2 - the token is always removed (the list is
-        # generated by us); mode 3 - only if we added the token (ownership
-        # tracked in CLIENT_ISOLATION_NET).
-        if [[ "$compact" == *",${net},"* ]] \
-           && { [[ "$ALLOWED_IPS_MODE" == "2" ]] || [[ "${CLIENT_ISOLATION_NET:-}" == "$net" ]]; }; then
-            while [[ "$compact" == *",${net},"* ]]; do
-                compact="${compact/,${net},/,}"
-            done
-            compact="${compact#,}"; compact="${compact%,}"
-            ALLOWED_IPS="${compact//,/, }"
-            log "Isolation enabled: tunnel subnet ${net} removed from client AllowedIPs."
-        fi
-        CLIENT_ISOLATION_NET=""
-    fi
-    export CLIENT_ISOLATION_NET
-}
 
 
 
@@ -857,53 +640,6 @@ validate_cidr_list() {
     done
 }
 
-configure_routing_mode() {
-    if [[ "$CLI_ROUTING_MODE" != "default" ]]; then
-        ALLOWED_IPS_MODE=$CLI_ROUTING_MODE
-        if [[ "$CLI_ROUTING_MODE" -eq 3 ]]; then
-            ALLOWED_IPS=$CLI_CUSTOM_ROUTES
-            if [ -z "$ALLOWED_IPS" ]; then die "No networks specified for --route-custom."; fi
-        fi
-        log "Routing mode from CLI: $ALLOWED_IPS_MODE"
-    elif [[ "$AUTO_YES" -eq 1 ]]; then
-        ALLOWED_IPS_MODE=2
-        log "Routing mode: Amnezia+DNS (--yes, default)."
-    else
-        echo ""
-        log "Select routing mode (client AllowedIPs):"
-        echo "  1) All traffic (0.0.0.0/0) - Max privacy, may block LAN"
-        echo "  2) Amnezia List+DNS (default) - Recommended for bypassing restrictions"
-        echo "  3) Only specified networks (Split Tunneling)"
-        read -rp "Your choice [2]: " r_mode < /dev/tty
-        ALLOWED_IPS_MODE=${r_mode:-2}
-    fi
-    case "$ALLOWED_IPS_MODE" in
-        1) ALLOWED_IPS="0.0.0.0/0"
-           log "Selected mode: All traffic." ;;
-        3) if [[ -z "$CLI_CUSTOM_ROUTES" ]]; then
-               read -rp "Enter networks (a.b.c.d/xx,...): " ALLOWED_IPS < /dev/tty
-               while ! validate_cidr_list "$ALLOWED_IPS"; do
-                   log_warn "Invalid CIDR format: '$ALLOWED_IPS'. Expected: x.x.x.x/y[,x.x.x.x/y]"
-                   read -rp "Try again: " ALLOWED_IPS < /dev/tty
-               done
-           else
-               ALLOWED_IPS=$CLI_CUSTOM_ROUTES
-               if ! validate_cidr_list "$ALLOWED_IPS"; then
-                   die "Invalid CIDR format: '$ALLOWED_IPS'. Expected: x.x.x.x/y[,x.x.x.x/y]"
-               fi
-           fi
-           log "Selected mode: Custom ($ALLOWED_IPS)" ;;
-        *) ALLOWED_IPS_MODE=2
-           # iOS breaks the tunnel if the list starts with 0.0.0.0/5: that block covers
-           # the reserved 0.0.0.0/8 which the iOS kernel chokes on, so it never reaches the
-           # rest of the routes. 1.0.0.0/8 + 2.0.0.0/7 + 4.0.0.0/6 is the same range minus the
-           # zero block (0.0.0.0/8 is non-routable anyway). Do not revert to 0.0.0.0/5 (Issue #42).
-           ALLOWED_IPS="1.0.0.0/8, 2.0.0.0/7, 4.0.0.0/6, 8.0.0.0/7, 11.0.0.0/8, 12.0.0.0/6, 16.0.0.0/4, 32.0.0.0/3, 64.0.0.0/2, 128.0.0.0/3, 160.0.0.0/5, 168.0.0.0/6, 172.0.0.0/12, 172.32.0.0/11, 172.64.0.0/10, 172.128.0.0/9, 173.0.0.0/8, 174.0.0.0/7, 176.0.0.0/4, 192.0.0.0/9, 192.128.0.0/11, 192.160.0.0/13, 192.169.0.0/16, 192.170.0.0/15, 192.172.0.0/14, 192.176.0.0/12, 192.192.0.0/10, 193.0.0.0/8, 194.0.0.0/7, 196.0.0.0/6, 200.0.0.0/5, 208.0.0.0/4, 8.8.8.8/32, 1.1.1.1/32"
-           log "Selected mode: Amnezia List+DNS." ;;
-    esac
-    if [ -z "$ALLOWED_IPS" ]; then die "Failed to determine AllowedIPs."; fi
-    export ALLOWED_IPS_MODE ALLOWED_IPS
-}
 
 # ==============================================================================
 # Вспомогательное
@@ -1372,20 +1108,6 @@ setup_improved_firewall() {
     ssh_ports=$(detect_ssh_ports)
     log "SSH port(s) for the UFW rule: ${ssh_ports}"
 
-    # Port change on reinstall: delete the old port's rule before adding the
-    # new one, otherwise the old UDP port stays open forever - the only other
-    # ufw delete lives in uninstall and reads the already rewritten config
-    # (Issue #175). SSH limit rules are deliberately left alone: auto-removing
-    # an SSH rule on a misdetected port would cut off access to the server.
-    if [[ -n "${PREV_AWG_PORT:-}" && "$PREV_AWG_PORT" =~ ^[0-9]+$ \
-          && "$PREV_AWG_PORT" != "$AWG_PORT" ]]; then
-        if ufw delete allow "${PREV_AWG_PORT}/udp" >/dev/null 2>&1; then
-            log "UFW: old port rule ${PREV_AWG_PORT}/udp deleted (port changed to ${AWG_PORT})."
-            PREV_AWG_PORT=""
-        else
-            log_warn "UFW: failed to delete the old port rule ${PREV_AWG_PORT}/udp (the rule may not exist). Will retry on the next installer run."
-        fi
-    fi
 
     local ufw_errors=0
     if ufw status 2>/dev/null | grep -q inactive; then
@@ -1395,12 +1117,6 @@ setup_improved_firewall() {
         for _sp in $ssh_ports; do
             ufw limit "${_sp}/tcp" comment "SSH Rate Limit" || { log_warn "UFW: failed to limit SSH (port ${_sp})"; ufw_errors=1; }
         done
-        ufw allow "${AWG_PORT}/udp" comment "AmneziaWG VPN" || { log_warn "UFW: failed to allow VPN port"; ufw_errors=1; }
-        if [[ -n "$main_nic" ]]; then
-            ufw route allow in on awg0 out on "$main_nic" comment "AmneziaWG Routing" \
-                || { log_warn "UFW: failed to add route rule"; ufw_errors=1; }
-            log "VPN routing rule added (awg0 → ${main_nic})."
-        fi
         if [[ "$ufw_errors" -ne 0 ]]; then
             log_error "One or more UFW rules failed to apply. Check settings manually."
             return 1
@@ -1437,11 +1153,6 @@ setup_improved_firewall() {
         for _sp in $ssh_ports; do
             ufw limit "${_sp}/tcp" comment "SSH Rate Limit" || { log_warn "UFW: failed to limit SSH (port ${_sp})"; ufw_errors=1; }
         done
-        ufw allow "${AWG_PORT}/udp" comment "AmneziaWG VPN" || { log_warn "UFW: failed to allow VPN port"; ufw_errors=1; }
-        if [[ -n "$main_nic" ]]; then
-            ufw route allow in on awg0 out on "$main_nic" comment "AmneziaWG Routing" \
-                || { log_warn "UFW: failed to add route rule"; ufw_errors=1; }
-        fi
         if [[ "$ufw_errors" -ne 0 ]]; then
             log_error "One or more UFW rules failed to apply. Check settings manually."
             return 1
@@ -1536,53 +1247,6 @@ JAILEOF
 # Service status check
 # ==============================================================================
 
-check_service_status() {
-    log "Checking service status..."
-    local ok=1
-
-    if systemctl is-failed --quiet awg-quick@awg0; then
-        log_error "Service FAILED!"
-        ok=0
-    fi
-
-    if ! ip addr show awg0 &>/dev/null; then
-        log_error "Interface awg0 not found!"
-        ok=0
-    fi
-
-    if ! awg show 2>/dev/null | grep -q "interface: awg0"; then
-        log_error "awg show cannot see interface!"
-        ok=0
-    fi
-
-    # Port check. Порт читается из самого awg0.conf — другого источника нет.
-    local port_check=${AWG_PORT:-0}
-    if [[ "$port_check" -eq 0 ]] && [[ -f "$SERVER_CONF_FILE" ]]; then
-        port_check=$(awk -F'=' '/^[[:space:]]*ListenPort[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' \
-                     "$SERVER_CONF_FILE" 2>/dev/null)
-        port_check=${port_check:-0}
-    fi
-    if [[ "$port_check" -ne 0 ]]; then
-        if ! ss -lunp | grep -q ":${port_check} "; then
-            log_error "Port $port_check/udp is not listening!"
-            ok=0
-        fi
-    fi
-
-    # Obfuscation parameter check
-    if awg show awg0 2>/dev/null | grep -q "jc:"; then
-        log "AWG obfuscation parameters active."
-    else
-        log_warn "AWG obfuscation parameters not detected in awg show."
-    fi
-
-    if [[ "$ok" -eq 1 ]]; then
-        log "Service and interface status OK."
-        return 0
-    else
-        return 1
-    fi
-}
 
 # ==============================================================================
 # Diagnostics
@@ -2644,6 +2308,16 @@ step4_setup_firewall() {
     else
         log "### STEP 4: Skipping UFW configuration (--no-tweaks) ###"
     fi
+
+    # Fail2Ban жил на шаге 7 вместе с запуском сервиса. Сервис теперь поднимает
+    # awg3.sh, а защита SSH к нему отношения не имеет — её место здесь, рядом
+    # с фаерволом.
+    if [[ "$NO_TWEAKS" -eq 0 ]]; then
+        setup_fail2ban
+    else
+        log "Skipping Fail2Ban (--no-tweaks)."
+    fi
+
     update_state 5
 }
 
@@ -2660,85 +2334,31 @@ step4_setup_firewall() {
 
 
 # ==============================================================================
-# STEP 7: Service startup
-# ==============================================================================
-
-step7_start_service() {
-    update_state 7
-    log "### STEP 7: Service startup and security configuration ###"
-
-    log "Enabling and starting awg-quick@awg0..."
-
-    # Isolation switched on->off: the new config's PostDown no longer has the
-    # DROP rule to remove, and the restart's down phase already runs against
-    # the new on-disk config. Remove stale rules explicitly, in a loop - a
-    # repeated interrupted run may have left more than one (issue #178,
-    # same deferred-cleanup pattern as PREV_AWG_PORT in #175).
-    if [[ "${CLIENT_ISOLATION:-1}" -eq 0 ]]; then
-        while iptables -D FORWARD -i awg0 -o awg0 -j DROP 2>/dev/null; do :; done
-        while ip6tables -D FORWARD -i awg0 -o awg0 -j DROP 2>/dev/null; do :; done
-    fi
-
-    if systemctl is-active --quiet awg-quick@awg0; then
-        log "Service already active — restarting to apply configuration..."
-        systemctl enable awg-quick@awg0 || log_warn "Failed to enable awg-quick@awg0 — check autostart manually"
-        systemctl restart awg-quick@awg0 || die "restart awg-quick@awg0 error."
-    else
-        systemctl enable --now awg-quick@awg0 || die "enable --now error."
-    fi
-    log "Service enabled and started."
-
-    log "Checking service status..."
-    local _attempt
-    for _attempt in 1 2 3 4 5; do
-        sleep 1
-        check_service_status 2>/dev/null && break
-        [[ $_attempt -lt 5 ]] && log_debug "Waiting for service startup... (attempt $_attempt/5)"
-    done
-    check_service_status || die "Service status check failed."
-
-    # Fail2Ban
-    if [[ "$NO_TWEAKS" -eq 0 ]]; then
-        setup_fail2ban
-    else
-        log "Skipping Fail2Ban (--no-tweaks)."
-    fi
-
-    log "Step 7 completed successfully."
-    update_state 99
-}
-
-# ==============================================================================
 # STEP 99: Completion
 # ==============================================================================
 
 step99_finish() {
     log "### УСТАНОВКА ЗАВЕРШЕНА ###"
     log "=============================================================================="
-    log "AmneziaWG 3.1 развёрнут."
+    log "AmneziaWG установлен. Сервера ещё нет — его создаёт awg3."
     log " "
-    log "КЛИЕНТЫ:"
-    log "  каждый живёт в своём каталоге ${AWG_DIR}/ИМЯ/ — conf, QR, ссылка vpn://"
-    log "  и пара ключей"
-    log "  добавить:  sudo awg3 add ИМЯ"
-    log "  забрать:   scp -r ПОЛЬЗОВАТЕЛЬ@<СЕРВЕР>:${AWG_DIR}/ИМЯ ./"
+    log "ДАЛЬШЕ:"
+    log "  sudo awg3 server-init                 создать интерфейс (спросит параметры)"
+    log "  sudo awg3 add ИМЯ                     выдать клиента"
     log " "
-    log "КОМАНДЫ:"
-    log "  sudo awg3 list                        клиенты и состояние сервера"
-    log "  sudo awg3 stats                       трафик по клиентам"
-    log "  systemctl status awg-quick@awg0       состояние сервиса"
-    log "  ufw status verbose                    состояние фаервола"
+    log "  Клиент живёт в своём каталоге ${AWG_DIR}/ИМЯ/ — conf, QR, ссылка vpn://"
+    log "  и пара ключей. Забрать целиком:"
+    log "    scp -r ПОЛЬЗОВАТЕЛЬ@<СЕРВЕР>:${AWG_DIR}/ИМЯ ./"
+    log " "
+    log "ЕЩЁ КОМАНДЫ:"
+    log "  sudo awg3 list                        клиенты и состояние интерфейса"
+    log "  sudo awg3 ifaces                      все интерфейсы сервера"
+    log "  sudo awg3 --help                      остальное"
     log " "
     log "ВАЖНО: нужен клиент Amnezia VPN 5.0.1.5 или новее — с поддержкой AWG 3.1."
     log " "
     cleanup_apt
     log " "
-
-    if [[ -f "$SERVER_CONF_FILE" ]]; then
-        log "Конфигурация сервера: $SERVER_CONF_FILE"
-    else
-        log_error "Конфигурация сервера ОТСУТСТВУЕТ: $SERVER_CONF_FILE"
-    fi
 
     log "Удаление файла состояния установки..."
     rm -f "$STATE_FILE" "${STATE_FILE}.lock" "$AWG_DIR/.boot_id_before_step2" \
@@ -2748,64 +2368,24 @@ step99_finish() {
 }
 
 # ==============================================================================
-# Сценарии развёртывания
+# Запуск
 # ==============================================================================
-
-MODE=""
-SRV_PORT=""
-SRV_SUBNET="10.9.9.1/24"
-SRV_MTU="1280"
-SRV_ISOLATION="off"
-SRV_IPV6="off"
-SRV_PROFILE="quic"
-SRV_INTENSITY="medium"
-SRV_ENDPOINT=""
-CLIENTS=""
-BOOTSTRAP_ARGS=()
-# Пользователь, которого создаёт bootstrap.sh: после подготовки системы
-# каталог данных переезжает в его домашний каталог, а не остаётся у того, кто
-# запустил sudo.
-BOOTSTRAP_USER=""
 
 show_help() {
     cat <<EOF
-install-awg3.sh ${SCRIPT_VERSION} — развёртывание AmneziaWG 3.1
+install-awg3.sh ${SCRIPT_VERSION} — установка AmneziaWG 3.1
 (форк bivlked/amneziawg-installer ${UPSTREAM_VERSION})
+
+Ставит пакеты, собирает модуль ядра и кладёт awg3.sh в PATH. Сервер он НЕ
+настраивает: интерфейс создаёт 'awg3 server-init', и он же спрашивает порт,
+подсеть и остальное. Одна команда — одна задача.
 
 ИСПОЛЬЗОВАНИЕ
     sudo ./install-awg3.sh [опции]
 
-Без опций выводится меню сценариев.
-
-СЦЕНАРИИ
-    --mode full           подготовка системы + AmneziaWG 3.1
-    --mode awg-only       только AmneziaWG 3.1, система уже подготовлена
-    --mode reinstall      пересоздать сервер, сохранив пиров
-    --mode uninstall      снести AmneziaWG (то же, что --uninstall)
-
-ПАРАМЕТРЫ СЕРВЕРА
-    --awg-port N          UDP-порт                    (по умолч.: случайный)
-    --subnet CIDR         подсеть туннеля             (по умолч.: ${SRV_SUBNET})
-    --mtu N               MTU                         (по умолч.: ${SRV_MTU})
-    --isolation on|off    изоляция клиентов           (по умолч.: ${SRV_ISOLATION})
-    --ipv6 on|off         IPv6 в туннеле              (по умолч.: ${SRV_IPV6})
-    --profile NAME        мимикрия: quic|tls|dtls|sip|dns|noise (по умолч.: ${SRV_PROFILE})
-    --intensity LVL       low|medium|high             (по умолч.: ${SRV_INTENSITY})
-    --endpoint HOST       имя хоста для клиентских Endpoint: DNS-имя или IP
-                          (синоним: --host-name; по умолч.: внешний IP)
-    --clients a,b,c       создать клиентов сразу      (по умолч.: ни одного)
-    --awg-dir PATH        каталог данных   (по умолч.: ~/awg целевого пользователя)
-
-ПОДГОТОВКА СИСТЕМЫ (только --mode full, прокидывается в bootstrap.sh)
-    --user NAME           имя нового sudo-пользователя
-    --password-file FILE  файл с паролем первой строкой
-    --ssh-port N          новый порт SSH
-    --disable-root-ssh yes|no
-                          отключить вход root по SSH
-
-ПРОЧЕЕ
+ОПЦИИ
+    --awg-dir PATH        каталог данных   (по умолч.: ~/awg текущего пользователя)
     -y, --yes             не задавать вопросов
-        --force           переустановка поверх работающей установки
         --no-tweaks       не трогать sysctl, swap и fail2ban
         --uninstall       удалить AmneziaWG
         --diagnostic      собрать диагностический отчёт
@@ -2813,74 +2393,22 @@ install-awg3.sh ${SCRIPT_VERSION} — развёртывание AmneziaWG 3.1
         --no-color        без цвета
     -h, --help            эта справка
 
+ПОРЯДОК РАЗВЁРТЫВАНИЯ
+    sudo ./bootstrap.sh --user vpnadmin --ssh-port 2222   подготовка системы
+    sudo ./install-awg3.sh                                этот скрипт
+    sudo awg3 server-init                                 создать интерфейс
+    sudo awg3 add ИМЯ                                     выдать клиента
+
 ПРИМЕЧАНИЯ
-    Источник истины о состоянии сервера — только awg0.conf. Отдельного файла
-    настроек нет: порт, подсеть, MTU, изоляция и IPv6 читаются из конфига.
+    Установка может потребовать перезагрузки — если обновилось ядро или модуль
+    не загрузился сразу. После неё запустите эту же команду ещё раз, она
+    продолжит с нужного места.
 
-    Профиль мимикрии и интенсивность — свойства ОТПРАВЛЯЮЩЕЙ стороны. Здесь
-    они задают параметры самого сервера и умолчание для создаваемых клиентов;
-    каждый следующий 'awg3 add -p tls' переопределяет их свободно.
-
-    Пароль нельзя передать аргументом: аргументы видны в ps.
+    Фаервол здесь настраивается только в общей части: политики и лимит на SSH.
+    Порт интерфейса открывает 'awg3 server-init' — он один знает, какой порт у
+    какого интерфейса, а интерфейсов может быть несколько.
 EOF
     exit "${HELP_EXIT_RC:-0}"
-}
-
-# Режима upgrade больше нет: он переводил 2.0-сервер на 3.0, а 2.0 из проекта
-# ушёл целиком. Пересоздание сервера с новыми параметрами — это reinstall.
-validate_mode() {
-    case "${1:-}" in
-        full|awg-only|reinstall|uninstall) return 0 ;;
-        # Режим был, и в чужих заметках он ещё встречается: подсказываем, чем
-        # он заменён, вместо глухого «неизвестный режим».
-        upgrade)
-            log_error "режима 'upgrade' больше нет: AmneziaWG 2.0 из проекта убран."
-            log_error "Сменить общие параметры сервера: sudo awg3 server-rekey"
-            log_error "Пересоздать сервер, сохранив пиров: $0 --mode reinstall"
-            return 1 ;;
-        *) log_error "неизвестный режим: '${1:-}'"; return 1 ;;
-    esac
-}
-
-mode_from_choice() {
-    case "${1:-}" in
-        1) printf 'full' ;;
-        2) printf 'awg-only' ;;
-        3) printf 'reinstall' ;;
-        4) printf 'uninstall' ;;
-        *) return 1 ;;
-    esac
-}
-
-show_menu() {
-    cat <<'EOF'
-
-Что делаем?
-
-  1) Полное развёртывание с нуля     подготовка системы + AmneziaWG
-  2) Только AmneziaWG                система уже подготовлена
-  3) Переустановить поверх           пиры сохраняются, параметры новые
-  4) Удалить                         снести AmneziaWG
-
-EOF
-    local choice
-    read -rp "Пункт [1-4]: " choice < /dev/tty
-    MODE=$(mode_from_choice "$choice") || die "недопустимый пункт: $choice"
-}
-
-# Аргументы для awg3.sh server-init. Печатаются одной строкой и разбираются
-# вызывающей стороной через словоделение — значения без пробелов по построению.
-build_server_init_args() {
-    local args="--awg-port ${SRV_PORT} --subnet ${SRV_SUBNET} --mtu ${SRV_MTU}"
-    args="${args} --isolation ${SRV_ISOLATION} --ipv6 ${SRV_IPV6}"
-    args="${args} -p ${SRV_PROFILE} -i ${SRV_INTENSITY}"
-    if [[ -n "${SRV_ENDPOINT:-}" ]]; then
-        args="${args} --endpoint ${SRV_ENDPOINT}"
-    fi
-    if [[ "${MODE:-}" == "reinstall" ]]; then
-        args="${args} --force"
-    fi
-    printf '%s' "$args"
 }
 
 script_dir() {
@@ -2903,165 +2431,16 @@ install_awg3_script() {
     log "awg3.sh установлен: $AWG_DIR/awg3.sh (симлинк /usr/local/sbin/awg3)"
 }
 
-run_server_init() {
-    local args
-    args=$(build_server_init_args)
-    log "Создание сервера AWG 3.1: $args"
-    # Сервис поднимет step7_start_service — там же и проверки состояния,
-    # поэтому server-init работает с --no-apply.
-    # shellcheck disable=SC2086
-    AWG3_DIR="$AWG_DIR" "$AWG_DIR/awg3.sh" server-init $args --no-apply -y \
-        || die "server-init не отработал"
-}
-
-create_initial_clients() {
-    [[ -n "$CLIENTS" ]] || return 0
-    local name
-    for name in ${CLIENTS//,/ }; do
-        log "Создание клиента '$name'..."
-        AWG3_DIR="$AWG_DIR" "$AWG_DIR/awg3.sh" add "$name" \
-            -p "$SRV_PROFILE" -i "$SRV_INTENSITY" -y \
-            || log_warn "клиент '$name' не создан"
-    done
-}
-
-# Опрос параметров сервера. С --yes ничего не спрашивается — берутся значения
-# флагов и умолчаний.
-ask_params() {
-    [[ "$AUTO_YES" -eq 0 ]] || return 0
-    [[ -t 0 ]] || return 0
-
-    local answer
-
-    if [[ -z "$SRV_PORT" ]]; then
-        read -rp "UDP-порт AmneziaWG [Enter — случайный]: " answer < /dev/tty
-        [[ -z "$answer" ]] || SRV_PORT="$answer"
-    fi
-
-    read -rp "Подсеть туннеля [${SRV_SUBNET}]: " answer < /dev/tty
-    [[ -z "$answer" ]] || SRV_SUBNET="$answer"
-
-    read -rp "MTU [${SRV_MTU}]: " answer < /dev/tty
-    [[ -z "$answer" ]] || SRV_MTU="$answer"
-
-    read -rp "Изолировать клиентов друг от друга? [y/N]: " answer < /dev/tty
-    case "$answer" in [yY]*) SRV_ISOLATION="on" ;; *) SRV_ISOLATION="off" ;; esac
-
-    read -rp "Включить IPv6 в туннеле? [y/N]: " answer < /dev/tty
-    case "$answer" in [yY]*) SRV_IPV6="on" ;; *) SRV_IPV6="off" ;; esac
-
-    read -rp "Профиль мимикрии quic|tls|dtls|sip|dns|noise [${SRV_PROFILE}]: " answer < /dev/tty
-    [[ -z "$answer" ]] || SRV_PROFILE="$answer"
-
-    read -rp "Интенсивность low|medium|high [${SRV_INTENSITY}]: " answer < /dev/tty
-    [[ -z "$answer" ]] || SRV_INTENSITY="$answer"
-
-    if [[ -z "$SRV_ENDPOINT" ]]; then
-        printf '\n'
-        echo "  Имя хоста для клиентов — адрес, который попадёт в Endpoint выданных"
-        echo "  конфигов. Укажите DNS-имя (vpn.example.com), если оно есть: тогда при"
-        echo "  смене IP сервера старые конфиги продолжат работать."
-        read -rp "Имя хоста [Enter — определить внешний IP автоматически]: " answer < /dev/tty
-        [[ -z "$answer" ]] || SRV_ENDPOINT="$answer"
-    fi
-
-    read -rp "Клиенты через запятую [Enter — ни одного]: " answer < /dev/tty
-    [[ -z "$answer" ]] || CLIENTS="$answer"
-}
-
-# Порт должен быть известен ДО настройки фаервола: step4_setup_firewall
-# открывает ${AWG_PORT}/udp, а server-init выполняется позже. Поэтому пустой
-# --awg-port разрешается здесь, а в server-init уходит уже конкретным числом —
-# иначе установщик и конфиг выбрали бы разные порты.
-resolve_awg_port() {
-    if [[ -n "$SRV_PORT" ]]; then
-        AWG_PORT="$SRV_PORT"
-        return 0
-    fi
-    local candidate attempt
-    for attempt in $(seq 1 20); do
-        candidate=$(( (RANDOM % 63977) + 1024 ))
-        if ! ss -Hulnp 2>/dev/null | awk '{print $5}' | grep -qE "[:.]${candidate}\$"; then
-            SRV_PORT="$candidate"
-            AWG_PORT="$candidate"
-            log "выбран случайный UDP-порт: $SRV_PORT"
-            return 0
-        fi
-    done
-    die "не удалось подобрать свободный UDP-порт — задайте его явно: --awg-port N"
-}
-
-validate_params() {
-    case "$SRV_PROFILE" in
-        quic|tls|dtls|sip|dns|noise) ;;
-        *) die "неизвестный профиль: $SRV_PROFILE" ;;
-    esac
-    case "$SRV_INTENSITY" in
-        low|medium|high) ;;
-        *) die "неизвестная интенсивность: $SRV_INTENSITY" ;;
-    esac
-    case "$SRV_ISOLATION" in on|off) ;; *) die "--isolation ожидает on|off" ;; esac
-    case "$SRV_IPV6"      in on|off) ;; *) die "--ipv6 ожидает on|off" ;; esac
-}
-
-# Согласование IPv6 между установщиком и сервером.
+# Установка AmneziaWG: пакеты, модуль ядра, общая часть фаервола.
 #
-# Шаг 1 по умолчанию глушит IPv6 в sysctl — на этот момент ответа про туннель
-# ещё нет. Если сервер потом просят поднять с IPv6, awg-quick не сможет
-# назначить интерфейсу IPv6-адрес, сервис останется в failed и сервера просто
-# не будет. Поэтому здесь sysctl переписывается заново, уже с известным
-# ответом: configure_ipv6_tunnel снимает отключение в работающем ядре, а
-# apply_sysctl_profile — в файле, чтобы оно не вернулось после перезагрузки.
-sync_ipv6_settings() {
-    if [[ "$SRV_IPV6" == "on" ]]; then
-        CLI_ALLOW_IPV6_TUNNEL=1
-        CLI_DISABLE_IPV6=0
-        log "IPv6 в туннеле запрошен — глобальное отключение IPv6 снимается"
-    else
-        CLI_DISABLE_IPV6=1
-    fi
-    configure_ipv6
-    configure_ipv6_tunnel
-    apply_sysctl_profile
-}
-
-# Установка AmneziaWG: пакеты, модуль ядра, фаервол.
-#
-# Параметры сервера спрашиваются ЗДЕСЬ, а не до вызова, и именно после шага 3.
-# Причина в перезагрузках: шаг 1 уходит в ребут при обновлении ядра, шаг 2 —
-# если модуль не загрузился сразу, а после ребута человек запускает ту же
-# команду заново. Стоя перед шагом 1, вопросы задавались бы в каждом запуске —
-# по два раза за установку. За шагом 3 их некому повторить.
-#
-# Заодно так честнее: пока модуль не собран и не проверен, отвечать не о чем —
-# сервера всё равно не будет. Порт нужен уже шагу 4 (его открывает фаервол),
-# остальное — только deploy_server.
+# Вопросов о VPN здесь нет ни одного — ни до перезагрузок, ни после. Их задаёт
+# 'awg3 server-init', то есть тот, кто эти ответы применяет.
 install_amneziawg_stack() {
     step1_update_and_optimize
     step2_install_amnezia
     step3_check_module
-
-    ask_params
-    validate_params
-    resolve_awg_port
-    sync_ipv6_settings
-
     step4_setup_firewall
 }
-
-# Создание сервера и запуск сервиса.
-deploy_server() {
-    install_awg3_script
-    run_server_init
-    step7_start_service
-    create_initial_clients
-    secure_files
-    step99_finish
-}
-
-# ==============================================================================
-# Разбор аргументов и запуск
-# ==============================================================================
 
 # Исходные аргументы запоминаются, чтобы предложить их дословно при
 # перезагрузке: от них зависит, в чей домашний каталог лягут конфиги.
@@ -3071,27 +2450,9 @@ parse_args() {
     ORIGINAL_ARGS="$*"
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --mode)              MODE="${2:-}"; shift 2 ;;
-            --awg-port)          SRV_PORT="${2:-}"; shift 2 ;;
-            --subnet)            SRV_SUBNET="${2:-}"; shift 2 ;;
-            --mtu)               SRV_MTU="${2:-}"; shift 2 ;;
-            --isolation)         SRV_ISOLATION="${2:-}"; shift 2 ;;
-            --ipv6)              SRV_IPV6="${2:-}"; shift 2 ;;
-            --profile)           SRV_PROFILE="${2:-}"; shift 2 ;;
-            --intensity)         SRV_INTENSITY="${2:-}"; shift 2 ;;
-            --clients)           CLIENTS="${2:-}"; shift 2 ;;
-            --endpoint|--host-name)
-                                 SRV_ENDPOINT="${2:-}"; shift 2 ;;
             --awg-dir)           AWG3_DIR="${2:-}"; shift 2 ;;
-            # Прокидываются в bootstrap.sh как есть
-            --user)              BOOTSTRAP_USER="${2:-}"
-                                 BOOTSTRAP_ARGS+=(--user "${2:-}"); shift 2 ;;
-            --password-file)     BOOTSTRAP_ARGS+=(--password-file "${2:-}"); shift 2 ;;
-            --ssh-port)          BOOTSTRAP_ARGS+=(--ssh-port "${2:-}"); shift 2 ;;
-            --disable-root-ssh)  BOOTSTRAP_ARGS+=(--disable-root-ssh "${2:-}"); shift 2 ;;
             --ssh-port-fw)       CLI_SSH_PORT="${2:-}"; shift 2 ;;
             -y|--yes)            AUTO_YES=1; shift ;;
-            --force)             FORCE_REINSTALL=1; shift ;;
             --no-tweaks)         NO_TWEAKS=1; CLI_NO_TWEAKS=1; shift ;;
             --uninstall)         UNINSTALL=1; shift ;;
             --diagnostic)        DIAGNOSTIC=1; shift ;;
@@ -3116,82 +2477,22 @@ main() {
     LOG_FILE="$AWG_DIR/install-awg3.log"
 
     if [[ "$DIAGNOSTIC" -eq 1 ]]; then create_diagnostic_report; exit 0; fi
-    if [[ "$UNINSTALL" -eq 1 ]]; then MODE="uninstall"; fi
 
     [[ "$(id -u)" -eq 0 ]] || die "нужны права root: sudo $0"
 
     prepare_awg_dir
 
-    [[ -n "$MODE" ]] || show_menu
-    validate_mode "$MODE" || exit 1
+    if [[ "$UNINSTALL" -eq 1 ]]; then step_uninstall; exit 0; fi
 
     check_container
     check_os_version
     check_kernel_version
     check_free_space
 
-    if [[ "${AWG_FORCE_REINSTALL:-0}" == "1" ]]; then FORCE_REINSTALL=1; fi
-
-    case "$MODE" in
-        full)
-            local bs
-            bs="$(script_dir)/bootstrap.sh"
-            [[ -x "$bs" ]] || die "рядом со скриптом нет исполняемого bootstrap.sh"
-            # --yes обязан дойти до bootstrap: без него подтверждение нового
-            # доступа требует tty, которого при неинтерактивном запуске нет,
-            # и вход root молча остаётся включённым вопреки
-            # --disable-root-ssh yes.
-            if [[ "$AUTO_YES" -eq 1 ]]; then
-                BOOTSTRAP_ARGS+=(--yes)
-            fi
-            "$bs" "${BOOTSTRAP_ARGS[@]+"${BOOTSTRAP_ARGS[@]}"}" \
-                || die "bootstrap.sh не отработал"
-            # Каталог данных переезжает к созданному пользователю: клиенты
-            # нужны именно ему, а не тому, кто запустил sudo.
-            AWG_DIR="$(resolve_awg_dir "${BOOTSTRAP_USER:-user}")"
-            LOG_FILE="$AWG_DIR/install-awg3.log"
-            STATE_FILE="$AWG_DIR/setup_state"
-            prepare_awg_dir
-            install_amneziawg_stack
-            deploy_server
-            ;;
-        awg-only)
-            # Повторный запуск — обычное дело: человек мог прервать установку
-            # или просто перезапустить её. Пересоздавать сервер молча нельзя
-            # (перегенерация общих параметров обесценит все выданные конфиги),
-            # но и падать с аварийным сообщением незачем: нужное состояние уже
-            # достигнуто.
-            if [[ -f "$SERVER_CONF_FILE" ]] && [[ "$FORCE_REINSTALL" -ne 1 ]]; then
-                log "AmneziaWG уже развёрнут: $SERVER_CONF_FILE"
-                log " "
-                log "  добавить клиента:      sudo awg3 add ИМЯ"
-                log "  посмотреть состояние:  sudo awg3 list"
-                log " "
-                log "Пересоздать сервер с новыми параметрами обфускации можно так:"
-                log "  sudo $0 --mode reinstall"
-                log_warn "ВНИМАНИЕ: после пересоздания все выданные конфиги перестанут подключаться."
-                exit 0
-            fi
-            install_amneziawg_stack
-            deploy_server
-            ;;
-        reinstall)
-            [[ -f "$SERVER_CONF_FILE" ]] \
-                || die "переустанавливать нечего: $SERVER_CONF_FILE не найден"
-            log_warn "Общие параметры будут перегенерированы — ВСЕ выданные клиентские"
-            log_warn "конфиги перестанут подключаться, их придётся создать заново."
-            if [[ "$AUTO_YES" -eq 0 ]]; then
-                local ans
-                read -rp "Продолжить? [y/N]: " ans < /dev/tty
-                [[ "$ans" =~ ^[Yy] ]] || die "отменено"
-            fi
-            install_amneziawg_stack
-            deploy_server
-            ;;
-        uninstall)
-            step_uninstall
-            ;;
-    esac
+    install_amneziawg_stack
+    install_awg3_script
+    secure_files
+    step99_finish
 }
 
 if [[ "${INSTALL_LIB_ONLY:-0}" -ne 1 && "${BASH_SOURCE[0]}" == "${0}" ]]; then

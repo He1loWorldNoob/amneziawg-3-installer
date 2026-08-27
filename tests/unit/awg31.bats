@@ -220,3 +220,81 @@ need_awg() { command -v awg >/dev/null 2>&1 || skip "awg не установле
     [ "$status" -eq 0 ]
     [ "$(grep -c '^RandomTrailers' "$AWG3_SERVER_CONF")" -eq 1 ]
 }
+
+# ── Настройка системы со стороны server-init ────────────────────────────────
+#
+# Установщик ставит пакеты и модуль, а порт в фаерволе и IPv6 в sysctl —
+# свойства конкретного интерфейса. Их знает только тот, кто интерфейс создаёт,
+# и интерфейсов может быть несколько.
+
+@test "форвардинг для IPv6-туннеля снимает глобальное отключение IPv6" {
+    # Установщик глушит IPv6: на момент установки неизвестно, понадобится ли
+    # он в туннеле. Без этих строк awg-quick не сможет назначить интерфейсу
+    # IPv6-адрес, и сервис останется в failed.
+    enable_forwarding on "$TEST_TMP/fwd.conf"
+    grep -qx "net.ipv4.ip_forward = 1" "$TEST_TMP/fwd.conf"
+    grep -qx "net.ipv6.conf.all.forwarding = 1" "$TEST_TMP/fwd.conf"
+    grep -qx "net.ipv6.conf.all.disable_ipv6 = 0" "$TEST_TMP/fwd.conf"
+    grep -qx "net.ipv6.conf.default.disable_ipv6 = 0" "$TEST_TMP/fwd.conf"
+    grep -qx "net.ipv6.conf.lo.disable_ipv6 = 0" "$TEST_TMP/fwd.conf"
+}
+
+@test "без IPv6 в туннеле отключение установщика остаётся в силе" {
+    enable_forwarding off "$TEST_TMP/fwd.conf"
+    grep -qx "net.ipv4.ip_forward = 1" "$TEST_TMP/fwd.conf"
+    ! grep -q "ipv6" "$TEST_TMP/fwd.conf"
+}
+
+@test "файл sysctl от server-init применяется после установщикова" {
+    # Оба лежат в /etc/sysctl.d и применяются по алфавиту. Если порядок
+    # перевернётся, отключение IPv6 от установщика победит — и туннель с IPv6
+    # молча останется без адреса.
+    [[ "99-awg3.conf" > "99-amneziawg-forwarding.conf" ]]
+}
+
+@test "server-init открывает порт в фаерволе сам" {
+    local body
+    body=$(sed -n '/^cmd_server_init() {/,/^}/p' "$REPO_ROOT/awg3.sh")
+    [[ "$body" == *open_firewall_port* ]]
+}
+
+@test "без ufw открывать нечего и это не ошибка" {
+    # Фаервол могли отключить намеренно; включать его за человека мы не станем.
+    command -v ufw >/dev/null 2>&1 && skip "на этой машине ufw есть"
+    run open_firewall_port 51830 "" eth0
+    [ "$status" -eq 0 ]
+}
+
+@test "server-init спрашивает параметры сам" {
+    local body
+    body=$(sed -n '/^cmd_server_init() {/,/^}/p' "$REPO_ROOT/awg3.sh")
+    [[ "$body" == *ask_server_params* ]]
+}
+
+@test "при -y вопросов нет" {
+    ASSUME_YES=1
+    run ask_server_params
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "введённый профиль проверяется, а не уходит в конфиг как есть" {
+    # Вопросы задаются после разбора флагов, поэтому валидация из main уже
+    # прошла: без повторной проверки опечатка дошла бы до генератора.
+    local body
+    body=$(sed -n '/^cmd_server_init() {/,/^}/p' "$REPO_ROOT/awg3.sh")
+    [[ "$body" == *validate_profile_intensity* ]]
+}
+
+# ── Вывод ifaces ────────────────────────────────────────────────────────────
+
+@test "строка ifaces не разъезжается на неактивном интерфейсе" {
+    # systemctl is-active печатает inactive И возвращает ненулевой код, grep -c
+    # печатает 0 и тоже возвращает 1. Ветка `|| printf ...` в обоих случаях
+    # дописывала второе значение через перевод строки — панель, которая читает
+    # эти колонки по табуляции, получала мусор.
+    local body
+    body=$(sed -n '/^cmd_ifaces() {/,/^}/p' "$REPO_ROOT/awg3.sh")
+    [[ "$body" != *"|| printf 'unknown'"* ]]
+    [[ "$body" != *"|| printf '0'"* ]]
+}

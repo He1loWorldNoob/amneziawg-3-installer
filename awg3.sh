@@ -966,6 +966,19 @@ _backup_file() {
     log_ok "бэкап: $bak"
 }
 
+# Проверяется дважды: в main — то, что пришло флагами, и в server-init — то,
+# что человек мог ввести в ответ на вопросы.
+validate_profile_intensity() {
+    case "$PROFILE" in
+        quic|tls|dtls|sip|dns|noise) ;;
+        *) die "неизвестный профиль: ${PROFILE}  (quic, tls, dtls, sip, dns, noise)" ;;
+    esac
+    case "$INTENSITY" in
+        low|medium|high) ;;
+        *) die "неизвестная интенсивность: ${INTENSITY}  (low, medium, high)" ;;
+    esac
+}
+
 confirm() {
     if [[ "$ASSUME_YES" -eq 1 ]]; then return 0; fi
     [[ -t 0 ]] || die "нужно подтверждение, а ввод не интерактивен — добавьте -y"
@@ -1486,6 +1499,17 @@ enable_forwarding() {
         printf 'net.ipv4.ip_forward = 1\n'
         if [[ "$ipv6" == "on" ]]; then
             printf 'net.ipv6.conf.all.forwarding = 1\n'
+            # Установщик по умолчанию глушит IPv6 целиком: на момент установки
+            # ещё неизвестно, понадобится ли он в туннеле. Снимаем отключение
+            # здесь, где ответ уже есть, — иначе awg-quick не сможет назначить
+            # интерфейсу IPv6-адрес и сервис останется в failed.
+            #
+            # Файлы sysctl.d применяются по алфавиту, и 99-awg3.conf идёт
+            # после 99-amneziawg-forwarding.conf установщика — то есть
+            # последнее слово остаётся за нами.
+            printf 'net.ipv6.conf.all.disable_ipv6 = 0\n'
+            printf 'net.ipv6.conf.default.disable_ipv6 = 0\n'
+            printf 'net.ipv6.conf.lo.disable_ipv6 = 0\n'
         fi
     } > "$file" || { log_err "не записан $file"; return 1; }
     chmod 644 "$file"
@@ -1497,6 +1521,104 @@ enable_forwarding() {
     return 0
 }
 
+# ask_server_params — интерактивные вопросы перед созданием интерфейса.
+#
+# Живут здесь, а не в установщике: установщик ставит AmneziaWG, настройка
+# интерфейса — задача awg3.sh, и параметры спрашивает тот, кто их применяет.
+# Значения, заданные флагами, показываются подсказкой по умолчанию — Enter
+# оставляет их как есть.
+#
+# Молчит при -y и при неинтерактивном вводе: скриптам вопросы задавать некому.
+ask_server_params() {
+    [[ "$ASSUME_YES" -eq 0 ]] || return 0
+    [[ -t 0 ]] || return 0
+
+    local answer
+
+    printf '
+'
+    log "Параметры интерфейса ${AWG_IFACE}. Enter оставляет значение в скобках."
+    printf '
+'
+
+    if [[ -z "$SRV_PORT" ]]; then
+        read -rp "  UDP-порт [Enter — случайный]: " answer < /dev/tty
+        [[ -z "$answer" ]] || SRV_PORT="$answer"
+    else
+        read -rp "  UDP-порт [${SRV_PORT}]: " answer < /dev/tty
+        [[ -z "$answer" ]] || SRV_PORT="$answer"
+    fi
+
+    read -rp "  Подсеть туннеля [${SRV_SUBNET}]: " answer < /dev/tty
+    [[ -z "$answer" ]] || SRV_SUBNET="$answer"
+
+    read -rp "  MTU [${SRV_MTU}]: " answer < /dev/tty
+    [[ -z "$answer" ]] || SRV_MTU="$answer"
+
+    read -rp "  Изолировать клиентов друг от друга? [y/N]: " answer < /dev/tty
+    case "$answer" in [yY]*) SRV_ISOLATION="on" ;; *) SRV_ISOLATION="off" ;; esac
+
+    read -rp "  Включить IPv6 в туннеле? [y/N]: " answer < /dev/tty
+    case "$answer" in [yY]*) SRV_IPV6="on" ;; *) SRV_IPV6="off" ;; esac
+
+    read -rp "  Профиль мимикрии quic|tls|dtls|sip|dns|noise [${PROFILE}]: " answer < /dev/tty
+    [[ -z "$answer" ]] || PROFILE="$answer"
+
+    read -rp "  Интенсивность low|medium|high [${INTENSITY}]: " answer < /dev/tty
+    [[ -z "$answer" ]] || INTENSITY="$answer"
+
+    if [[ -z "${ENDPOINT_OVERRIDE:-}" ]]; then
+        printf '
+'
+        log "  Имя хоста попадёт в Endpoint выданных конфигов. DNS-имя лучше IP:"
+        log "  при смене адреса сервера старые конфиги продолжат работать."
+        read -rp "  Имя хоста [Enter — определить внешний IP]: " answer < /dev/tty
+        [[ -z "$answer" ]] || ENDPOINT_OVERRIDE="$answer"
+    fi
+    printf '
+'
+}
+
+# open_firewall_port — открыть порт интерфейса в ufw.
+#
+# Раньше это делал установщик, потому что знал порт. Теперь порт знает только
+# тот, кто создаёт интерфейс, — и это единственное место, где второй, третий и
+# любой следующий интерфейс получают свой порт открытым сам собой.
+#
+# Неактивный или отсутствующий ufw — не ошибка: фаервол мог быть отключён
+# намеренно, и включать его за человека мы не станем.
+open_firewall_port() {
+    local port="$1" old="${2:-}" nic="${3:-}"
+    command -v ufw >/dev/null 2>&1 || return 0
+    ufw status 2>/dev/null | grep -q "Status: active" || {
+        log "ufw неактивен — порт ${port}/udp открывать не нужно"
+        return 0
+    }
+
+    # Прежнее правило удаляется только при смене порта: иначе пересоздание
+    # интерфейса на том же порту на мгновение закрывало бы его самому себе.
+    if [[ -n "$old" && "$old" != "$port" ]]; then
+        if ufw delete allow "${old}/udp" >/dev/null 2>&1; then
+            log "ufw: убрано прежнее правило ${old}/udp"
+        fi
+    fi
+
+    if ufw allow "${port}/udp" comment "AmneziaWG ${AWG_IFACE}" >/dev/null 2>&1; then
+        log_ok "ufw: открыт ${port}/udp"
+    else
+        log_warn "не удалось открыть ${port}/udp в ufw — откройте вручную"
+    fi
+
+    # Маршрут наружу. PostUp вставляет свой ACCEPT первым правилом FORWARD, так
+    # что трафик пойдёт и без этого, но с DEFAULT_FORWARD_POLICY=DROP правило
+    # ufw описывает то же намерение в его собственных терминах — и переживает
+    # `ufw reload`, который цепочки iptables пересобирает.
+    if [[ -n "$nic" ]]; then
+        ufw route allow in on "$AWG_IFACE" out on "$nic"             comment "AmneziaWG ${AWG_IFACE}" >/dev/null 2>&1             || log_warn "ufw: не добавлен маршрут ${AWG_IFACE} -> ${nic}"
+    fi
+    ufw reload >/dev/null 2>&1 || true
+}
+
 cmd_server_init() {
     guard_existing_server || exit 1
 
@@ -1506,11 +1628,21 @@ cmd_server_init() {
     # устройство, сервис уходит в failed. Такую мину лучше не закладывать.
     require_awg31 "параметры 3.1" || exit 1
 
+    ask_server_params
+    validate_profile_intensity
+
     [[ -n "$SRV_PORT" ]] || { rand_int 1024 65000; SRV_PORT=$REPLY; }
     validate_awg_port "$SRV_PORT" || exit 1
     validate_subnet   "$SRV_SUBNET" || exit 1
     validate_mtu      "$SRV_MTU"    || exit 1
+    case "$SRV_ISOLATION" in on|off) ;; *) die "isolation ожидает on|off: $SRV_ISOLATION" ;; esac
+    case "$SRV_IPV6"      in on|off) ;; *) die "ipv6 ожидает on|off: $SRV_IPV6" ;; esac
     port_is_free "$SRV_PORT" || die "UDP-порт $SRV_PORT уже занят"
+
+    # Прежний порт нужен до перезаписи конфига: по нему снимается старое
+    # правило ufw, если порт сменился.
+    local old_port=""
+    [[ ! -f "$SERVER_CONF" ]] || old_port=$(_iface_value ListenPort)
 
     local nic
     nic=$(get_main_nic) \
@@ -1559,6 +1691,8 @@ cmd_server_init() {
 
     ROLLBACK_ACTIVE=0
     trap - EXIT
+
+    open_firewall_port "$SRV_PORT" "$old_port" "$nic"
 
     if [[ "$DO_APPLY" -eq 1 ]]; then
         systemctl enable --now "awg-quick@${AWG_IFACE}" 2>/dev/null \
@@ -2422,7 +2556,11 @@ cmd_ifaces() {
         # grep -c печатает 0 и при этом возвращает 1: ветка `|| printf 0`
         # дописывала бы второй ноль через перевод строки, и колонки разъезжались.
         clients=$(grep -c '^[[:space:]]*\[Peer\]' "$conf" 2>/dev/null) || clients=0
-        state=$(systemctl is-active "awg-quick@${name}" 2>/dev/null || printf 'unknown')
+        # Та же ловушка, что и с grep -c: `is-active` печатает inactive И
+        # возвращает ненулевой код, поэтому ветка `||` дописывала бы второе
+        # слово через перевод строки — строка таблицы разъезжалась на две.
+        state=$(systemctl is-active "awg-quick@${name}" 2>/dev/null) || true
+        [[ -n "$state" ]] || state="unknown"
 
         # Версия видна только по RandomTrailers: интерфейс без него создан до
         # 3.1, и клиента на нём выдать нельзя, пока не прошёл server-rekey.
@@ -2648,14 +2786,7 @@ main() {
     # --iface мог сменить интерфейс уже после первого вычисления путей.
     resolve_paths
 
-    case "$PROFILE" in
-        quic|tls|dtls|sip|dns|noise) ;;
-        *) die "неизвестный профиль: ${PROFILE}  (quic, tls, dtls, sip, dns, noise)" ;;
-    esac
-    case "$INTENSITY" in
-        low|medium|high) ;;
-        *) die "неизвестная интенсивность: ${INTENSITY}  (low, medium, high)" ;;
-    esac
+    validate_profile_intensity
     case "$SRV_ISOLATION" in
         on|off) ;;
         *) die "--isolation ожидает on|off: $SRV_ISOLATION" ;;
