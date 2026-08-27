@@ -51,6 +51,13 @@ $VpsPort      = $DefaultPort
 $VpsUser      = $DefaultUser
 $RemoteScript = ''
 $RemoteDir    = ''
+$HomeDir      = ''
+
+# Интерфейс, с которым работает панель. Их на сервере может быть несколько, и
+# они независимы: свой порт, своя подсеть, свои клиенты. awg0 — тот, что
+# создаёт установщик; остальные заводятся вручную через awg3.sh server-init
+# --iface. Пункт «Интерфейсы» переключает панель между ними.
+$Iface = 'awg0'
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
@@ -234,6 +241,17 @@ function Test-HostKeyChanged {
     return [bool]($Out | Select-String -SimpleMatch -Quiet 'REMOTE HOST IDENTIFICATION HAS CHANGED')
 }
 
+# Переключает панель на интерфейс сервера. Каталог клиентов вычисляется по тем
+# же правилам, что и в awg3.sh: awg0 живёт в ~/awg, остальные — в соседнем
+# каталоге по имени интерфейса (~/awg1). Разъехаться эти два знания не должны,
+# иначе панель скачивала бы файлы не того интерфейса, что показывает в списке.
+function Set-Iface {
+    param([string] $Name)
+    $script:Iface = $Name
+    $script:RemoteDir = if ($Name -eq 'awg0') { "$($script:HomeDir)/awg" }
+                        else { "$($script:HomeDir)/$Name" }
+}
+
 # Выполняет awg3.sh с аргументами. Возвращает строки вывода, код — в
 # $script:LastRc.
 function Invoke-Remote {
@@ -244,6 +262,12 @@ function Invoke-Remote {
     # почему-то не сработало, пусть будет честное «требуется пароль» вместо
     # молчаливого ожидания ввода, которого некому сделать.
     $remote = 'sudo -n ' + (Quote-Sh $RemoteScript)
+    # --iface добавляется ТОЛЬКО для неосновного интерфейса. На сервере со
+    # старым awg3.sh этого флага нет, и он принял бы его за имя команды; пока
+    # панель работает с awg0, она остаётся совместимой с такими серверами.
+    if ($script:Iface -and $script:Iface -ne 'awg0') {
+        $remote += ' ' + (Quote-Sh '--iface') + ' ' + (Quote-Sh $script:Iface)
+    }
     foreach ($arg in $CmdArgs) { $remote += ' ' + (Quote-Sh $arg) }
 
     $out = Invoke-Ssh $remote
@@ -761,6 +785,115 @@ function Action-Endpoint {
     }
 }
 
+# ── Интерфейсы ──────────────────────────────────────────────────────────────
+#
+# Разбор вывода `awg3.sh ifaces`: колонки разделены табуляцией именно ради
+# этого места. Возвращает массив массивов ячеек или пустой массив.
+function Get-Ifaces {
+    $out = Invoke-Remote -CmdArgs @('ifaces') -Quiet
+    if ($script:LastRc -ne 0) {
+        foreach ($line in $out) { Write-Host "  $line" }
+        Write-Err 'Список интерфейсов не получен.'
+        Write-Dim 'Похоже, на сервере awg3.sh без команды ifaces — обновите его.'
+        return @()
+    }
+
+    $rows = @()
+    foreach ($line in @($out)) {
+        $text = "$line"
+        if ($text -notmatch "`t") { continue }
+        $cells = $text -split "`t"
+        if ($cells[0] -eq 'ИНТЕРФЕЙС') { continue }
+        if ($cells.Count -lt 7) { continue }
+        $rows += , $cells
+    }
+    return $rows
+}
+
+function Action-Ifaces {
+    Write-Head 'Интерфейсы сервера'
+
+    $rows = @(Get-Ifaces)
+    if ($rows.Count -eq 0) { return }
+
+    Write-Host ''
+    Write-Host ('   {0,2}  {1,-8} {2,-6} {3,-18} {4,-6} {5,-8} {6}' -f `
+        '', 'ИМЯ', 'ПОРТ', 'ПОДСЕТЬ', 'ВЕРС', 'КЛИЕНТОВ', 'СЕРВИС') -ForegroundColor DarkCyan
+    for ($i = 0; $i -lt $rows.Count; $i++) {
+        $r = $rows[$i]
+        # RandomTrailers — единственное, что отличает 3.1 от 3.0 на проводе,
+        # поэтому версия показывается по нему, а не по версии пакета.
+        $ver = if ($r[3] -eq 'on') { '3.1' } else { '3.0' }
+        $line = ('   {0,2}  {1,-8} {2,-6} {3,-18} {4,-6} {5,-8} {6}' -f `
+            ($i + 1), $r[0], $r[1], $r[2], $ver, $r[5], $r[6])
+        if ($r[0] -eq $script:Iface) {
+            Write-Host "$line  <- текущий" -ForegroundColor Green
+        } else {
+            Write-Host $line
+        }
+    }
+
+    Write-Host ''
+    Write-Dim 'Интерфейсы независимы: свой порт, своя подсеть, свои клиенты.'
+    Write-Host ''
+    $choice = (Read-Host '  Номер интерфейса для работы (Enter — оставить текущий)').Trim()
+    if (-not $choice) { return }
+    if ($choice -notmatch '^\d+$') { Write-Warn 'Нет такого пункта.'; return }
+    $idx = [int]$choice
+    if ($idx -lt 1 -or $idx -gt $rows.Count) { Write-Warn 'Нет такого пункта.'; return }
+
+    Set-Iface $rows[$idx - 1][0]
+    Write-Ok "Панель работает с интерфейсом $script:Iface (клиенты в $script:RemoteDir)."
+}
+
+function Action-MigrateClient {
+    Write-Head 'Переезд клиента на другой интерфейс'
+    Write-Dim "Сейчас панель работает с интерфейсом $script:Iface."
+    Write-Dim 'Клиент заводится на целевом интерфейсе с ТЕМ ЖЕ ключом, а на текущем'
+    Write-Dim 'остаётся. Прежняя ссылка продолжает работать, пока человек не импортирует'
+    Write-Dim 'новую, — поэтому переезд не отключает его ни на секунду.'
+
+    $rows = @(Get-Ifaces)
+    if ($rows.Count -lt 2) {
+        Write-Host ''
+        Write-Warn 'Переезжать некуда: на сервере только один интерфейс.'
+        return
+    }
+
+    $name = Select-Client 'Кого переселяем'
+    if (-not $name) { Write-Dim 'Отменено.'; return }
+
+    $targets = @($rows | Where-Object { $_[0] -ne $script:Iface })
+    Write-Head "Куда переселяем '$name'"
+    for ($i = 0; $i -lt $targets.Count; $i++) {
+        $t = $targets[$i]
+        Write-Host ("   {0,2}  {1,-8} порт {2}, подсеть {3}" -f ($i + 1), $t[0], $t[1], $t[2])
+    }
+    Write-Host '    0  отмена' -ForegroundColor DarkGray
+    Write-Host ''
+    $choice = (Read-Host '  Номер').Trim()
+    if ($choice -notmatch '^\d+$') { Write-Dim 'Отменено.'; return }
+    $idx = [int]$choice
+    if ($idx -lt 1 -or $idx -gt $targets.Count) { Write-Dim 'Отменено.'; return }
+    $target = $targets[$idx - 1][0]
+
+    Write-Host ''
+    Invoke-Remote -CmdArgs @('migrate-client', $name, '--to', $target) | Out-Null
+    if ($script:LastRc -ne 0) { return }
+
+    $from = $script:Iface
+    Write-Host ''
+    Write-Ok "'$name' заведён на $target."
+    Write-Dim "На $from он остался — прежняя ссылка продолжает работать."
+    Write-Dim "Когда человек импортирует новую, вернитесь на $from (пункт I) и удалите там ключ."
+
+    if (Confirm-Action "Переключить панель на $target и скачать новый набор?") {
+        Set-Iface $target
+        Invoke-Fetch -Name $name -OutDir (Join-Path $ScriptDir $name) | Out-Null
+        Show-ClientLink -Name $name
+    }
+}
+
 function Action-ServerRekey {
     Write-Head 'Смена общих параметров сервера'
     Write-Warn 'ЭТО ОТКЛЮЧИТ ВСЕХ КЛИЕНТОВ РАЗОМ.'
@@ -771,7 +904,7 @@ function Action-ServerRekey {
     if ($word -cne 'СМЕНИТЬ') { Write-Dim 'Отменено.'; return }
 
     Write-Host ''
-    Invoke-Remote -CmdArgs @('server-upgrade', '-y') | Out-Null
+    Invoke-Remote -CmdArgs @('server-rekey', '-y') | Out-Null
     if ($script:LastRc -eq 0) {
         Write-Warn 'Теперь пересоздайте клиентов и раздайте им новые конфиги.'
     }
@@ -818,8 +951,9 @@ function Read-Connection {
     # Каталог данных лежит в домашнем каталоге пользователя — так его кладёт
     # install-awg3.sh. У root домашний каталог не в /home.
     $home_ = if ($script:VpsUser -eq 'root') { '/root' } else { "/home/$($script:VpsUser)" }
-    $script:RemoteDir    = "$home_/awg"
+    $script:HomeDir      = $home_
     $script:RemoteScript = "$home_/awg/awg3.sh"
+    Set-Iface 'awg0'
 }
 
 # Применяет профиль к переменным подключения. Конфиг ssh переписываем здесь же:
@@ -831,8 +965,9 @@ function Use-Profile {
     $script:VpsPort = [int]$Item.port
     $script:VpsUser = $Item.user
     $home_ = if ($Item.user -eq 'root') { '/root' } else { "/home/$($Item.user)" }
-    $script:RemoteDir    = "$home_/awg"
+    $script:HomeDir      = $home_
     $script:RemoteScript = "$home_/awg/awg3.sh"
+    Set-Iface 'awg0'
     Write-SshConfig
 }
 
@@ -958,7 +1093,11 @@ function Show-Banner {
     Write-Host '   ╔══════════════════════════════════════════════╗' -ForegroundColor Cyan
     Write-Host '   ║        AmneziaWG — панель управления         ║' -ForegroundColor Cyan
     Write-Host '   ╚══════════════════════════════════════════════╝' -ForegroundColor Cyan
-    if ($VpsHost) { Write-Host "        $VpsUser@$VpsHost`:$VpsPort" -ForegroundColor DarkGray }
+    if ($VpsHost) {
+        $where = "        $VpsUser@$VpsHost`:$VpsPort"
+        if ($script:Iface -and $script:Iface -ne 'awg0') { $where += "  [$($script:Iface)]" }
+        Write-Host $where -ForegroundColor DarkGray
+    }
 }
 
 function Show-Menu {
@@ -975,6 +1114,10 @@ function Show-Menu {
     Write-Host '    7  Перезапустить сервис'
     Write-Host '    8  Резервная копия'
     Write-Host '    9  Имя хоста для клиентов'
+    Write-Host ''
+    Write-Host '   ИНТЕРФЕЙСЫ' -ForegroundColor DarkCyan
+    Write-Host ("    I  Интерфейсы сервера (сейчас: {0})" -f $script:Iface)
+    Write-Host '    T  Переезд клиента на другой интерфейс'
     Write-Host ''
     Write-Host '   ПРОЧЕЕ' -ForegroundColor DarkCyan
     Write-Host '    G  Показать набор параметров обфускации'
@@ -1046,6 +1189,8 @@ try {
             '^7$'    { Action-Restart;     Pause-Panel }
             '^8$'    { Action-Backup;      Pause-Panel }
             '^9$'    { Action-Endpoint;    Pause-Panel }
+            '^[iI]$' { Action-Ifaces;      Pause-Panel }
+            '^[tT]$' { Action-MigrateClient; Pause-Panel }
             '^[gG]$' { Action-Gen;         Pause-Panel }
             '^[mM]$' { Action-Migrate;     Pause-Panel }
             '^[sS]$' { Action-ServerRekey; Pause-Panel }
