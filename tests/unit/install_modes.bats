@@ -212,17 +212,72 @@ run_isolated() {
     SRV_IPV6=on
     configure_ipv6() { :; }
     configure_ipv6_tunnel() { :; }
+    # Заглушка обязательна: настоящая функция пишет в /etc/sysctl.d.
+    apply_sysctl_profile() { SYSCTL_REAPPLIED=1; }
     sync_ipv6_settings
     [ "$CLI_ALLOW_IPV6_TUNNEL" -eq 1 ]
     [ "$CLI_DISABLE_IPV6" -eq 0 ]
+}
+
+@test "ответ про IPv6 переписывает sysctl, а не только рантайм" {
+    # Вопросы задаются после шага 1, а он уже записал файл с выключенным
+    # IPv6. Снять отключение только через sysctl -w мало: после следующей
+    # перезагрузки файл вернул бы его и туннель встал бы без адреса.
+    SRV_IPV6=on
+    SYSCTL_REAPPLIED=0
+    configure_ipv6() { :; }
+    configure_ipv6_tunnel() { :; }
+    apply_sysctl_profile() { SYSCTL_REAPPLIED=1; }
+    sync_ipv6_settings
+    [ "$SYSCTL_REAPPLIED" -eq 1 ]
 }
 
 @test "без IPv6 в туннеле глобальное отключение остаётся" {
     SRV_IPV6=off
     configure_ipv6() { :; }
     configure_ipv6_tunnel() { :; }
+    apply_sysctl_profile() { :; }
     sync_ipv6_settings
     [ "$CLI_DISABLE_IPV6" -eq 1 ]
+}
+
+# ── Порядок вопросов ────────────────────────────────────────────────────────
+
+# Номер строки внутри тела функции: по нему проверяется порядок вызовов.
+line_in_stack() {
+    sed -n '/^install_amneziawg_stack() {/,/^}/p' "$SCRIPT"         | grep -n "$1" | head -1 | cut -d: -f1
+}
+
+@test "параметры спрашиваются после проверки модуля, а не до перезагрузок" {
+    # Шаг 1 уходит в перезагрузку при обновлении ядра, шаг 2 — если модуль не
+    # загрузился сразу; после неё человек запускает ТУ ЖЕ команду заново.
+    # Вопросы перед ними задавались бы по два раза за установку.
+    local i_step3 i_ask i_port i_step4
+    i_step3=$(line_in_stack step3_check_module)
+    i_ask=$(line_in_stack ask_params)
+    i_port=$(line_in_stack resolve_awg_port)
+    i_step4=$(line_in_stack step4_setup_firewall)
+    [ -n "$i_step3" ] && [ -n "$i_ask" ] && [ -n "$i_port" ] && [ -n "$i_step4" ]
+    [ "$i_step3" -lt "$i_ask" ]
+    # Порт обязан быть известен ДО фаервола: шаг 4 открывает именно его.
+    [ "$i_port" -lt "$i_step4" ]
+    [ "$i_ask" -lt "$i_step4" ]
+}
+
+@test "в диспетчере режимов вопросов не осталось" {
+    # Иначе они снова оказались бы перед перезагрузками — по одному набору
+    # на каждый запуск команды.
+    ! grep -qE 'ask_params; validate_params' "$SCRIPT"
+}
+
+@test "шаг 1 и согласование IPv6 пишут sysctl одной и той же функцией" {
+    # Разъехавшись, они дали бы разный файл до и после ответа про IPv6.
+    local body
+    body=$(sed -n '/^step1_update_and_optimize() {/,/^}/p' "$SCRIPT")
+    [[ "$body" == *apply_sysctl_profile* ]]
+    [[ "$body" != *setup_advanced_sysctl* ]]
+    body=$(sed -n '/^sync_ipv6_settings() {/,/^}/p' "$SCRIPT")
+    [[ "$body" == *apply_sysctl_profile* ]]
 }
 
 @test "каталог данных достаётся пользователю, а не root" {

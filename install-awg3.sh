@@ -1152,6 +1152,18 @@ optimize_system() {
 # Sysctl configuration (minimal, for --no-tweaks)
 # ==============================================================================
 
+# Какой из двух наборов sysctl писать, решает --no-tweaks. Оба переписывают
+# свой файл целиком, поэтому функцию можно звать повторно: именно так решение
+# про IPv6, ставшее известным уже после шага 1, попадает в файл до следующей
+# перезагрузки.
+apply_sysctl_profile() {
+    if [[ "$NO_TWEAKS" -eq 0 ]]; then
+        setup_advanced_sysctl
+    else
+        setup_minimal_sysctl
+    fi
+}
+
 setup_minimal_sysctl() {
     log "Configuring minimal sysctl (--no-tweaks)..."
     local f="/etc/sysctl.d/99-amneziawg-forwarding.conf"
@@ -1913,14 +1925,11 @@ step1_update_and_optimize() {
     install_packages curl wget gpg sudo ethtool
 
     if [[ "$NO_TWEAKS" -eq 0 ]]; then
-        # System optimization
         optimize_system
-        # Sysctl configuration
-        setup_advanced_sysctl
     else
         log "Skipping optimization and hardening (--no-tweaks)."
-        setup_minimal_sysctl
     fi
+    apply_sysctl_profile
 
     log "Step 1 completed successfully."
 
@@ -2997,10 +3006,12 @@ validate_params() {
 
 # Согласование IPv6 между установщиком и сервером.
 #
-# Первый шаг установщика по умолчанию глушит IPv6 в sysctl. Если при этом
-# сервер просят поднять с IPv6 в туннеле, awg-quick не сможет назначить
-# интерфейсу IPv6-адрес, сервис останется в failed и сервера просто не будет.
-# Обе настройки должны решаться до шага 1, а не после.
+# Шаг 1 по умолчанию глушит IPv6 в sysctl — на этот момент ответа про туннель
+# ещё нет. Если сервер потом просят поднять с IPv6, awg-quick не сможет
+# назначить интерфейсу IPv6-адрес, сервис останется в failed и сервера просто
+# не будет. Поэтому здесь sysctl переписывается заново, уже с известным
+# ответом: configure_ipv6_tunnel снимает отключение в работающем ядре, а
+# apply_sysctl_profile — в файле, чтобы оно не вернулось после перезагрузки.
 sync_ipv6_settings() {
     if [[ "$SRV_IPV6" == "on" ]]; then
         CLI_ALLOW_IPV6_TUNNEL=1
@@ -3011,14 +3022,30 @@ sync_ipv6_settings() {
     fi
     configure_ipv6
     configure_ipv6_tunnel
+    apply_sysctl_profile
 }
 
 # Установка AmneziaWG: пакеты, модуль ядра, фаервол.
+#
+# Параметры сервера спрашиваются ЗДЕСЬ, а не до вызова, и именно после шага 3.
+# Причина в перезагрузках: шаг 1 уходит в ребут при обновлении ядра, шаг 2 —
+# если модуль не загрузился сразу, а после ребута человек запускает ту же
+# команду заново. Стоя перед шагом 1, вопросы задавались бы в каждом запуске —
+# по два раза за установку. За шагом 3 их некому повторить.
+#
+# Заодно так честнее: пока модуль не собран и не проверен, отвечать не о чем —
+# сервера всё равно не будет. Порт нужен уже шагу 4 (его открывает фаервол),
+# остальное — только deploy_server.
 install_amneziawg_stack() {
-    sync_ipv6_settings
     step1_update_and_optimize
     step2_install_amnezia
     step3_check_module
+
+    ask_params
+    validate_params
+    resolve_awg_port
+    sync_ipv6_settings
+
     step4_setup_firewall
 }
 
@@ -3125,7 +3152,6 @@ main() {
             LOG_FILE="$AWG_DIR/install-awg3.log"
             STATE_FILE="$AWG_DIR/setup_state"
             prepare_awg_dir
-            ask_params; validate_params; resolve_awg_port
             install_amneziawg_stack
             deploy_server
             ;;
@@ -3146,7 +3172,6 @@ main() {
                 log_warn "ВНИМАНИЕ: после пересоздания все выданные конфиги перестанут подключаться."
                 exit 0
             fi
-            ask_params; validate_params; resolve_awg_port
             install_amneziawg_stack
             deploy_server
             ;;
@@ -3160,7 +3185,6 @@ main() {
                 read -rp "Продолжить? [y/N]: " ans < /dev/tty
                 [[ "$ans" =~ ^[Yy] ]] || die "отменено"
             fi
-            ask_params; validate_params; resolve_awg_port
             install_amneziawg_stack
             deploy_server
             ;;
