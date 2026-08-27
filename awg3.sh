@@ -3,21 +3,21 @@
 # awg3.sh — AmneziaWG 3.0: сервер с нуля, клиенты, перевод конфигов на 3.0.
 #
 # Самодостаточный файл, без внешних библиотек:
-#   * создание сервера сразу в 3.0 (ключи, NAT, обфускация, awg0.conf);
+#   * создание сервера сразу в 3.1 (ключи, NAT, обфускация, awg0.conf);
 #   * создание клиента (ключи, свободный IP, [Peer] в awg0.conf, apply, QR,
 #     ссылка vpn:// для приложения Amnezia);
-#   * генерация параметров обфускации AWG 3.0.
+#   * генерация параметров обфускации AWG 3.1.
 #
 # Каждый клиент держит свои файлы в собственном каталоге ~/awg/ИМЯ/ — конфиг,
 # QR, ссылку и пару ключей рядом, чтобы отдать клиента целиком одной папкой.
 #
-#   ./awg3.sh server-init            # поднять сервер AWG 3.0 с нуля
-#   ./awg3.sh add ivan2              # новый клиент сразу в AWG 3.0
+#   ./awg3.sh server-init            # поднять сервер AWG 3.1 с нуля
+#   ./awg3.sh add ivan2              # новый клиент сразу в AWG 3.1
 #   ./awg3.sh link ivan2             # пересобрать ссылку по готовому конфигу
 #   ./awg3.sh list                   # клиенты и фактическое состояние сервера
 #   ./awg3.sh migrate                # разложить старых клиентов по каталогам
 #   ./awg3.sh gen                    # просто выдать набор параметров
-#   ./awg3.sh server-upgrade         # перевести существующий 2.0-сервер на 3.0
+#   ./awg3.sh server-rekey           # новые общие параметры для интерфейса
 #
 # ЕДИНСТВЕННЫЙ источник истины — /etc/amnezia/amneziawg/awg0.conf. Отдельного
 # файла настроек нет: порт, подсеть, MTU, изоляция клиентов и IPv6 читаются из
@@ -34,10 +34,12 @@
 set -Eeuo pipefail
 
 # Версия самого скрипта. Не путать с версией протокола: в исходном awg-gen.sh
-# она задавалась флагом -v (1.0|1.5|2.0|3.0), здесь же выбора нет — генерируется
-# всегда AWG 3.0, а более старые режимы не поддерживаются намеренно.
+# она задавалась флагом -v (1.0|1.5|2.0|3.0), здесь же выбора нет — новые
+# интерфейсы всегда 3.1, а более старые режимы не поддерживаются намеренно.
+# Единственная степень свободы — --random-trailers off: он оставляет интерфейс
+# на 3.0, чтобы к нему подключались приложения старше 5.0.1.5.
 SCRIPT_VERSION="1.2.0"
-readonly AWG_PROTOCOL="3.0"
+readonly AWG_PROTOCOL="3.1"
 
 # ── Пути ────────────────────────────────────────────────────────────────────
 #
@@ -48,10 +50,37 @@ readonly AWG_PROTOCOL="3.0"
 # и без разыменования SCRIPT_DIR указал бы на /usr/local/sbin — каталог, где
 # нет ни одного клиента.
 SCRIPT_DIR="$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-AWG_DIR="${AWG3_DIR:-$SCRIPT_DIR}"
-SERVER_CONF="${AWG3_SERVER_CONF:-/etc/amnezia/amneziawg/awg0.conf}"
-LOG_FILE="$AWG_DIR/awg3.log"
+
+# Явно заданные переменные окружения сильнее вычисления по интерфейсу: ими
+# пользуются юнит-тесты и прогон на копии конфига. Запоминаем факт задания
+# отдельно, иначе --iface затирал бы их при пересчёте.
+AWG_DIR_EXPLICIT="${AWG3_DIR:-}"
+SERVER_CONF_EXPLICIT="${AWG3_SERVER_CONF:-}"
 AWG_IFACE="${AWG3_IFACE:-awg0}"
+
+# resolve_paths — вычисляет AWG_DIR, SERVER_CONF, LOG_FILE и LEGACY_KEYS_DIR по
+# текущему AWG_IFACE.
+#
+# Каталог клиентов у awg0 — каталог самого скрипта (~/awg): так сложилось
+# исторически, и ломать раскладку работающих серверов незачем. У остальных
+# интерфейсов — соседний каталог по имени интерфейса (~/awg1), клиенты внутри
+# него так же вложенно: ~/awg1/ИМЯ/ИМЯ.conf.
+#
+# Вызывается дважды: здесь, чтобы работали ранние сообщения об ошибках, и
+# после разбора аргументов, где --iface мог сменить интерфейс.
+resolve_paths() {
+    if [[ -n "$AWG_DIR_EXPLICIT" ]]; then
+        AWG_DIR="$AWG_DIR_EXPLICIT"
+    elif [[ "$AWG_IFACE" == "awg0" ]]; then
+        AWG_DIR="$SCRIPT_DIR"
+    else
+        AWG_DIR="$(dirname -- "$SCRIPT_DIR")/$AWG_IFACE"
+    fi
+    SERVER_CONF="${SERVER_CONF_EXPLICIT:-/etc/amnezia/amneziawg/${AWG_IFACE}.conf}"
+    LOG_FILE="$AWG_DIR/awg3.log"
+    LEGACY_KEYS_DIR="$AWG_DIR/keys"
+}
+resolve_paths
 
 # Раскладка файлов: каждый клиент живёт в своём каталоге.
 #
@@ -62,8 +91,6 @@ AWG_IFACE="${AWG3_IFACE:-awg0}"
 # Прежняя плоская раскладка (~/awg/ИМЯ.conf + ~/awg/keys/ИМЯ.private) ещё
 # читается, чтобы list и remove работали до переноса; `awg3.sh migrate`
 # перекладывает всё на новую схему.
-
-LEGACY_KEYS_DIR="$AWG_DIR/keys"
 
 client_dir() { printf '%s/%s' "$AWG_DIR" "$1"; }
 
@@ -107,6 +134,34 @@ SRV_ISOLATION="off"
 SRV_IPV6="off"
 SRV_IPV6_SUBNET="fddd:2c4:2c4:2c4::/64"
 SRV_FORCE=0
+
+# Параметры AmneziaWG 3.1.
+#
+# RandomTrailers дописывает к каждому служебному пакету случайный хвост, снимая
+# постоянную длину рукопожатия (без него init всегда 148+S1, ответ 92+S2 — по
+# ним сервер опознаётся с одного пакета). Приёмник при этом переходит с
+# проверки «длина равна ожидаемой» на «не меньше ожидаемой», поэтому параметр
+# обязан СОВПАДАТЬ на обоих концах: включённый только на одной стороне рвёт
+# туннель полностью. Отсюда же он и не sender-side: клиент обязан повторить
+# его за сервером, как S1-S4 и HeaderProtectionKey.
+#
+# DisableCookies запрещает отвечать на cookie-запросы. Он односторонний:
+# включается на любом конце независимо и старую сторону не ломает.
+SRV_RANDOM_TRAILERS="on"
+SRV_DISABLE_COOKIES="on"
+# Задан ли флаг явно. Нужно, чтобы server-rekey на legacy-интерфейсе сохранял
+# его текущее состояние, а не включал RandomTrailers молча по умолчанию:
+# это отключило бы всех выданных клиентов разом.
+SRV_RT_EXPLICIT=0
+SRV_DC_EXPLICIT=0
+
+# Переезд клиента между интерфейсами: куда и с каким ключом.
+MIGRATE_TO=""
+REUSE_PRIVKEY=""
+
+# Минимальная версия модуля и tools, понимающая эти два параметра.
+readonly AWG31_MIN_MAJOR=3
+readonly AWG31_MIN_MINOR=1
 
 # device/noise-types.go: HeaderCipherNonceSize. При включённой защите заголовка
 # nonce читается из первых NONCE_SIZE байт padding'а, поэтому S1-S4 не могут
@@ -379,6 +434,16 @@ gen_sender_params() {
     G_RJ="${rj_lo}-${rj_hi}"
     G_KA="${ka_lo}-${ka_hi}"
     G_MHA="${at_lo}-${at_hi}"
+
+    # PersistentKeepalive: постоянный интервал сам по себе признак, поэтому
+    # он тоже разный у каждого клиента. Диапазон понимают только tools 3.1 и
+    # приложение от 5.0.1.5, так что для legacy-интерфейса остаётся число —
+    # его примет кто угодно.
+    local pk_lo pk_hi
+    rand_int 22 30; pk_lo=$REPLY
+    rand_int 6 14;  pk_hi=$((pk_lo + REPLY))
+    G_PKA_RANGE="${pk_lo}-${pk_hi}"
+    rand_int 25 40; G_PKA_ONE=$REPLY
 }
 
 # gen_shared_params: то, что обязано совпадать на обоих концах.
@@ -464,6 +529,19 @@ load_server_params() {
     S_MTU=$(_iface_value MTU)
     S_PORT=$(_iface_value ListenPort)
 
+    # RandomTrailers обязан совпадать с сервером, поэтому клиент получает его
+    # отсюда, а не генерирует. Отсутствие строки означает выключено: так
+    # выглядят все конфиги, созданные до 3.1.
+    S_RTR=$(_iface_value RandomTrailers)
+    [[ -n "$S_RTR" ]] || S_RTR="off"
+
+    # DisableCookies односторонний, туннель от рассинхрона не рвётся. Но клиент
+    # всё равно повторяет за сервером: интерфейс, у которого его выключили
+    # намеренно, заводят ради приложений, которые этого ключа не знают, — и
+    # строка в их конфиге всё испортила бы ровно там, где её избегали.
+    S_DC=$(_iface_value DisableCookies)
+    [[ -n "$S_DC" ]] || S_DC="off"
+
     local addr_line
     addr_line=$(_iface_value Address)
     S_ADDR=""; S_ADDR6=""
@@ -487,6 +565,67 @@ server_is_awg3() {
     [[ -n "${S_HPK:-}" ]]
 }
 
+# ── Версии модуля и tools ───────────────────────────────────────────────────
+#
+# Сравнивается только major.minor: патч-часть — дата сборки (3.1.20260812), на
+# возможности она не влияет. Строка, которую не удалось разобрать, считается
+# устаревшей: это консервативный исход, он лишь запретит записать параметр.
+
+# awg_version_ge <строка> — 0, если версия не ниже 3.1.
+awg_version_ge() {
+    local v="${1:-}" maj min
+    [[ "$v" =~ ([0-9]+)\.([0-9]+) ]] || return 1
+    maj=${BASH_REMATCH[1]}; min=${BASH_REMATCH[2]}
+    (( maj > AWG31_MIN_MAJOR || (maj == AWG31_MIN_MAJOR && min >= AWG31_MIN_MINOR) ))
+}
+
+# Версия модуля, ЗАГРУЖЕННОГО в ядро. Именно она решает, примет ли устройство
+# RandomTrailers, и она может отличаться от версии на диске — ровно так
+# выглядит сервер сразу после обновления пакетов, до перезагрузки.
+awg_module_loaded_version() {
+    cat /sys/module/amneziawg/version 2>/dev/null | tr -d '[:space:]'
+}
+
+# Версия модуля НА ДИСКЕ: собран, но, возможно, ещё не загружен.
+awg_module_disk_version() {
+    modinfo amneziawg 2>/dev/null | awk '/^version:/ { print $2; exit }'
+}
+
+awg_tools_version() {
+    awg --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1
+}
+
+# require_awg31 <зачем> — не пускает дальше, если 3.1 не поддерживается.
+#
+# Разделяет два случая, потому что действие у них разное: если на диске уже
+# 3.1, обновлять нечего и нужна перезагрузка; предложить здесь apt было бы
+# враньём — он ничего не изменит, и человек застрял бы в цикле.
+require_awg31() {
+    local what="${1:-этот параметр}" loaded disk tools
+    loaded=$(awg_module_loaded_version)
+    disk=$(awg_module_disk_version)
+    tools=$(awg_tools_version)
+
+    if ! awg_version_ge "$tools"; then
+        log_err "amneziawg-tools версии ${tools:-неизвестно} не знают $what — нужна 3.1 или новее."
+        log_err "Обновите пакеты: apt-get update && apt-get install --only-upgrade amneziawg-tools"
+        return 1
+    fi
+
+    if awg_version_ge "$loaded"; then return 0; fi
+
+    if awg_version_ge "$disk"; then
+        log_err "модуль ядра ${disk} уже собран, но в памяти всё ещё ${loaded:-не загружен}."
+        log_err "Нужна ПЕРЕЗАГРУЗКА — заменить загруженный модуль иначе нечем."
+        log_err "Обновлять пакеты не нужно, они уже свежие."
+    else
+        log_err "модуль ядра версии ${loaded:-не загружен} не знает $what — нужна 3.1 или новее."
+        log_err "Обновите пакеты и перезагрузитесь:"
+        log_err "  apt-get update && apt-get install --only-upgrade amneziawg-dkms amneziawg-tools"
+    fi
+    return 1
+}
+
 # Фактическое состояние сервера читается из PostUp, а не из отдельного файла
 # настроек: конфиг — единственный источник истины, и расходиться с ним нечему.
 server_isolation_state() {
@@ -507,8 +646,8 @@ server_ipv6_state() {
 
 require_server_awg3() {
     if server_is_awg3; then return 0; fi
-    log_err "сервер ещё не переведён на AWG 3.0: в $SERVER_CONF нет HeaderProtectionKey."
-    log_err "Сначала выполните: $0 server-upgrade"
+    log_err "в $SERVER_CONF нет HeaderProtectionKey — это не конфиг AWG 3.x."
+    log_err "Проверьте, тот ли это конфиг: $SERVER_CONF"
     exit 1
 }
 
@@ -908,13 +1047,24 @@ render_client_conf() {
         printf 'RejectAfterTime = %s\n' "$G_RJ"
         printf 'KeepaliveTimeout = %s\n' "$G_KA"
         printf 'MaxHandshakeAttempts = %s\n' "$G_MHA"
+        # Повторяется за сервером: рассинхрон рвёт туннель целиком. Строка
+        # пишется только когда включено — иначе конфиг перестал бы читаться
+        # приложениями старше 5.0.1.5, которые этого ключа не знают.
+        if [[ "${S_RTR:-off}" == "on" ]]; then
+            printf 'RandomTrailers = on\n'
+        fi
+        if [[ "${S_DC:-off}" == "on" ]]; then
+            printf 'DisableCookies = on\n'
+        fi
+        local keepalive="$G_PKA_ONE"
+        if [[ "${S_RTR:-off}" == "on" ]]; then keepalive="$G_PKA_RANGE"; fi
         printf '\n'
         printf '[Peer]\n'
         printf 'PublicKey = %s\n' "$srv_pub"
         if [[ -n "$psk" ]]; then printf 'PresharedKey = %s\n' "$psk"; fi
         printf 'Endpoint = %s:%s\n' "$endpoint" "$port"
         printf 'AllowedIPs = %s\n' "$CLIENT_ALLOWED_IPS"
-        printf 'PersistentKeepalive = 33\n'
+        printf 'PersistentKeepalive = %s\n' "$keepalive"
     } > "$tmp"
 
     mv -f "$tmp" "$out" || { rm -f "$tmp"; die "не записан $out"; }
@@ -1004,6 +1154,16 @@ render_server_conf() {
             var="G_I${n}"
             if [[ -n "${!var}" ]]; then printf 'I%s = %s\n' "$n" "${!var}"; fi
         done
+        # Таймеры 3.0 на сервере: он тоже инициатор, когда пересогласует ключ.
+        printf 'RekeyAfterTime = %s\n' "$G_RA"
+        printf 'RekeyTimeout = %s\n' "$G_RT"
+        printf 'RejectAfterTime = %s\n' "$G_RJ"
+        printf 'KeepaliveTimeout = %s\n' "$G_KA"
+        printf 'MaxHandshakeAttempts = %s\n' "$G_MHA"
+        # Пишутся только когда включены: строка со значением off ничего не
+        # добавляет, а на модуле ниже 3.1 сделала бы конфиг незагружаемым.
+        if [[ "$SRV_RANDOM_TRAILERS" == "on" ]]; then printf 'RandomTrailers = on\n'; fi
+        if [[ "$SRV_DISABLE_COOKIES" == "on" ]]; then printf 'DisableCookies = on\n'; fi
     } > "$tmp"
 
     if [[ -n "$peers_src" && -f "$peers_src" ]]; then
@@ -1216,8 +1376,13 @@ build_vpn_uri() {
         [[ -n "$val" ]] || continue
         inner+="\"${key}\":\"$(_json_escape "$val")\","
     done
+    # RandomTrailers и DisableCookies обязаны попасть в ссылку: приложение
+    # строит туннель по этим полям, а не по тексту в config. Без них клиент,
+    # поднятый из ссылки, окажется с выключенным RandomTrailers против сервера
+    # с включённым — и туннель молча не встанет.
     for key in HeaderProtectionKey ContentPaddingAddition RekeyAfterTime \
-               RekeyTimeout RejectAfterTime KeepaliveTimeout MaxHandshakeAttempts; do
+               RekeyTimeout RejectAfterTime KeepaliveTimeout MaxHandshakeAttempts \
+               RandomTrailers DisableCookies; do
         val=$(_conf_value "$conf" "$key" interface)
         [[ -n "$val" ]] || continue
         inner+="\"${key}\":\"$(_json_escape "$val")\","
@@ -1237,7 +1402,10 @@ build_vpn_uri() {
     local outer="{"
     outer+='"containers":[{"awg":{"isThirdPartyConfig":true,'
     outer+="\"last_config\":\"$(_json_escape "$inner")\","
-    outer+="\"port\":\"${port}\",\"protocol_version\":\"2\",\"transport_proto\":\"udp\"},"
+    # "3.1" — та же метка, что ставит официальное приложение (awgV3 в
+    # protocolConstants.h). Поле справочное: туннель строится по набору полей
+    # в last_config, а версия идёт в подпись сервера в интерфейсе.
+    outer+="\"port\":\"${port}\",\"protocol_version\":\"3.1\",\"transport_proto\":\"udp\"},"
     outer+='"container":"amnezia-awg"}],'
     outer+='"defaultContainer":"amnezia-awg",'
     outer+="\"description\":\"$(_json_escape "$desc")\","
@@ -1303,8 +1471,8 @@ server_public_key() {
 
 # ── Команда: server-init ────────────────────────────────────────────────────
 #
-# Создание сервера AWG 3.0 с нуля: ключи, параметры обфускации, NAT, конфиг,
-# форвардинг. Промежуточной стадии 2.0 не существует, server-upgrade здесь не
+# Создание сервера AWG 3.1 с нуля: ключи, параметры обфускации, NAT, конфиг,
+# форвардинг. Промежуточной стадии 2.0 не существует, server-rekey здесь не
 # участвует — он остаётся только для уже существующих 2.0-серверов.
 
 guard_existing_server() {
@@ -1337,6 +1505,18 @@ enable_forwarding() {
 
 cmd_server_init() {
     guard_existing_server || exit 1
+
+    # Проверка до записи, а не по коду возврата awg. Конфиг с RandomTrailers на
+    # модуле ниже 3.1 не ломает уже поднятый интерфейс — он ломает СЛЕДУЮЩИЙ
+    # запуск: awg setconf отдаёт «Invalid argument», awg-quick сносит
+    # устройство, сервис уходит в failed. Такую мину лучше не закладывать.
+    if [[ "$SRV_RANDOM_TRAILERS" == "on" ]]; then
+        require_awg31 "RandomTrailers" || exit 1
+    elif [[ "$SRV_DISABLE_COOKIES" == "on" ]]; then
+        # Модулю ниже 3.1 этот ключ так же неизвестен, и конфиг с ним не
+        # загрузится — проверять надо и когда RandomTrailers выключен.
+        require_awg31 "DisableCookies" || exit 1
+    fi
 
     [[ -n "$SRV_PORT" ]] || { rand_int 1024 65000; SRV_PORT=$REPLY; }
     validate_awg_port "$SRV_PORT" || exit 1
@@ -1397,10 +1577,18 @@ cmd_server_init() {
             || log_warn "сервис не запустился, смотрите: systemctl status awg-quick@${AWG_IFACE}"
     fi
 
-    log_ok "сервер AWG 3.0 создан: $SERVER_CONF"
+    local ver="3.0"
+    [[ "$SRV_RANDOM_TRAILERS" == "on" ]] && ver="3.1"
+    log_ok "интерфейс ${AWG_IFACE}: сервер AWG ${ver} создан, $SERVER_CONF"
     log "  порт: ${SRV_PORT}/udp, подсеть: ${SRV_SUBNET}, MTU: ${SRV_MTU}"
     log "  изоляция клиентов: ${SRV_ISOLATION}, IPv6: ${SRV_IPV6}"
-    log "  добавить клиента: $0 add ИМЯ"
+    # Подсказка обязана нести --iface: без него add уйдёт на awg0, а человек
+    # решит, что завёл клиента только что созданному интерфейсу.
+    if [[ "$AWG_IFACE" == "awg0" ]]; then
+        log "  добавить клиента: $0 add ИМЯ"
+    else
+        log "  добавить клиента: $0 --iface ${AWG_IFACE} add ИМЯ"
+    fi
 }
 
 # Ловушка висит на EXIT, а не на ERR: die() выходит через exit, и ERR на нём
@@ -1509,7 +1697,16 @@ cmd_add() {
     client_ip=$(get_next_client_ip)
     client_ip6=$(get_client_ipv6 "$client_ip")
 
-    privkey=$(awg genkey)
+    # При переезде между интерфейсами ключ клиента берётся прежний: на сервере
+    # это тот же пир, а у человека — та же личность. Меняются только общие
+    # параметры интерфейса, адрес и порт.
+    if [[ -n "$REUSE_PRIVKEY" ]]; then
+        privkey=$(tr -d '[:space:]' < "$REUSE_PRIVKEY") \
+            || die "не прочитан ключ клиента: $REUSE_PRIVKEY"
+        [[ -n "$privkey" ]] || die "пустой ключ клиента: $REUSE_PRIVKEY"
+    else
+        privkey=$(awg genkey)
+    fi
     pubkey=$(printf '%s' "$privkey" | awg pubkey)
 
     if [[ -n "$client_ip6" ]]; then
@@ -1573,7 +1770,9 @@ cmd_add() {
     log "  каталог: $cdir"
     log "  конфиг: $conf"
     if [[ -f "${conf%.conf}.vpnuri" ]]; then log "  ссылка: ${conf%.conf}.vpnuri"; fi
-    log "  профиль обфускации: AWG 3.0 / ${PROFILE} / ${INTENSITY}"
+    local ver="3.0"
+    [[ "${S_RTR:-off}" == "on" ]] && ver="3.1"
+    log "  профиль обфускации: AWG ${ver} / ${PROFILE} / ${INTENSITY}"
 }
 
 _rollback_add() {
@@ -1729,9 +1928,15 @@ cmd_list() {
 
     printf '\n'
     if server_is_awg3; then
-        printf 'Сервер: AWG 3.0 (S1=%s H1=%s)\n' "$S_S1" "$S_H1"
+        if [[ "${S_RTR:-off}" == "on" ]]; then
+            printf 'Интерфейс %s: AWG 3.1 (S1=%s H1=%s, RandomTrailers on)\n' \
+                "$AWG_IFACE" "$S_S1" "$S_H1"
+        else
+            printf 'Интерфейс %s: AWG 3.0 (S1=%s H1=%s, RandomTrailers off)\n' \
+                "$AWG_IFACE" "$S_S1" "$S_H1"
+        fi
     else
-        printf 'Сервер: AWG 2.0 — HeaderProtectionKey отсутствует\n'
+        printf 'Интерфейс %s: конфиг не похож на наш — нет HeaderProtectionKey\n' "$AWG_IFACE"
     fi
     printf '  порт: %s/udp, подсеть: %s, MTU: %s\n' \
         "${S_PORT:-?}" "${S_ADDR:-?}" "${S_MTU:-?}"
@@ -2164,21 +2369,121 @@ MaxHandshakeAttempts = ${G_MHA}
 EOF
 }
 
-# ── Команда: server-upgrade ─────────────────────────────────────────────────
+# ── Команда: migrate-client ─────────────────────────────────────────────────
+#
+# Заводит существующего клиента на другом интерфейсе, сохраняя его ключевую
+# пару: на сервере это остаётся тот же пир, у человека — та же личность.
+# Меняются общие параметры интерфейса, адрес в туннеле и порт.
+#
+# С исходного интерфейса клиент НЕ удаляется намеренно. Пока он там есть,
+# прежняя ссылка продолжает работать, и человек переезжает тогда, когда сам
+# импортирует новую. Это и делает переезд безостановочным; убрать старого
+# пира можно потом обычным remove.
+cmd_migrate_client() {
+    local name="$1"
+    local from="$AWG_IFACE"
 
-cmd_server_upgrade() {
+    [[ -n "$MIGRATE_TO" ]] || die "укажите целевой интерфейс: --to awgN"
+    [[ "$MIGRATE_TO" != "$from" ]] || die "исходный и целевой интерфейс совпадают: $from"
+    # Оба каталога вычисляются по имени интерфейса. Если их прибили
+    # переменными окружения, клиент уехал бы в конфиг и каталог исходного
+    # интерфейса — то есть переезда не случилось бы, а файлы перезаписались.
+    [[ -z "$SERVER_CONF_EXPLICIT" ]] \
+        || die "переезд несовместим с заданным AWG3_SERVER_CONF: путь вычисляется по интерфейсу"
+    [[ -z "$AWG_DIR_EXPLICIT" ]] \
+        || die "переезд несовместим с заданным AWG3_DIR: каталог вычисляется по интерфейсу"
+    validate_client_name "$name"
+
+    local src_priv
+    src_priv="$(client_dir "$name")/${name}.private"
+    [[ -f "$src_priv" ]] \
+        || die "у клиента '$name' не сохранён приватный ключ: $src_priv"
+
+    local target_conf="/etc/amnezia/amneziawg/${MIGRATE_TO}.conf"
+    [[ -f "$target_conf" ]] \
+        || die "интерфейс $MIGRATE_TO не найден: $target_conf"
+
+    log "переезд '$name': $from -> $MIGRATE_TO, ключ клиента сохраняется"
+
+    REUSE_PRIVKEY="$src_priv"
+    AWG_IFACE="$MIGRATE_TO"
+    resolve_paths
+    cmd_add "$name"
+
+    log_ok "'$name' заведён на $MIGRATE_TO"
+    log "На $from он остался: прежняя ссылка продолжает работать, пока человек не импортирует новую."
+    log "Когда переедет — убрать старого: $0 --iface $from remove $name"
+}
+
+# ── Команда: ifaces ─────────────────────────────────────────────────────────
+#
+# Список серверных интерфейсов. Отдельного реестра нет намеренно: источник
+# истины — сами конфиги в /etc/amnezia/amneziawg, расходиться с реальностью
+# нечему. Формат — колонки с разделителем табуляцией, чтобы панель могла
+# разобрать вывод, не вглядываясь в выравнивание.
+cmd_ifaces() {
+    local conf name port addr rtr dc clients state dir found=0
+
+    printf 'ИНТЕРФЕЙС\tПОРТ\tПОДСЕТЬ\tRANDOMTRAILERS\tDISABLECOOKIES\tКЛИЕНТОВ\tСЕРВИС\n'
+    for conf in /etc/amnezia/amneziawg/*.conf; do
+        [[ -f "$conf" ]] || continue
+        name=$(basename "$conf" .conf)
+        found=1
+
+        # Значения читаются тем же способом, что и в остальном скрипте, но по
+        # чужому файлу — поэтому не через _iface_value, который смотрит только
+        # в $SERVER_CONF.
+        port=$(awk -F'=' '/^[[:space:]]*\[Peer\]/{exit} /^[[:space:]]*ListenPort[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$conf")
+        addr=$(awk -F'=' '/^[[:space:]]*\[Peer\]/{exit} /^[[:space:]]*Address[[:space:]]*=/{sub(/^[^=]*=[[:space:]]*/,""); print; exit}' "$conf")
+        rtr=$(awk -F'=' '/^[[:space:]]*\[Peer\]/{exit} /^[[:space:]]*RandomTrailers[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$conf")
+        dc=$(awk -F'=' '/^[[:space:]]*\[Peer\]/{exit} /^[[:space:]]*DisableCookies[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$conf")
+        # grep -c печатает 0 и при этом возвращает 1: ветка `|| printf 0`
+        # дописывала бы второй ноль через перевод строки, и колонки разъезжались.
+        clients=$(grep -c '^[[:space:]]*\[Peer\]' "$conf" 2>/dev/null) || clients=0
+        state=$(systemctl is-active "awg-quick@${name}" 2>/dev/null || printf 'unknown')
+
+        if [[ "$name" == "awg0" ]]; then dir="$SCRIPT_DIR"; else dir="$(dirname -- "$SCRIPT_DIR")/$name"; fi
+        [[ -d "$dir" ]] || dir="—"
+
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$name" "${port:-?}" "${addr:-?}" "${rtr:-off}" "${dc:-off}" "$clients" "$state"
+    done
+
+    [[ "$found" -eq 1 ]] || log_warn "ни одного интерфейса в /etc/amnezia/amneziawg не найдено"
+}
+
+# ── Команда: server-rekey ───────────────────────────────────────────────────
+
+cmd_server_rekey() {
     load_server_params
 
-    if server_is_awg3; then
-        log_warn "сервер уже на AWG 3.0 (HeaderProtectionKey присутствует)."
-        log_warn "Повторный запуск сгенерирует НОВЫЕ общие параметры и разорвёт все текущие подключения."
-        confirm "Всё равно перегенерировать?" || die "отменено"
+    # Без явного флага сохраняем режим интерфейса: молча включить
+    # RandomTrailers на legacy-интерфейсе значит отключить всех его клиентов.
+    # С DisableCookies то же самое, только мягче: туннель он не рвёт, но
+    # появившаяся строка сломала бы разбор конфига у старых приложений — а
+    # именно ради них его и выключали.
+    if [[ "$SRV_RT_EXPLICIT" -eq 0 ]]; then
+        SRV_RANDOM_TRAILERS="${S_RTR:-off}"
+    fi
+    if [[ "$SRV_DC_EXPLICIT" -eq 0 ]]; then
+        SRV_DISABLE_COOKIES="${S_DC:-off}"
+    fi
+    if [[ "$SRV_RANDOM_TRAILERS" == "on" ]]; then
+        require_awg31 "RandomTrailers" || exit 1
+    elif [[ "$SRV_DISABLE_COOKIES" == "on" ]]; then
+        # Модулю ниже 3.1 этот ключ так же неизвестен, и конфиг с ним не
+        # загрузится — проверять надо и когда RandomTrailers выключен.
+        require_awg31 "DisableCookies" || exit 1
     fi
 
-    log "После смены общих параметров все клиентские конфиги станут недействительны."
+    log_warn "Будут сгенерированы НОВЫЕ общие параметры — все текущие подключения оборвутся."
     log "Каждого клиента придётся создать заново: $0 remove ИМЯ, затем $0 add ИМЯ"
     confirm "Продолжить?" || die "отменено"
 
+    # gen_sender_params обязателен: ContentPaddingAddition — параметр
+    # отправляющей стороны, и заполняет G_CPA именно он. Без этого вызова
+    # команда падала на `unbound variable` сразу после снятия бэкапа.
+    gen_sender_params
     gen_shared_params
     _backup_file "$SERVER_CONF"
 
@@ -2191,12 +2496,15 @@ cmd_server_upgrade() {
     # список пиров — переносится дословно.
     awk -v s1="$G_S1" -v s2="$G_S2" -v s3="$G_S3" -v s4="$G_S4" \
         -v h1="$G_H1" -v h2="$G_H2" -v h3="$G_H3" -v h4="$G_H4" \
-        -v hpk="$G_HPK" -v cpa="$G_CPA" '
+        -v hpk="$G_HPK" -v cpa="$G_CPA" \
+        -v rtr="$SRV_RANDOM_TRAILERS" -v dc="$SRV_DISABLE_COOKIES" '
         function emit_block() {
             printf "\nS1 = %s\nS2 = %s\nS3 = %s\nS4 = %s\n", s1, s2, s3, s4
             printf "H1 = %s\nH2 = %s\nH3 = %s\nH4 = %s\n", h1, h2, h3, h4
             printf "HeaderProtectionKey = %s\n", hpk
             printf "ContentPaddingAddition = %s\n", cpa
+            if (rtr == "on") printf "RandomTrailers = on\n"
+            if (dc  == "on") printf "DisableCookies = on\n"
         }
         BEGIN { in_iface = 0; done = 0 }
         /^[[:space:]]*\[Interface\]/ { in_iface = 1; print; next }
@@ -2210,7 +2518,7 @@ cmd_server_upgrade() {
                 sub(/^[[:space:]]+/, "", line)
                 split(line, kv, "=")
                 gsub(/^[[:space:]]+|[[:space:]]+$/, "", kv[1])
-                if (kv[1] ~ /^(S[1-4]|H[1-4]|HeaderProtectionKey|ContentPaddingAddition|Jc|Jmin|Jmax|I[1-5])$/) next
+                if (kv[1] ~ /^(S[1-4]|H[1-4]|HeaderProtectionKey|ContentPaddingAddition|Jc|Jmin|Jmax|I[1-5]|RandomTrailers|DisableCookies)$/) next
                 if (line == "") next
             }
             print
@@ -2220,7 +2528,7 @@ cmd_server_upgrade() {
 
     mv -f "$tmp" "$SERVER_CONF" || { rm -f "$tmp"; die "не записан $SERVER_CONF"; }
     chmod 600 "$SERVER_CONF"
-    log_ok "сервер переведён на AWG 3.0"
+    log_ok "общие параметры интерфейса ${AWG_IFACE} обновлены"
 
     # syncconf не меняет параметры интерфейса — только полный перезапуск.
     apply_restart || true
@@ -2238,7 +2546,7 @@ awg3.sh ${SCRIPT_VERSION} — AmneziaWG ${AWG_PROTOCOL}: клиенты и па�
     awg3.sh <команда> [аргументы] [опции]
 
 КОМАНДЫ
-    add NAME              создать клиента сразу с параметрами AWG 3.0
+    add NAME              создать клиента с параметрами текущего интерфейса
     remove NAME...        удалить клиента: пир, файлы и ключи
     link [NAME...]        пересобрать ссылку vpn:// по конфигу
                           (без имён — всем клиентам; с одним именем ссылка
@@ -2250,10 +2558,14 @@ awg3.sh ${SCRIPT_VERSION} — AmneziaWG ${AWG_PROTOCOL}: клиенты и па�
     restart               перезапустить awg-quick@ИНТЕРФЕЙС
     backup [--prune N]    архив конфигов и ключей в ~/awg/backups
     migrate               разложить клиентов из старой плоской схемы по каталогам
-    gen                   вывести готовый набор параметров AWG 3.0
-    server-init           создать сервер AWG 3.0 с нуля
+    gen                   вывести готовый набор параметров AWG 3.1
+    server-init           создать сервер AWG 3.1 с нуля
     set-endpoint HOST     сменить имя хоста для новых клиентских конфигов
-    server-upgrade        сгенерировать новые общие параметры для сервера
+    ifaces                список серверных интерфейсов
+    migrate-client N --to IFACE
+                          завести клиента на другом интерфейсе, сохранив его ключ
+    server-rekey          сгенерировать новые общие параметры интерфейса
+                          (прежнее имя server-upgrade ещё принимается)
 
 ОПЦИИ
     -p, --profile NAME    профиль мимикрии для I1:
@@ -2277,6 +2589,18 @@ awg3.sh ${SCRIPT_VERSION} — AmneziaWG ${AWG_PROTOCOL}: клиенты и па�
         --ipv6-subnet CIDR
                           (server-init) подсеть IPv6       (по умолч.: ${SRV_IPV6_SUBNET})
         --force           (server-init) пересоздать сервер, перенеся пиров
+        --random-trailers on|off
+                          (server-init, server-rekey) RandomTrailers 3.1.
+                          ОБЯЗАН совпадать на сервере и всех его клиентах:
+                          включённый на одной стороне рвёт туннель. Требует
+                          модуль и tools 3.1  (по умолч.: ${SRV_RANDOM_TRAILERS})
+        --disable-cookies on|off
+                          (server-init, server-rekey) не отвечать на
+                          cookie-запросы. Односторонний, старых клиентов не
+                          ломает                 (по умолч.: ${SRV_DISABLE_COOKIES})
+        --iface NAME      серверный интерфейс    (по умолч.: awg0)
+                          Принимается и перед командой: awg3 --iface awg1 list
+        --to IFACE        (migrate-client) целевой интерфейс
     -y, --yes             не задавать вопросов
     -h, --help            эта справка
 
@@ -2294,16 +2618,34 @@ awg3.sh ${SCRIPT_VERSION} — AmneziaWG ${AWG_PROTOCOL}: клиенты и па�
     'migrate' переносит её на новую схему.
 
     Пути переопределяются переменными AWG3_DIR, AWG3_SERVER_CONF, AWG3_IFACE.
+
+    Интерфейсов может быть несколько, и они независимы: у каждого свой порт,
+    подсеть, общие параметры и каталог клиентов. awg0 живёт в каталоге самого
+    скрипта, остальные — в соседнем каталоге по имени: ~/awg1/ИМЯ/ИМЯ.conf.
+    Одинаковые имена клиентов на РАЗНЫХ интерфейсах допустимы — на этом
+    держится безостановочный переезд через migrate-client.
 EOF
 }
 
 main() {
     [[ $# -gt 0 ]] || { usage; exit 1; }
 
+    # --iface относится ко всему вызову, а не к команде, поэтому принимается и
+    # перед ней: `awg3 --iface awg1 list` читается естественнее, чем
+    # `awg3 list --iface awg1`. Оба порядка работают — ниже флаг разбирается
+    # ещё раз вместе с остальными.
+    while [[ "${1:-}" == "--iface" ]]; do
+        [[ -n "${2:-}" ]] || die "--iface ожидает имя интерфейса"
+        AWG_IFACE="$2"; shift 2
+    done
+
+    [[ $# -gt 0 ]] || { usage; exit 1; }
+
     local cmd="$1"; shift
     case "$cmd" in
         -h|--help|help) usage; exit 0 ;;
-        add|remove|link|list|names|stats|show|restart|backup|gen|migrate|server-upgrade|server-init|set-endpoint) ;;
+        add|remove|link|list|names|stats|show|restart|backup|gen|migrate|server-rekey|server-init|set-endpoint|ifaces|migrate-client) ;;
+        server-upgrade) cmd=server-rekey ;;
         *) die "неизвестная команда: ${cmd}  (см. --help)" ;;
     esac
 
@@ -2327,12 +2669,24 @@ main() {
             --ipv6)         SRV_IPV6="${2:-}"; shift 2 ;;
             --ipv6-subnet)  SRV_IPV6_SUBNET="${2:-}"; shift 2 ;;
             --force)        SRV_FORCE=1; shift ;;
+            --iface)        AWG_IFACE="${2:-}"; shift 2 ;;
+            --to)           MIGRATE_TO="${2:-}"; shift 2 ;;
+            --random-trailers) SRV_RANDOM_TRAILERS="${2:-}"; SRV_RT_EXPLICIT=1; shift 2 ;;
+            --disable-cookies) SRV_DISABLE_COOKIES="${2:-}"; SRV_DC_EXPLICIT=1; shift 2 ;;
             -y|--yes)       ASSUME_YES=1; shift ;;
             -h|--help)      usage; exit 0 ;;
             -*)             die "неизвестная опция: $1  (см. --help)" ;;
             *)              positional+=("$1"); shift ;;
         esac
     done
+
+    # Имя интерфейса уходит в пути к файлам и в systemctl, поэтому проверяется
+    # до первого использования: awg-quick@ принимает только это подмножество.
+    [[ "$AWG_IFACE" =~ ^[A-Za-z][A-Za-z0-9_-]{0,14}$ ]] \
+        || die "недопустимое имя интерфейса: ${AWG_IFACE}"
+
+    # --iface мог сменить интерфейс уже после первого вычисления путей.
+    resolve_paths
 
     case "$PROFILE" in
         quic|tls|dtls|sip|dns|noise) ;;
@@ -2349,6 +2703,14 @@ main() {
     case "$SRV_IPV6" in
         on|off) ;;
         *) die "--ipv6 ожидает on|off: $SRV_IPV6" ;;
+    esac
+    case "$SRV_RANDOM_TRAILERS" in
+        on|off) ;;
+        *) die "--random-trailers ожидает on|off: $SRV_RANDOM_TRAILERS" ;;
+    esac
+    case "$SRV_DISABLE_COOKIES" in
+        on|off) ;;
+        *) die "--disable-cookies ожидает on|off: $SRV_DISABLE_COOKIES" ;;
     esac
     if [[ -n "$PRUNE_KEEP" ]]; then
         [[ "$PRUNE_KEEP" =~ ^[0-9]+$ ]] && (( PRUNE_KEEP >= 1 )) \
@@ -2377,7 +2739,12 @@ main() {
         backup)         cmd_backup ;;
         gen)            cmd_gen ;;
         migrate)        cmd_migrate ;;
-        server-upgrade) cmd_server_upgrade ;;
+        server-rekey)   cmd_server_rekey ;;
+        ifaces)         cmd_ifaces ;;
+        migrate-client)
+            [[ "${#positional[@]}" -eq 1 ]] || die "migrate-client принимает ровно одно имя клиента"
+            cmd_migrate_client "${positional[0]}"
+            ;;
         server-init)    cmd_server_init ;;
         set-endpoint)
             [[ "${#positional[@]}" -eq 1 ]] || die "set-endpoint принимает ровно одно имя хоста"
