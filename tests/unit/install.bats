@@ -379,3 +379,25 @@ Hit:7 https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu noble InRelease')
     grep -q "CmdArgs @('peers')" "$REPO_ROOT/panel/awg-panel.ps1"
     grep -qE "^ +peers\)" "$REPO_ROOT/awg3.sh"
 }
+
+@test "панель переживает отсутствие консоли" {
+    # Clear-Host падает без дескриптора консоли: под перенаправлением в файл
+    # или в конвейере. Панель умирала на первой же перерисовке — то есть
+    # именно тогда, когда человек пытался снять лог, чтобы прислать его.
+    grep -q "try { Clear-Host } catch { }" "$REPO_ROOT/panel/awg-panel.ps1"
+}
+
+@test "крошки показываются только после входа на сервер" {
+    # Иначе на экране серверов печатался адрес прошлой (в том числе
+    # неудавшейся) попытки, и панель выглядела подключённой к серверу,
+    # которого в списке нет.
+    grep -q 'if ($script:Connected -and $VpsHost)' "$REPO_ROOT/panel/awg-panel.ps1"
+}
+
+@test "сообщение об ошибке не стирается перерисовкой" {
+    # Show-Banner зовёт Clear-Host: без паузы объяснение, почему не удалось
+    # добавить сервер, исчезало раньше, чем его успевали прочитать.
+    local body
+    body=$(sed -n "/'\^\[Nn\]\\$' {/,/^            }/p" "$REPO_ROOT/panel/awg-panel.ps1" | head -12)
+    [[ "$body" == *"Pause-Panel"* ]]
+}

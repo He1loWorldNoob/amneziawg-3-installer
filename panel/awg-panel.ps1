@@ -59,6 +59,8 @@ $Iface       = 'awg0'
 $Peer        = ''
 $PeerRow     = @()
 $ProfileName = ''
+# Вошли ли мы на сервер. До этого показывать крошки не о чем.
+$Connected   = $false
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
@@ -1147,6 +1149,7 @@ $ServerSummary = @{}
 
 function Screen-Servers {
     while ($true) {
+        $script:Connected = $false
         Show-Banner
         $items = @(Get-Profiles)
 
@@ -1156,7 +1159,7 @@ function Screen-Servers {
         if ($items.Count -gt 0) {
             for ($i = 0; $i -lt $items.Count; $i++) {
                 $it = $items[$i]
-                Write-Host ("   {0,2}  {1,-14}" -f ($i + 1), $it.name) -NoNewline
+                Write-Host ("   {0,2}  {1,-22} " -f ($i + 1), $it.name) -NoNewline
                 Write-Host ("{0}@{1}:{2}" -f $it.user, $it.host, $it.port) -NoNewline -ForegroundColor DarkGray
                 $sum = $script:ServerSummary[$it.name]
                 if ($sum) { Write-Host ("   {0}" -f $sum) -ForegroundColor DarkGray }
@@ -1176,8 +1179,15 @@ function Screen-Servers {
 
         switch -Regex ($choice) {
             '^[Qq]$' { return 'exit' }
-            '^[Nn]$' { if (New-ServerProfile) { if (Connect-Server) { return 'ifaces' } } }
-            '^[Dd]$' { Remove-ServerProfile }
+            '^[Nn]$' {
+                # Пауза обязательна: следующий виток цикла зовёт Show-Banner с
+                # Clear-Host и стёр бы объяснение, почему не вышло.
+                if (New-ServerProfile) {
+                    if (Connect-Server) { return 'ifaces' }
+                }
+                Pause-Panel
+            }
+            '^[Dd]$' { Remove-ServerProfile; Pause-Panel }
             '^\d+$'  {
                 $idx = [int]$choice
                 if ($idx -ge 1 -and $idx -le $items.Count) {
@@ -1198,6 +1208,7 @@ function Connect-Server {
     Write-Host '  Проверяю доступ...' -ForegroundColor DarkGray
     Set-Iface 'awg0'
     $script:Peer = ''
+    $script:Connected = $false
     $probe = Invoke-Remote -CmdArgs @('names') -Quiet
 
     if (Test-HostKeyChanged $probe) {
@@ -1231,6 +1242,7 @@ function Connect-Server {
         }
         return $false
     }
+    $script:Connected = $true
     return $true
 }
 
@@ -1423,14 +1435,22 @@ function Screen-Peer {
 }
 
 function Show-Banner {
-    Clear-Host
+    # Clear-Host падает, когда вывода в консоль нет: под перенаправлением в
+    # файл, в конвейере, в чужом терминале без дескриптора. Экран тогда просто
+    # не очищается — это лучше, чем уронить панель на первой же перерисовке и
+    # лишить человека возможности прислать лог.
+    try { Clear-Host } catch { }
     Write-Host ''
     Write-Host '   ╔══════════════════════════════════════════════╗' -ForegroundColor Cyan
     Write-Host '   ║        AmneziaWG — панель управления         ║' -ForegroundColor Cyan
     Write-Host '   ╚══════════════════════════════════════════════╝' -ForegroundColor Cyan
     # Хлебные крошки: где мы находимся в дереве сервер → интерфейс → ключ.
     # Без них на третьем уровне неясно, к какому интерфейсу относятся ключи.
-    if ($VpsHost) {
+    #
+    # Показываются только после успешного входа: на экране серверов они
+    # печатали адрес прошлой (в том числе неудавшейся) попытки — панель
+    # выглядела подключённой к серверу, которого нет в списке.
+    if ($script:Connected -and $VpsHost) {
         $crumbs = "$VpsUser@$VpsHost`:$VpsPort"
         if ($script:Iface) { $crumbs += "  ›  $($script:Iface)" }
         if ($script:Peer)  { $crumbs += "  ›  $($script:Peer)" }
