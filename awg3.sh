@@ -972,6 +972,19 @@ _fix_owner() {
     chown "$owner" "$target" 2>/dev/null || true
 }
 
+# Владелец каталога берётся у РОДИТЕЛЯ — то есть у домашнего каталога того,
+# чьи это ключи.
+#
+# _fix_owner здесь не годится: он смотрит на сам AWG_DIR, а каталог второго и
+# следующих интерфейсов только что создан root'ом и остался бы root:root.
+# Человек не смог бы ни прочитать свой конфиг, ни забрать его через scp — при
+# том, что для awg0 всё работало, и разница выглядела бы необъяснимой.
+_own_dir_from_parent() {
+    local dir="$1" owner
+    owner=$(stat -c '%u:%g' "$(dirname -- "$dir")" 2>/dev/null) || return 0
+    chown "$owner" "$dir" 2>/dev/null || true
+}
+
 _backup_file() {
     local f="$1"
     [[ -f "$f" ]] || return 0
@@ -1683,7 +1696,7 @@ cmd_server_init() {
     ROLLBACK_ACTIVE=1
     trap '_rollback_server_init' EXIT
 
-    mkdir -p "$AWG_DIR"; chmod 700 "$AWG_DIR"; _fix_owner "$AWG_DIR"
+    mkdir -p "$AWG_DIR"; chmod 700 "$AWG_DIR"; _own_dir_from_parent "$AWG_DIR"
     generate_server_keys
 
     local address="$SRV_SUBNET"
@@ -2035,7 +2048,7 @@ cmd_list() {
     printf '%s\n' "СОВМЕСТИМ"
     printf '%s\n' "-------------------------------------------------------------------------------------"
 
-    local name conf addr hpk ver match c_s1 c_h1 layout
+    local name conf addr hpk ver match c_s1 c_h1 c_rtr layout
     while IFS= read -r name; do
         conf=$(client_conf_path "$name")
         if [[ "$conf" == "$AWG_DIR/$name/$name.conf" ]]; then
@@ -2048,9 +2061,17 @@ cmd_list() {
         c_s1=$(_conf_value "$conf" S1 interface)
         c_h1=$(_conf_value "$conf" H1 interface)
 
-        if [[ -n "$hpk" ]]; then ver="3.0"; else ver="2.0"; fi
+        c_rtr=$(_conf_value "$conf" RandomTrailers interface)
+        [[ -n "$c_rtr" ]] || c_rtr="off"
 
-        if [[ "$c_s1" == "${S_S1}" && "$c_h1" == "${S_H1}" && "$hpk" == "${S_HPK}" ]]; then
+        if [[ "$c_rtr" == "on" ]]; then ver="3.1"
+        elif [[ -n "$hpk" ]]; then ver="3.0"
+        else ver="—"; fi
+
+        # RandomTrailers сравнивается наравне с S1/H1/HeaderProtectionKey:
+        # рассинхрон по нему рвёт туннель так же полно и так же молча, а
+        # выданный до перехода на 3.1 конфиг выглядит совершенно исправным.
+        if [[ "$c_s1" == "${S_S1}" && "$c_h1" == "${S_H1}"               && "$hpk" == "${S_HPK}" && "$c_rtr" == "${S_RTR:-off}" ]]; then
             match="${C_GRN}да${C_OFF}"
         else
             match="${C_RED}нет — клиент не подключится${C_OFF}"

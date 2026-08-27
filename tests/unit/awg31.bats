@@ -386,3 +386,51 @@ need_awg() { command -v awg >/dev/null 2>&1 || skip "awg не установле
     i_dep=$(printf '%s\n' "$body" | grep -n 'die "нет обязательных команд' | head -1 | cut -d: -f1)
     [ "$i_root" -lt "$i_dep" ]
 }
+
+# ── Каталог второго интерфейса ──────────────────────────────────────────────
+
+@test "каталог интерфейса достаётся владельцу домашнего каталога, а не root" {
+    # Регрессия: каталог awg1 создавался root'ом, а _fix_owner брал владельца у
+    # него же — и оставлял root:root. Для awg0 всё работало (каталог уже был
+    # человека), и разница выглядела необъяснимой: свой конфиг с awg1 нельзя
+    # было ни прочитать, ни забрать через scp.
+    local home="$TEST_TMP/home/петя"
+    mkdir -p "$home"
+    local dir="$home/awg1"
+    mkdir -p "$dir"
+
+    # chown под обычным пользователем не сработает — проверяем, что владелец
+    # берётся у родителя, а не у самого каталога.
+    local body
+    body=$(sed -n '/^_own_dir_from_parent() {/,/^}/p' "$REPO_ROOT/awg3.sh")
+    [[ "$body" == *'dirname'* ]]
+    run _own_dir_from_parent "$dir"
+    [ "$status" -eq 0 ]
+}
+
+@test "server-init заводит каталог через _own_dir_from_parent" {
+    local body
+    body=$(sed -n '/^cmd_server_init() {/,/^}/p' "$REPO_ROOT/awg3.sh")
+    [[ "$body" == *_own_dir_from_parent* ]]
+    [[ "$body" != *'_fix_owner "$AWG_DIR"'* ]]
+}
+
+# ── Колонка версии и совместимости в list ───────────────────────────────────
+
+@test "клиент 3.1 показывается как 3.1, а не как 3.0" {
+    # Колонка досталась от времён, когда 2.0 и 3.0 сосуществовали, и печатала
+    # 3.0 для любого клиента с HeaderProtectionKey — включая свежий 3.1.
+    local body
+    body=$(sed -n '/^cmd_list() {/,/^}/p' "$REPO_ROOT/awg3.sh")
+    [[ "$body" == *'ver="3.1"'* ]]
+    [[ "$body" != *'ver="2.0"'* ]]
+}
+
+@test "совместимость учитывает RandomTrailers" {
+    # Рассинхрон по нему рвёт туннель так же полно и так же молча, как
+    # разошедшийся S1 — а конфиг, выданный до перехода на 3.1, выглядит
+    # совершенно исправным.
+    local body
+    body=$(sed -n '/^cmd_list() {/,/^}/p' "$REPO_ROOT/awg3.sh")
+    [[ "$body" == *'c_rtr" == "${S_RTR:-off}"'* ]]
+}
