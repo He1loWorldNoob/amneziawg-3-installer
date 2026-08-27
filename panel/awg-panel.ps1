@@ -835,14 +835,105 @@ function Action-Ifaces {
     Write-Host ''
     Write-Dim 'Интерфейсы независимы: свой порт, своя подсеть, свои клиенты.'
     Write-Host ''
-    $choice = (Read-Host '  Номер интерфейса для работы (Enter — оставить текущий)').Trim()
+    Write-Host '    N  создать новый интерфейс' -ForegroundColor DarkGray
+    Write-Host '    D  удалить интерфейс' -ForegroundColor DarkYellow
+    Write-Host ''
+    $choice = (Read-Host '  Номер интерфейса, N, D (Enter — оставить текущий)').Trim()
     if (-not $choice) { return }
+
+    if ($choice -match '^[nN]$') { Action-IfaceAdd;    return }
+    if ($choice -match '^[dD]$') { Action-IfaceRemove $rows; return }
+
     if ($choice -notmatch '^\d+$') { Write-Warn 'Нет такого пункта.'; return }
     $idx = [int]$choice
     if ($idx -lt 1 -or $idx -gt $rows.Count) { Write-Warn 'Нет такого пункта.'; return }
 
     Set-Iface $rows[$idx - 1][0]
     Write-Ok "Панель работает с интерфейсом $script:Iface (клиенты в $script:RemoteDir)."
+}
+
+# Создание интерфейса. Имя не спрашиваем: awg3 сам берёт первое свободное, и
+# придумывать его человеку незачем — важны порт и подсеть, а они у каждого
+# интерфейса свои, иначе смысла в нескольких нет.
+function Action-IfaceAdd {
+    Write-Head 'Новый интерфейс'
+    Write-Dim 'Интерфейсы независимы: свой порт, своя подсеть, свои общие параметры.'
+    Write-Dim 'Порт в фаерволе awg3 откроет сам.'
+    Write-Host ''
+
+    $port = (Read-Host '  UDP-порт (Enter — случайный)').Trim()
+    if ($port -and ($port -notmatch '^\d+$' -or [int]$port -lt 1 -or [int]$port -gt 65535)) {
+        Write-Err 'Порт должен быть числом от 1 до 65535.'
+        return
+    }
+    $subnet = (Read-Host '  Подсеть туннеля, например 10.9.1.1/24 (Enter — по умолчанию)').Trim()
+    if ($subnet -and $subnet -notmatch '^\d+\.\d+\.\d+\.\d+/\d+$') {
+        Write-Err 'Подсеть указывается как адрес сервера с маской: 10.9.1.1/24.'
+        return
+    }
+
+    # --iface здесь не нужен: `iface add` сам выбирает имя и работает с ним.
+    $cmdArgs = @('iface', 'add')
+    if ($port)   { $cmdArgs += @('--awg-port', $port) }
+    if ($subnet) { $cmdArgs += @('--subnet', $subnet) }
+    $cmdArgs += '-y'
+
+    Write-Host ''
+    $saved = $script:Iface
+    Set-Iface 'awg0'          # чтобы к команде не приклеился --iface текущего
+    $out = Invoke-Remote -CmdArgs $cmdArgs
+    Set-Iface $saved
+    if ($script:LastRc -ne 0) { return }
+
+    # Имя нового интерфейса берём из вывода: угадывать его на своей стороне
+    # значило бы дублировать правило выбора, которое живёт в awg3.
+    $match = $out | Select-String 'новый интерфейс: (awg\w+)' | Select-Object -First 1
+    $created = if ($match) { $match.Matches[0].Groups[1].Value } else { '' }
+    if ($created) {
+        Write-Host ''
+        if (Confirm-Action "Переключить панель на $created?") { Set-Iface $created }
+    }
+}
+
+# Удаление интерфейса. Вместе с ним исчезают клиенты и их ключи, поэтому
+# подтверждение строгое — набрать имя целиком, как при смене общих параметров.
+function Action-IfaceRemove {
+    param($Rows)
+
+    Write-Head 'Удалить интерфейс'
+    Write-Warn 'Вместе с интерфейсом исчезнут его клиенты и их ключи.'
+    Write-Host ''
+    for ($i = 0; $i -lt $Rows.Count; $i++) {
+        $r = $Rows[$i]
+        Write-Host ("   {0,2}  {1,-8} порт {2}, клиентов {3}" -f ($i + 1), $r[0], $r[1], $r[4])
+    }
+    Write-Host '    0  отмена' -ForegroundColor DarkGray
+    Write-Host ''
+    $choice = (Read-Host '  Номер').Trim()
+    if ($choice -notmatch '^\d+$') { Write-Dim 'Отменено.'; return }
+    $idx = [int]$choice
+    if ($idx -lt 1 -or $idx -gt $Rows.Count) { Write-Dim 'Отменено.'; return }
+    $target = $Rows[$idx - 1][0]
+
+    Write-Host ''
+    $word = Read-Host "  Наберите имя интерфейса целиком, чтобы подтвердить [$target]"
+    if ($word -cne $target) { Write-Dim 'Отменено.'; return }
+
+    Write-Host ''
+    $saved = $script:Iface
+    Set-Iface 'awg0'
+    Invoke-Remote -CmdArgs @('iface', 'remove', $target, '-y') | Out-Null
+    $rc = $script:LastRc
+    Set-Iface $saved
+    if ($rc -ne 0) { return }
+
+    # Панель могла стоять на удалённом интерфейсе — возвращаем её на awg0,
+    # иначе следующая же команда ушла бы в никуда.
+    if ($script:Iface -eq $target) {
+        Set-Iface 'awg0'
+        Write-Warn "Панель переключена на awg0: $target больше нет."
+    }
+    Write-Ok "Интерфейс $target удалён."
 }
 
 function Action-MigrateClient {

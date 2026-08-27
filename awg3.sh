@@ -935,6 +935,12 @@ validate_client_name() {
 }
 
 check_dependencies() {
+    # Root проверяется ПЕРВЫМ. iptables и awg лежат в /usr/sbin, которого нет
+    # в PATH обычного пользователя: без этой очерёдности запуск без sudo
+    # сообщал «нет обязательных команд: iptables» и отправлял искать пакет
+    # вместо того, чтобы сказать про права.
+    [[ "$EUID" -eq 0 ]] || die "нужны права root: sudo $0 ..."
+
     # Переменная цикла объявлена local: без этого она перетирает одноимённую
     # переменную вызывающей функции — область видимости в bash динамическая.
     local missing=() dep
@@ -943,7 +949,19 @@ check_dependencies() {
     done
     [[ "${#missing[@]}" -eq 0 ]] || die "нет обязательных команд: ${missing[*]}"
     [[ -r /dev/urandom ]] || die "/dev/urandom нечитаем"
-    [[ "$EUID" -eq 0 ]] || die "нужны права root (sudo -i)"
+
+    # Каталог данных awg0 — это каталог самого скрипта. Запущенный из
+    # распакованного репозитория, он сложил бы приватные ключи клиентов прямо
+    # в дерево исходников, а следующая распаковка поверх легла бы рядом с
+    # ними. Установленный экземпляр лежит в ~/awg, и там это ровно то, что
+    # нужно, — поэтому запрещаем только исходники.
+    if [[ -z "$AWG_DIR_EXPLICIT" && -f "$SCRIPT_DIR/install-awg3.sh" && -d "$SCRIPT_DIR/tests" ]]; then
+        log_err "запущен из каталога с исходниками: $SCRIPT_DIR"
+        log_err "Клиентские ключи легли бы сюда же. Поставьте и работайте с установленным:"
+        log_err "  sudo ./install-awg3.sh   (положит скрипт в ~/awg и даст awg3 в PATH)"
+        log_err "  sudo awg3 ..."
+        exit 1
+    fi
 }
 
 # Файлы должны остаться у владельца каталога awg, иначе старый
@@ -2573,6 +2591,104 @@ cmd_ifaces() {
     [[ "$found" -eq 1 ]] || log_warn "ни одного интерфейса в /etc/amnezia/amneziawg не найдено"
 }
 
+# ── Команда: iface ──────────────────────────────────────────────────────────
+#
+# Интерфейсами управляют одним набором: iface / iface add / iface remove.
+# Прежние имена (ifaces, server-init) остались псевдонимами — их знает панель
+# и помнят руки.
+
+# Первое свободное имя вида awgN. Считаем от awg0: занятым считается любой, у
+# которого есть конфиг, даже если сервис не запущен.
+next_free_iface() {
+    local n=0
+    while [[ -f "/etc/amnezia/amneziawg/awg${n}.conf" ]]; do
+        n=$(( n + 1 ))
+        (( n < 100 )) || die "не найдено свободное имя интерфейса"
+    done
+    printf 'awg%s' "$n"
+}
+
+# iface remove — снести интерфейс целиком.
+#
+# Удаляются и ключи клиентов: держать их без интерфейса незачем, а забытая
+# папка с приватными ключами хуже, чем её отсутствие. Поэтому спрашиваем, что
+# именно исчезнет, и показываем число клиентов до, а не после.
+cmd_iface_remove() {
+    local name="$1"
+    [[ -n "$name" ]] || die "укажите интерфейс: $0 iface remove awgN"
+    [[ "$name" =~ ^[A-Za-z][A-Za-z0-9_-]{0,14}$ ]] || die "недопустимое имя: $name"
+
+    local conf="/etc/amnezia/amneziawg/${name}.conf"
+    [[ -f "$conf" ]] || die "интерфейс $name не найден: $conf"
+
+    # Каталог клиентов вычисляется по тем же правилам, что и везде.
+    local dir
+    if [[ "$name" == "awg0" ]]; then dir="$SCRIPT_DIR"; else dir="$(dirname -- "$SCRIPT_DIR")/$name"; fi
+
+    local clients port
+    clients=$(grep -c '^[[:space:]]*\[Peer\]' "$conf" 2>/dev/null) || clients=0
+    port=$(awk -F'=' '/^[[:space:]]*\[Peer\]/{exit} /^[[:space:]]*ListenPort[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$conf")
+
+    log_warn "Будет удалён интерфейс ${name}:"
+    log "  конфиг:   $conf"
+    log "  клиентов: $clients — их конфиги и ключи тоже"
+    if [[ "$name" == "awg0" ]]; then
+        log "  каталог:  $dir (только подкаталоги клиентов, сам каталог остаётся)"
+    else
+        log "  каталог:  $dir целиком"
+    fi
+    [[ -z "$port" ]] || log "  порт:     ${port}/udp — правило ufw будет снято"
+    confirm "Удалить $name?" || die "отменено"
+
+    systemctl disable --now "awg-quick@${name}" 2>/dev/null         || log_warn "сервис awg-quick@${name} не остановился — проверьте вручную"
+
+    if [[ -n "$port" ]] && command -v ufw >/dev/null 2>&1; then
+        ufw delete allow "${port}/udp" >/dev/null 2>&1             && log "ufw: снято правило ${port}/udp" || true
+        ufw route delete allow in on "$name" >/dev/null 2>&1 || true
+    fi
+
+    _backup_file "$conf"
+    rm -f "$conf" || die "не удалён $conf"
+
+    # awg0 живёт в каталоге скрипта: снести его целиком нельзя — там сам
+    # awg3.sh. Удаляем только каталоги клиентов, перечисленные в конфиге.
+    if [[ "$name" == "awg0" ]]; then
+        local peer
+        while IFS= read -r peer; do
+            [[ -n "$peer" ]] || continue
+            rm -rf "${dir:?}/${peer}"
+        done < <(grep '^#_Name = ' "$BACKUP_LAST" 2>/dev/null | sed 's/^#_Name = //')
+    else
+        rm -rf "${dir:?}"
+    fi
+
+    log_ok "интерфейс $name удалён (конфиг сохранён в $BACKUP_LAST)"
+}
+
+cmd_iface() {
+    local sub="${1:-list}"
+    case "$sub" in
+        list|"")
+            cmd_ifaces
+            ;;
+        add)
+            local name="${2:-}"
+            [[ -n "$name" ]] || name=$(next_free_iface)
+            [[ "$name" =~ ^[A-Za-z][A-Za-z0-9_-]{0,14}$ ]] || die "недопустимое имя: $name"
+            AWG_IFACE="$name"
+            resolve_paths
+            log "новый интерфейс: $AWG_IFACE"
+            cmd_server_init
+            ;;
+        remove|rm|delete)
+            cmd_iface_remove "${2:-}"
+            ;;
+        *)
+            die "неизвестное действие: iface $sub  (list, add, remove)"
+            ;;
+    esac
+}
+
 # ── Команда: server-rekey ───────────────────────────────────────────────────
 
 cmd_server_rekey() {
@@ -2670,7 +2786,10 @@ awg3.sh ${SCRIPT_VERSION} — AmneziaWG ${AWG_PROTOCOL}: клиенты и па�
     gen                   вывести готовый набор параметров AWG 3.1
     server-init           создать сервер AWG 3.1 с нуля
     set-endpoint HOST     сменить имя хоста для новых клиентских конфигов
-    ifaces                список серверных интерфейсов
+    iface [list]          список серверных интерфейсов (то же, что ifaces)
+    iface add [NAME]      создать интерфейс; без имени берётся первое свободное
+    iface remove NAME     снести интерфейс: сервис, правило ufw, конфиг и
+                          клиентов вместе с ключами
     migrate-client N --to IFACE
                           завести клиента на другом интерфейсе, сохранив его ключ
     server-rekey          сгенерировать новые общие параметры интерфейса
@@ -2744,7 +2863,7 @@ main() {
     local cmd="$1"; shift
     case "$cmd" in
         -h|--help|help) usage; exit 0 ;;
-        add|remove|link|list|names|stats|show|restart|backup|gen|migrate|server-rekey|server-init|set-endpoint|ifaces|migrate-client) ;;
+        add|remove|link|list|names|stats|show|restart|backup|gen|migrate|server-rekey|server-init|set-endpoint|iface|ifaces|migrate-client) ;;
         server-upgrade) cmd=server-rekey ;;
         *) die "неизвестная команда: ${cmd}  (см. --help)" ;;
     esac
@@ -2824,6 +2943,7 @@ main() {
         migrate)        cmd_migrate ;;
         server-rekey)   cmd_server_rekey ;;
         ifaces)         cmd_ifaces ;;
+        iface)          cmd_iface "${positional[@]+"${positional[@]}"}" ;;
         migrate-client)
             [[ "${#positional[@]}" -eq 1 ]] || die "migrate-client принимает ровно одно имя клиента"
             cmd_migrate_client "${positional[0]}"

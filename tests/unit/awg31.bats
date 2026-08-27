@@ -298,3 +298,91 @@ need_awg() { command -v awg >/dev/null 2>&1 || skip "awg не установле
     [[ "$body" != *"|| printf 'unknown'"* ]]
     [[ "$body" != *"|| printf '0'"* ]]
 }
+
+# ── Группа iface ────────────────────────────────────────────────────────────
+
+@test "iface без действия показывает список" {
+    cmd_ifaces() { echo "СПИСОК"; }
+    run cmd_iface
+    [ "$status" -eq 0 ]
+    [ "$output" = "СПИСОК" ]
+}
+
+@test "iface list — то же самое" {
+    cmd_ifaces() { echo "СПИСОК"; }
+    run cmd_iface list
+    [ "$output" = "СПИСОК" ]
+}
+
+@test "iface add без имени берёт первое свободное" {
+    next_free_iface() { echo "awg7"; }
+    cmd_server_init() { echo "создан:$AWG_IFACE"; }
+    resolve_paths() { :; }
+    run cmd_iface add
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"создан:awg7"* ]]
+}
+
+@test "iface add с именем берёт его" {
+    cmd_server_init() { echo "создан:$AWG_IFACE"; }
+    resolve_paths() { :; }
+    run cmd_iface add awg3
+    [[ "$output" == *"создан:awg3"* ]]
+}
+
+@test "iface add отвергает недопустимое имя" {
+    # Имя уходит в путь к файлу и в systemctl: awg-quick@ принимает только
+    # это подмножество.
+    cmd_server_init() { :; }
+    resolve_paths() { :; }
+    run cmd_iface add "awg 1; rm -rf /"
+    [ "$status" -ne 0 ]
+}
+
+@test "iface remove без имени не угадывает, а требует его" {
+    run cmd_iface_remove ""
+    [ "$status" -ne 0 ]
+}
+
+@test "iface remove на несуществующем интерфейсе отказывается" {
+    run cmd_iface_remove awg9
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"не найден"* ]]
+}
+
+@test "неизвестное действие iface отвергается" {
+    run cmd_iface нечто
+    [ "$status" -ne 0 ]
+}
+
+@test "прежние имена команд остались псевдонимами" {
+    # Их знает панель и помнят руки: ломать незачем.
+    local body
+    body=$(sed -n '/^main() {/,/^}/p' "$REPO_ROOT/awg3.sh")
+    [[ "$body" == *"ifaces)"* ]]
+    [[ "$body" == *"server-init)"* ]]
+    [[ "$body" == *"server-upgrade) cmd=server-rekey"* ]]
+}
+
+# ── Запуск не из того каталога ──────────────────────────────────────────────
+
+@test "запуск из каталога с исходниками запрещён" {
+    # Каталог данных awg0 — каталог самого скрипта. Из распакованного
+    # репозитория приватные ключи клиентов легли бы в дерево исходников.
+    run bash -c "cd '$REPO_ROOT' && AWG3_DIR= AWG3_SERVER_CONF= ./awg3.sh list 2>&1"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"исходниками"* ]] || [[ "$output" == *"root"* ]]
+}
+
+@test "права root проверяются раньше зависимостей" {
+    # iptables лежит в /usr/sbin, которого нет в PATH обычного пользователя:
+    # без этой очерёдности запуск без sudo советовал искать пакет.
+    local body
+    body=$(sed -n '/^check_dependencies() {/,/^}/p' "$REPO_ROOT/awg3.sh")
+    local i_root i_dep
+    i_root=$(printf '%s\n' "$body" | grep -n 'EUID' | head -1 | cut -d: -f1)
+    # Ищем именно вызов die: та же фраза стоит в комментарии выше, и по ней
+    # проверка порядка нашла бы комментарий вместо кода.
+    i_dep=$(printf '%s\n' "$body" | grep -n 'die "нет обязательных команд' | head -1 | cut -d: -f1)
+    [ "$i_root" -lt "$i_dep" ]
+}
