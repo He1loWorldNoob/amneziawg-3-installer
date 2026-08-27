@@ -3,7 +3,9 @@
 Развёртывание AmneziaWG 3.1 на сервере с полного нуля: подготовка системы,
 установка AmneziaWG, создание 3.1-конфигурации и управление клиентами.
 
-Промежуточной стадии 2.0 нет — сервер создаётся сразу в 3.1.
+Три скрипта, три задачи: `bootstrap.sh` готовит систему, `install-awg3.sh`
+ставит AmneziaWG, `awg3` создаёт и ведёт интерфейсы. Промежуточных версий
+протокола нет — интерфейс всегда 3.1.
 
 Проверено на Ubuntu 24.04 и Debian 13: развёртывание с нуля, подключение
 клиента с реальным трафиком, обновление ядра с пересборкой модуля,
@@ -14,8 +16,8 @@
 | Файл | Назначение |
 |---|---|
 | `bootstrap.sh` | подготовка свежего сервера: обновление, `sudo`, новый sudo-пользователь, SSH-порт, отключение root по SSH, фаервол |
-| `install-awg3.sh` | пакеты, DKMS-модуль, фаервол, запуск `server-init`; форк [bivlked/amneziawg-installer](https://github.com/bivlked/amneziawg-installer) v5.23.0 |
-| `awg3.sh` | `server-init`, `add`, `remove`, `link`, `list`, `stats`, `backup`, `show`, `restart`, `ifaces`, `migrate-client` |
+| `install-awg3.sh` | пакеты, DKMS-модуль, общая часть фаервола; конфигурацию не трогает. Форк [bivlked/amneziawg-installer](https://github.com/bivlked/amneziawg-installer) v5.23.0 |
+| `awg3.sh` | интерфейсы и клиенты: `server-init`, `add`, `remove`, `link`, `list`, `stats`, `backup`, `show`, `restart`, `ifaces`, `migrate-client`, `server-rekey` |
 | `panel/` | необязательная панель управления с Windows: то же самое, но меню вместо SSH-команд |
 
 ## Требования
@@ -43,33 +45,39 @@ git clone https://github.com/He1loWorldNoob/amneziawg-3-installer.git
 cd amneziawg-3-installer
 ```
 
-Дальше два шага, между ними — переподключение под новым пользователем:
+Дальше три команды, у каждой своя задача. Между первой и второй —
+переподключение под новым пользователем: это и есть проверка, что доступ
+работает, до того как root будет закрыт.
 
 ```bash
-# под root
+# 1. подготовка системы (под root)
 sudo ./bootstrap.sh --user vpnadmin --ssh-port 2222 --disable-root-ssh yes
+
 # переподключиться: ssh -p 2222 vpnadmin@СЕРВЕР, затем снова скачать репозиторий
-sudo ./install-awg3.sh --mode awg-only
-sudo awg3 add my_phone          # QR и ссылка vpn:// лягут рядом с конфигом
-```
 
-Либо одной командой с меню:
-
-```bash
+# 2. установка AmneziaWG: пакеты и модуль ядра, про VPN не спрашивает ничего
 sudo ./install-awg3.sh
+
+# 3. создать интерфейс — спросит порт, подсеть, IPv6 и остальное
+sudo awg3 server-init
+
+# и выдать клиента: QR и ссылка vpn:// лягут рядом с конфигом
+sudo awg3 add my_phone
 ```
 
-Полностью без вопросов:
+Второй шаг может потребовать перезагрузки — если обновилось ядро. После неё
+запустите ту же команду ещё раз, она продолжит с нужного места.
+
+Всё без вопросов:
 
 ```bash
-sudo ./install-awg3.sh --mode full --user vpnadmin --password-file /root/pw \
-    --ssh-port 2222 --disable-root-ssh yes \
-    --awg-port 48872 --subnet 10.9.9.1/24 --isolation off \
-    --clients my_phone,my_laptop --yes
+sudo ./install-awg3.sh --yes
+sudo awg3 server-init -y --awg-port 48872 --subnet 10.9.9.1/24 --isolation off
+sudo awg3 add my_phone -y
 ```
 
-Пароль передаётся только файлом или интерактивно — аргументы командной
-строки видны в `ps` любому пользователю системы.
+Пароль в `bootstrap.sh` передаётся только файлом или интерактивно — аргументы
+командной строки видны в `ps` любому пользователю системы.
 
 ## Как это устроено
 
@@ -115,9 +123,11 @@ sudo ./install-awg3.sh --mode full --user vpnadmin --password-file /root/pw \
 рвёт туннель целиком. `DisableCookies` запрещает отвечать на cookie-запросы и,
 наоборот, односторонний.
 
-Оба включены по умолчанию; `--random-trailers off` оставляет интерфейс на 3.0
-ради приложений Amnezia старше 5.0.1.5. Нужен клиент 5.0.1.5+, модуль и
-`amneziawg-tools` версии 3.1 — версии проверяются до записи конфига.
+Выключателей у них нет: 3.0 из проекта убран. Нужен клиент Amnezia 5.0.1.5+, а
+на сервере модуль и `amneziawg-tools` версии 3.1 — версии проверяются до записи
+конфига. Интерфейс, созданный до 3.1, `awg3` опознаёт и не даёт выдать на нём
+клиента, пока не прошёл `server-rekey`: рассинхрон `RandomTrailers` рвёт туннель
+молча, без единой ошибки.
 
 Интерфейсов может быть несколько, и они независимы: свой порт, подсеть, общие
 параметры и каталог клиентов (`~/awg` у `awg0`, `~/awg1` у `awg1`).
@@ -127,6 +137,9 @@ sudo awg3 --iface awg1 server-init --awg-port 51840 --subnet 10.9.1.1/24
 sudo awg3 ifaces
 sudo awg3 --iface awg0 migrate-client ivan --to awg1
 ```
+
+Порт в `ufw` и, если нужен IPv6, снятие его глобального отключения в `sysctl` —
+тоже работа `server-init`: он один знает, какой порт у какого интерфейса.
 
 `migrate-client` заводит клиента на другом интерфейсе с тем же ключом и
 **не удаляет** его со старого: прежняя ссылка работает, пока человек не
@@ -161,7 +174,7 @@ sudo apt-get install -y bats shellcheck
 ./tests/run.sh postup   # только tests/unit/postup.bats
 ```
 
-202 юнит-теста. Плюс интеграционные прогоны на живых Ubuntu 24.04 и
+220 юнит-тестов. Плюс интеграционные прогоны на живых Ubuntu 24.04 и
 Debian 13, включая реальное подключение клиента и проверку после
 перезагрузки — журнал и список найденных ими дефектов в
 [`tests/integration/README.md`](tests/integration/README.md).

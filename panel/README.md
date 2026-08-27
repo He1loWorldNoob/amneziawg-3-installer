@@ -49,8 +49,7 @@ SSH-команд.
 там (`5`).
 
 Создать сам интерфейс панель не умеет: это разовая операция на сервере,
-`sudo awg3 --iface awg1 server-init --awg-port ... --subnet ...` плюс
-`sudo ufw allow` на его порт.
+`sudo awg3 --iface awg1 server-init`. Порт в фаерволе он открывает сам.
 
 ## Запуск
 
