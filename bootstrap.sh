@@ -95,9 +95,52 @@ os_supported() {
 
 # Аргумент нужен тестам, в бою используется путь по умолчанию.
 # shellcheck disable=SC2120
+# Сборка ядра: то, что отличает cloud-amd64 от amd64 и generic от lowlatency.
+# Ubuntu вставляет между версией и сборкой ABI-номер (6.8.0-51-generic) — он к
+# сборке не относится и выбрасывается, иначе каждое обновление выглядело бы
+# сменой сборки.
+kernel_flavor() {
+    local rest="${1#*-}"
+    if [[ "$rest" =~ ^[0-9]+- ]]; then rest="${rest#*-}"; fi
+    printf '%s' "$rest"
+}
+
+# kernel_upgrade_pending [работающее ядро] [каталог модулей]
+#
+# Установлено ли ядро свежее работающего. Сравниваются только ядра ТОЙ ЖЕ
+# сборки: cloud-amd64 и amd64 лежат рядом, и переход между ними перезагрузкой
+# не случается.
+# shellcheck disable=SC2120  # в bootstrap зовётся без аргументов, bats передаёт свои
+kernel_upgrade_pending() {
+    local running="${1:-$(uname -r)}" dir="${2:-/lib/modules}"
+    local flavor entry newest
+    local -a found=()
+    [[ -d "$dir" ]] || return 1
+    flavor=$(kernel_flavor "$running")
+
+    # Перебор глобом, а не `ls | grep`: имена каталогов приходят от пакетов, и
+    # полагаться на то, что в них не окажется пробела, незачем.
+    for entry in "$dir"/*"-${flavor}"; do
+        [[ -d "$entry" ]] || continue
+        found+=("$(basename "$entry")")
+    done
+    [[ "${#found[@]}" -gt 0 ]] || return 1
+
+    newest=$(printf '%s\n' "${found[@]}" | sort -V | tail -1)
+    [[ -n "$newest" && "$newest" != "$running" ]]
+}
+
+# Нужна ли перезагрузка.
+#
+# Маркер /var/run/reboot-required создаёт update-notifier, которого в облачных
+# образах Debian нет: после смены ядра файла не появится, и bootstrap молчал —
+# а потом установщик собирал модуль под новое ядро и всё равно требовал
+# перезагрузку. Поэтому вторым признаком смотрим на сами ядра.
+# shellcheck disable=SC2120  # маркер подменяется только в тестах
 reboot_required() {
     local marker="${1:-/var/run/reboot-required}"
-    [[ -f "$marker" ]]
+    [[ -f "$marker" ]] && return 0
+    kernel_upgrade_pending
 }
 
 apt_upgrade_system() {
