@@ -228,3 +228,28 @@ EOF
     run confirm_new_access 203.0.113.10 2222 admin
     [ "$status" -eq 0 ]
 }
+
+# ── Вход по паролю ──────────────────────────────────────────────────────────
+
+@test "вход по паролю разрешается явно" {
+    # Скрипт заводит пользователя именно с паролем и дважды его спрашивает.
+    # Облачные образы Debian и Ubuntu приходят с PasswordAuthentication no —
+    # без этой строки войти заданным паролем нельзя нигде, а узнаёт об этом
+    # человек уже отключившись.
+    write_sshd_dropin 2222 "no"
+    grep -qx "PasswordAuthentication yes" "$SSHD_DROPIN"
+    grep -qx "PermitRootLogin no" "$SSHD_DROPIN"
+}
+
+@test "файл конфига читается раньше облачных настроек" {
+    # sshd берёт ПЕРВОЕ вхождение ключа, файлы каталога читаются по алфавиту:
+    # 99-awg3-hardening.conf проигрывал бы 60-cloudimg-settings.conf молча.
+    [[ "$(basename "$SSHD_DROPIN")" < "60-cloudimg-settings.conf" ]]
+}
+
+@test "прежний файл конфига убирается" {
+    # Оставленный, он продолжал бы задавать порт и root-вход своими значениями.
+    printf 'Port 22\n' > "$SSHD_DROPIN_LEGACY"
+    write_sshd_dropin 2222 "no"
+    [ ! -f "$SSHD_DROPIN_LEGACY" ]
+}

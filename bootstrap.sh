@@ -37,7 +37,14 @@ NEEDS_REBOOT=0
 ROOT_SSH_DISABLED=0
 SERVER_ADDR=""
 SUMMARY_FILE=""
-SSHD_DROPIN="/etc/ssh/sshd_config.d/99-awg3-hardening.conf"
+# Имя начинается с 00 не для красоты: sshd берёт ПЕРВОЕ вхождение каждого
+# ключа, а файлы каталога читаются по алфавиту. Облачные образы кладут туда
+# свои настройки (у Ubuntu это 60-cloudimg-settings.conf с
+# PasswordAuthentication no), и файл с номером 99 проиграл бы им молча.
+SSHD_DROPIN="/etc/ssh/sshd_config.d/00-awg3.conf"
+# Как файл назывался раньше: удаляется при записи, иначе на сервере остались бы
+# два конфига с расходящимися значениями.
+SSHD_DROPIN_LEGACY="/etc/ssh/sshd_config.d/99-awg3-hardening.conf"
 SSH_SOCKET_DROPIN="/etc/systemd/system/ssh.socket.d/99-awg3-port.conf"
 
 # ── Вывод ───────────────────────────────────────────────────────────────────
@@ -428,11 +435,24 @@ write_sshd_dropin() {
     {
         printf '# Создано bootstrap.sh (awg3-deploy). Правки будут перезаписаны.\n'
         printf 'Port %s\n' "$port"
+        # Вход по паролю разрешён намеренно. Этот скрипт заводит пользователя
+        # именно с паролем — и дважды его спрашивает; если sshd пароль не
+        # принимает, войти этим паролем нельзя нигде, а человек об этом узнаёт
+        # уже отключившись. Облачные образы Debian и Ubuntu приходят с
+        # PasswordAuthentication no, поэтому значение задаётся явно.
+        #
+        # Цена — перебор паролей по SSH. Против него здесь же: нестандартный
+        # порт, `ufw limit` на него и fail2ban.
+        printf 'PasswordAuthentication yes\n'
         if [[ -n "$root_login" ]]; then
             printf 'PermitRootLogin %s\n' "$root_login"
         fi
     } > "$SSHD_DROPIN"
     chmod 644 "$SSHD_DROPIN"
+
+    # Прежний файл с другим именем: оставленный, он продолжал бы задавать порт
+    # и root-вход своими значениями.
+    [[ ! -f "$SSHD_DROPIN_LEGACY" ]] || rm -f "$SSHD_DROPIN_LEGACY"
 }
 
 # Порт для socket activation задаётся в юните, а не в sshd_config.
@@ -611,6 +631,7 @@ write_summary() {
         fi
         printf '\nПодключение:\n    ssh -p %s %s@%s\n' "$NEW_SSH_PORT" "$NEW_USER" "$SERVER_ADDR"
         printf '\nСОХРАНИТЕ ЭТИ ДАННЫЕ. Пароль пользователя восстановить нельзя.\n'
+        printf 'Вход по паролю на этом порту разрешён, вход root по SSH закрыт.\n'
         if [[ "$NEEDS_REBOOT" -eq 1 ]]; then
             printf '\nОбновилось ядро — перезагрузите сервер: sudo reboot\n'
         fi
