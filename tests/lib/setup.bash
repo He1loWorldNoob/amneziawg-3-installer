@@ -13,9 +13,10 @@ setup_awg3() {
     TEST_TMP="$(mktemp -d)"
     export TEST_TMP
 
+    # AWG3_DIR — корень данных; клиенты живут в подкаталоге интерфейса.
     export AWG3_DIR="$TEST_TMP/awg"
     export AWG3_SERVER_CONF="$TEST_TMP/awg0.conf"
-    mkdir -p "$AWG3_DIR"
+    mkdir -p "$AWG3_DIR/awg0"
 
     AWG3_LIB_ONLY=1 source "$REPO_ROOT/awg3.sh"
 }

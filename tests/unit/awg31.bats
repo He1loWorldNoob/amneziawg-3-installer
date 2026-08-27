@@ -140,31 +140,44 @@ EOF
 
 # ── Пути по интерфейсу ──────────────────────────────────────────────────────
 
-@test "awg0 остаётся в каталоге скрипта, остальные — рядом по имени" {
+@test "каждый интерфейс — свой каталог внутри корня" {
     # Переменные окружения из setup перекрывают вычисление, поэтому для этой
     # проверки их надо снять: иначе тест мерил бы не то.
-    AWG_DIR_EXPLICIT="" SERVER_CONF_EXPLICIT="" SCRIPT_DIR="/home/user/awg"
+    AWG_ROOT_EXPLICIT="" SERVER_CONF_EXPLICIT="" SCRIPT_DIR="/home/user/awg"
 
     AWG_IFACE=awg0; resolve_paths
-    [ "$AWG_DIR" = "/home/user/awg" ]
+    [ "$AWG_ROOT" = "/home/user/awg" ]
+    [ "$AWG_DIR" = "/home/user/awg/awg0" ]
     [ "$SERVER_CONF" = "/etc/amnezia/amneziawg/awg0.conf" ]
 
     AWG_IFACE=awg1; resolve_paths
-    [ "$AWG_DIR" = "/home/user/awg1" ]
+    [ "$AWG_ROOT" = "/home/user/awg" ]
+    [ "$AWG_DIR" = "/home/user/awg/awg1" ]
     [ "$SERVER_CONF" = "/etc/amnezia/amneziawg/awg1.conf" ]
 }
 
-@test "заданные переменные окружения сильнее вычисления по интерфейсу" {
+@test "клиент с именем интерфейса больше ни с чем не сталкивается" {
+    # В прежней раскладке клиент awg1 на awg0 занял бы каталог интерфейса.
+    AWG_ROOT_EXPLICIT="" SERVER_CONF_EXPLICIT="" SCRIPT_DIR="/home/user/awg"
+    AWG_IFACE=awg0; resolve_paths
+    [ "$(client_dir awg1)" = "/home/user/awg/awg0/awg1" ]
     AWG_IFACE=awg1; resolve_paths
-    [ "$AWG_DIR" = "$AWG3_DIR" ]
+    [ "$AWG_DIR" = "/home/user/awg/awg1" ]
+}
+
+@test "заданная переменная окружения задаёт корень, а не каталог интерфейса" {
+    AWG_IFACE=awg1; resolve_paths
+    [ "$AWG_ROOT" = "$AWG3_DIR" ]
+    [ "$AWG_DIR" = "$AWG3_DIR/awg1" ]
     [ "$SERVER_CONF" = "$AWG3_SERVER_CONF" ]
 }
 
-@test "журнал и каталог старых ключей едут вместе с интерфейсом" {
-    AWG_DIR_EXPLICIT="" SERVER_CONF_EXPLICIT="" SCRIPT_DIR="/home/user/awg"
+@test "журнал и каталог старых ключей лежат в корне, а не у интерфейса" {
+    # Журнал один на все интерфейсы: он про работу скрипта, а не про туннель.
+    AWG_ROOT_EXPLICIT="" SERVER_CONF_EXPLICIT="" SCRIPT_DIR="/home/user/awg"
     AWG_IFACE=awg1; resolve_paths
-    [ "$LOG_FILE" = "/home/user/awg1/awg3.log" ]
-    [ "$LEGACY_KEYS_DIR" = "/home/user/awg1/keys" ]
+    [ "$LOG_FILE" = "/home/user/awg/awg3.log" ]
+    [ "$LEGACY_KEYS_DIR" = "/home/user/awg/keys" ]
 }
 
 # ── server-rekey ────────────────────────────────────────────────────────────
@@ -433,4 +446,67 @@ need_awg() { command -v awg >/dev/null 2>&1 || skip "awg не установле
     local body
     body=$(sed -n '/^cmd_list() {/,/^}/p' "$REPO_ROOT/awg3.sh")
     [[ "$body" == *'c_rtr" == "${S_RTR:-off}"'* ]]
+}
+
+# ── Перенос на раскладку по интерфейсам ─────────────────────────────────────
+
+@test "list видит клиента прежней раскладки awg0" {
+    # До раскладки по интерфейсам awg0 держал клиентов прямо в корне.
+    mkdir -p "$AWG_ROOT/старый"
+    printf '[Interface]\nAddress = 10.9.9.5/32\n' > "$AWG_ROOT/старый/старый.conf"
+    run list_client_names
+    [[ "$output" == *"старый"* ]]
+}
+
+@test "на другом интерфейсе чужие клиенты из корня не показываются" {
+    # Иначе awg1 «унаследовал» бы клиентов awg0 — они бы и не подключились,
+    # и запутали бы список.
+    mkdir -p "$AWG_ROOT/старый"
+    printf '[Interface]\nAddress = 10.9.9.5/32\n' > "$AWG_ROOT/старый/старый.conf"
+    AWG_IFACE=awg1; resolve_paths
+    mkdir -p "$AWG_DIR"
+    run list_client_names
+    [[ "$output" != *"старый"* ]]
+}
+
+@test "migrate переносит клиента из корня в каталог интерфейса" {
+    mkdir -p "$AWG_ROOT/старый"
+    printf '[Interface]\nAddress = 10.9.9.5/32\n' > "$AWG_ROOT/старый/старый.conf"
+    printf 'КЛЮЧ\n' > "$AWG_ROOT/старый/старый.private"
+
+    ASSUME_YES=1
+    run cmd_migrate
+    [ "$status" -eq 0 ]
+    [ -f "$AWG_DIR/старый/старый.conf" ]
+    [ -f "$AWG_DIR/старый/старый.private" ]
+    [ ! -d "$AWG_ROOT/старый" ]
+}
+
+@test "migrate забирает и ключи сервера, забытые в корне" {
+    # Приватный ключ, оставленный в корне, ничем не управляется и никому не
+    # нужен — но лежит рядом с данными всех интерфейсов.
+    printf 'PRIV\n' > "$AWG_ROOT/server_private.key"
+    printf 'PUB\n'  > "$AWG_ROOT/server_public.key"
+
+    ASSUME_YES=1
+    run cmd_migrate
+    [ "$status" -eq 0 ]
+    [ -f "$AWG_DIR/server_private.key" ]
+    [ -f "$AWG_DIR/server_public.key" ]
+    [ ! -f "$AWG_ROOT/server_private.key" ]
+}
+
+@test "migrate на уже разложенном каталоге ничего не делает" {
+    ASSUME_YES=1
+    run cmd_migrate
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"переносить нечего"* ]]
+}
+
+@test "бэкапы лежат в корне, а не у каждого интерфейса" {
+    # Архив собирает конфиги всех интерфейсов — держать его внутри одного из
+    # них значило бы потерять его вместе с этим интерфейсом.
+    local body
+    body=$(sed -n '/^cmd_backup() {/,/^}/p' "$REPO_ROOT/awg3.sh")
+    [[ "$body" == *'bdir="$AWG_ROOT/backups"'* ]]
 }

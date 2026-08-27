@@ -35,21 +35,26 @@ modprobe: ERROR: could not insert 'amneziawg': Key was rejected by service
 интерактивная процедура при каждой загрузке.
 
 **Как получить файлы на сервере.** Всё выполняется на самом сервере, копировать
-с локальной машины ничего не нужно:
+с локальной машины ничего не нужно. Каждый шаг качает своё — целиком репозиторий
+нужен только для тестов и панели:
 
 ```bash
-# без git — на свежем сервере его может не быть
+# шаг 1: один самодостаточный файл
+curl -fsSLO https://raw.githubusercontent.com/He1loWorldNoob/amneziawg-3-installer/main/bootstrap.sh
+
+# шаг 2: два файла рядом
+curl -fsSLO https://raw.githubusercontent.com/He1loWorldNoob/amneziawg-3-installer/main/install-awg3.sh \
+     -O https://raw.githubusercontent.com/He1loWorldNoob/amneziawg-3-installer/main/awg3.sh
+chmod +x install-awg3.sh awg3.sh
+
+# весь репозиторий, если нужны тесты и панель
 curl -fsSL https://github.com/He1loWorldNoob/amneziawg-3-installer/archive/refs/heads/main.tar.gz \
   | tar -xz && cd amneziawg-3-installer-main
-
-# либо, если git установлен
-git clone https://github.com/He1loWorldNoob/amneziawg-3-installer.git
-cd amneziawg-3-installer
 ```
 
-Если между шагами вы меняли пользователя (`bootstrap.sh` создаёт нового),
-скачайте репозиторий заново уже под ним — каталог остаётся в домашней папке
-того, кто скачивал.
+Между шагами меняется пользователь — `bootstrap.sh` создаёт нового, — поэтому
+файлы второго шага качаются уже под ним. Одно и то же дважды скачивать не
+приходится: у шагов разные файлы.
 
 ---
 
@@ -70,8 +75,12 @@ AmneziaWG в это не лезет вовсе.
 это и есть проверка, что доступ работает, до того как root будет закрыт.
 
 ```bash
-sudo ./bootstrap.sh --user vpnadmin --ssh-port 2222 --disable-root-ssh yes
+curl -fsSLO https://raw.githubusercontent.com/He1loWorldNoob/amneziawg-3-installer/main/bootstrap.sh
+sudo bash bootstrap.sh --user vpnadmin --ssh-port 2222 --disable-root-ssh yes
 ```
+
+`bootstrap.sh` самодостаточен — качается одним файлом и ничего рядом не
+требует. Репозиторий целиком нужен только для тестов и панели.
 
 Скрипт спросит пароль для нового пользователя (дважды) и, перед отключением
 root, остановится с требованием проверить новый доступ:
@@ -105,13 +114,15 @@ fail2ban, сносит лишние для сервера пакеты. Не н�
 
 ### Шаг 2 — установка AmneziaWG
 
-Уже под новым пользователем:
+Уже под новым пользователем. Скачивать заново то, что качали на первом шаге, не
+нужно: у каждого шага свои файлы.
 
 ```bash
 ssh -p 2222 vpnadmin@СЕРВЕР
-# скачайте репозиторий заново — он остался в домашней папке того, кто
-# скачивал его на первом шаге
-curl -fsSL https://github.com/He1loWorldNoob/amneziawg-3-installer/archive/refs/heads/main.tar.gz   | tar -xz && cd amneziawg-3-installer-main
+# два файла рядом: установщик кладёт awg3.sh в ~/awg и даёт awg3 в PATH
+curl -fsSLO https://raw.githubusercontent.com/He1loWorldNoob/amneziawg-3-installer/main/install-awg3.sh \
+     -O https://raw.githubusercontent.com/He1loWorldNoob/amneziawg-3-installer/main/awg3.sh
+chmod +x install-awg3.sh awg3.sh
 sudo ./install-awg3.sh
 ```
 

@@ -53,31 +53,32 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
 # Явно заданные переменные окружения сильнее вычисления по интерфейсу: ими
 # пользуются юнит-тесты и прогон на копии конфига. Запоминаем факт задания
 # отдельно, иначе --iface затирал бы их при пересчёте.
-AWG_DIR_EXPLICIT="${AWG3_DIR:-}"
+AWG_ROOT_EXPLICIT="${AWG3_DIR:-}"
 SERVER_CONF_EXPLICIT="${AWG3_SERVER_CONF:-}"
 AWG_IFACE="${AWG3_IFACE:-awg0}"
 
-# resolve_paths — вычисляет AWG_DIR, SERVER_CONF, LOG_FILE и LEGACY_KEYS_DIR по
-# текущему AWG_IFACE.
+# resolve_paths — вычисляет AWG_ROOT, AWG_DIR, SERVER_CONF, LOG_FILE и
+# LEGACY_KEYS_DIR по текущему AWG_IFACE.
 #
-# Каталог клиентов у awg0 — каталог самого скрипта (~/awg): так сложилось
-# исторически, и ломать раскладку работающих серверов незачем. У остальных
-# интерфейсов — соседний каталог по имени интерфейса (~/awg1), клиенты внутри
-# него так же вложенно: ~/awg1/ИМЯ/ИМЯ.conf.
+# AWG_ROOT — корень данных, каталог самого скрипта (~/awg). Всё лежит внутри
+# него: журнал, бэкапы и по каталогу на интерфейс. Клиенты — ещё уровнем
+# ниже: ~/awg/awg1/ИМЯ/ИМЯ.conf.
+#
+# Раскладка по интерфейсам, а не вперемешку, снимает и столкновение имён:
+# клиент, названный awg1, иначе занял бы каталог интерфейса.
 #
 # Вызывается дважды: здесь, чтобы работали ранние сообщения об ошибках, и
 # после разбора аргументов, где --iface мог сменить интерфейс.
 resolve_paths() {
-    if [[ -n "$AWG_DIR_EXPLICIT" ]]; then
-        AWG_DIR="$AWG_DIR_EXPLICIT"
-    elif [[ "$AWG_IFACE" == "awg0" ]]; then
-        AWG_DIR="$SCRIPT_DIR"
+    if [[ -n "$AWG_ROOT_EXPLICIT" ]]; then
+        AWG_ROOT="$AWG_ROOT_EXPLICIT"
     else
-        AWG_DIR="$(dirname -- "$SCRIPT_DIR")/$AWG_IFACE"
+        AWG_ROOT="$SCRIPT_DIR"
     fi
+    AWG_DIR="$AWG_ROOT/$AWG_IFACE"
     SERVER_CONF="${SERVER_CONF_EXPLICIT:-/etc/amnezia/amneziawg/${AWG_IFACE}.conf}"
-    LOG_FILE="$AWG_DIR/awg3.log"
-    LEGACY_KEYS_DIR="$AWG_DIR/keys"
+    LOG_FILE="$AWG_ROOT/awg3.log"
+    LEGACY_KEYS_DIR="$AWG_ROOT/keys"
 }
 resolve_paths
 
@@ -93,14 +94,20 @@ resolve_paths
 
 client_dir() { printf '%s/%s' "$AWG_DIR" "$1"; }
 
-# Путь к конфигу клиента: новая схема в приоритете, затем старая. Для
-# несуществующего клиента возвращается путь по новой схеме — туда и создаём.
+# Путь к конфигу клиента: текущая схема в приоритете, затем прежние. Для
+# несуществующего клиента возвращается путь по текущей — туда и создаём.
+#
+# Прежних схем две, и обе бывают только у awg0: до раскладки по интерфейсам он
+# держал клиентов прямо в корне (~/awg/ИМЯ/ИМЯ.conf), а ещё раньше — плоско
+# (~/awg/ИМЯ.conf). Искать их для awg1 нельзя: там нашлись бы чужие клиенты.
 client_conf_path() {
     local name="$1"
     if [[ -f "$AWG_DIR/$name/$name.conf" ]]; then
         printf '%s/%s/%s.conf' "$AWG_DIR" "$name" "$name"
-    elif [[ -f "$AWG_DIR/$name.conf" ]]; then
-        printf '%s/%s.conf' "$AWG_DIR" "$name"
+    elif [[ "$AWG_IFACE" == "awg0" && -f "$AWG_ROOT/$name/$name.conf" ]]; then
+        printf '%s/%s/%s.conf' "$AWG_ROOT" "$name" "$name"
+    elif [[ "$AWG_IFACE" == "awg0" && -f "$AWG_ROOT/$name.conf" ]]; then
+        printf '%s/%s.conf' "$AWG_ROOT" "$name"
     else
         printf '%s/%s/%s.conf' "$AWG_DIR" "$name" "$name"
     fi
@@ -174,7 +181,7 @@ else
 fi
 
 _log_file() {
-    [[ -d "$AWG_DIR" ]] || return 0
+    [[ -d "$AWG_ROOT" ]] || return 0
     local existed=1
     [[ -f "$LOG_FILE" ]] || existed=0
     printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" >> "$LOG_FILE" 2>/dev/null || true
@@ -955,7 +962,7 @@ check_dependencies() {
     # в дерево исходников, а следующая распаковка поверх легла бы рядом с
     # ними. Установленный экземпляр лежит в ~/awg, и там это ровно то, что
     # нужно, — поэтому запрещаем только исходники.
-    if [[ -z "$AWG_DIR_EXPLICIT" && -f "$SCRIPT_DIR/install-awg3.sh" && -d "$SCRIPT_DIR/tests" ]]; then
+    if [[ -z "$AWG_ROOT_EXPLICIT" && -f "$SCRIPT_DIR/install-awg3.sh" && -d "$SCRIPT_DIR/tests" ]]; then
         log_err "запущен из каталога с исходниками: $SCRIPT_DIR"
         log_err "Клиентские ключи легли бы сюда же. Поставьте и работайте с установленным:"
         log_err "  sudo ./install-awg3.sh   (положит скрипт в ~/awg и даст awg3 в PATH)"
@@ -968,7 +975,7 @@ check_dependencies() {
 # manage_amneziawg.sh, запущенный не под root, перестанет их читать.
 _fix_owner() {
     local target="$1" owner
-    owner=$(stat -c '%u:%g' "$AWG_DIR" 2>/dev/null) || return 0
+    owner=$(stat -c '%u:%g' "$AWG_ROOT" 2>/dev/null) || return 0
     chown "$owner" "$target" 2>/dev/null || true
 }
 
@@ -2017,14 +2024,24 @@ list_client_names() {
             base=$(basename "$d")
             if [[ -f "$d/$base.conf" ]]; then printf '%s\n' "$base"; fi
         done
-        for f in "$AWG_DIR"/*.conf; do
-            [[ -f "$f" ]] || continue
-            # Серверный конфиг, если он оказался в том же каталоге, клиентом не
-            # является: у него есть ListenPort, которого у клиента не бывает.
-            if [[ "$f" -ef "$SERVER_CONF" ]]; then continue; fi
-            if grep -qE '^[[:space:]]*ListenPort[[:space:]]*=' "$f" 2>/dev/null; then continue; fi
-            printf '%s\n' "$(basename "$f" .conf)"
-        done
+
+        # Прежние раскладки awg0: клиенты в корне и совсем старая плоская.
+        # Каталоги интерфейсов сюда не попадают — внутри awg1 нет awg1.conf.
+        if [[ "$AWG_IFACE" == "awg0" ]]; then
+            for d in "$AWG_ROOT"/*/; do
+                [[ -d "$d" ]] || continue
+                base=$(basename "$d")
+                if [[ -f "$d/$base.conf" ]]; then printf '%s\n' "$base"; fi
+            done
+            for f in "$AWG_ROOT"/*.conf; do
+                [[ -f "$f" ]] || continue
+                # Серверный конфиг, если он оказался в том же каталоге, клиентом
+                # не является: у него есть ListenPort, которого у клиента не бывает.
+                if [[ "$f" -ef "$SERVER_CONF" ]]; then continue; fi
+                if grep -qE '^[[:space:]]*ListenPort[[:space:]]*=' "$f" 2>/dev/null; then continue; fi
+                printf '%s\n' "$(basename "$f" .conf)"
+            done
+        fi
     } | sort -u
 }
 
@@ -2122,14 +2139,21 @@ migrate_one() {
         log "'$name': уже в своём каталоге, пропускаю"
         return 0
     fi
-    [[ -f "$AWG_DIR/${name}.conf" ]] || { log_err "'$name': конфиг не найден"; return 1; }
+    local src_dir="$AWG_ROOT/$name"
+    if [[ ! -f "$AWG_ROOT/${name}.conf" && ! -f "$src_dir/${name}.conf" ]]; then
+        log_err "'$name': конфиг не найден"
+        return 1
+    fi
 
     mkdir -p "$cdir" || { log_err "'$name': не создан каталог $cdir"; return 1; }
     chmod 700 "$cdir"; _fix_owner "$cdir"
 
     local src dst
-    for src in "$AWG_DIR/${name}.conf" "$AWG_DIR/${name}.png" \
-               "$AWG_DIR/${name}.vpnuri" "$AWG_DIR/${name}.vpnuri.png" \
+    for src in "$src_dir/${name}.conf" "$src_dir/${name}.png" \
+               "$src_dir/${name}.vpnuri" "$src_dir/${name}.vpnuri.png" \
+               "$src_dir/${name}.private" "$src_dir/${name}.public" \
+               "$AWG_ROOT/${name}.conf" "$AWG_ROOT/${name}.png" \
+               "$AWG_ROOT/${name}.vpnuri" "$AWG_ROOT/${name}.vpnuri.png" \
                "$LEGACY_KEYS_DIR/${name}.private" "$LEGACY_KEYS_DIR/${name}.public"; do
         [[ -f "$src" ]] || continue
         dst="$cdir/$(basename "$src")"
@@ -2145,10 +2169,14 @@ migrate_one() {
     # Бэкапы конфигов, накопленные прежними запусками, едут следом:
     # иначе они осиротеют в корне каталога.
     local bak
-    for bak in "$AWG_DIR/${name}.conf".bak-*; do
+    for bak in "$src_dir/${name}.conf".bak-* "$AWG_ROOT/${name}.conf".bak-*; do
         [[ -f "$bak" ]] || continue
         if mv -f "$bak" "$cdir/"; then moved=$((moved + 1)); fi
     done
+
+    # Опустевший каталог прежней раскладки убираем — он больше ни на что не
+    # указывает, а оставленный сбивает с толку при следующем migrate.
+    [[ "$src_dir" == "$cdir" ]] || rmdir "$src_dir" 2>/dev/null || true
 
     log_ok "'$name': перенесено файлов — $moved → $cdir"
     return 0
@@ -2157,20 +2185,27 @@ migrate_one() {
 cmd_migrate() {
     local names=() name flat=()
     mapfile -t names < <(list_client_names)
-    [[ "${#names[@]}" -gt 0 ]] || die "клиентов не найдено"
 
     for name in "${names[@]}"; do
-        if [[ ! -f "$AWG_DIR/$name/$name.conf" && -f "$AWG_DIR/${name}.conf" ]]; then
+        if [[ ! -f "$AWG_DIR/$name/$name.conf" ]]; then
             flat+=("$name")
         fi
     done
 
-    if [[ "${#flat[@]}" -eq 0 ]]; then
-        log_ok "переносить нечего: все клиенты уже разложены по каталогам"
+    local keys_in_root=0
+    if [[ "$AWG_IFACE" == "awg0" && ( -f "$AWG_ROOT/server_private.key" || -f "$AWG_ROOT/server_public.key" ) ]]; then
+        keys_in_root=1
+    fi
+
+    if [[ "${#flat[@]}" -eq 0 && "$keys_in_root" -eq 0 ]]; then
+        log_ok "переносить нечего: всё уже разложено по каталогам интерфейсов"
         return 0
     fi
 
-    log "Будут перенесены в собственные каталоги: ${flat[*]}"
+    if [[ "${#flat[@]}" -gt 0 ]]; then
+        log "Будут перенесены в каталог интерфейса ${AWG_IFACE}: ${flat[*]}"
+    fi
+    [[ "$keys_in_root" -eq 0 ]] || log "Ключи сервера из корня тоже переедут."
     log "Файлы перемещаются (conf, png, ключи, бэкапы), сервер не затрагивается."
     confirm "Продолжить?" || die "отменено"
 
@@ -2178,6 +2213,22 @@ cmd_migrate() {
     for name in "${flat[@]}"; do
         if migrate_one "$name"; then ok=$((ok + 1)); else fail=$((fail + 1)); fi
     done
+
+    # Ключи сервера awg0 прежде лежали в корне — там, где тогда был его
+    # каталог. Переносим следом: приватный ключ, забытый в корне, ничем не
+    # управляется и никому не нужен, а дублировать его негде.
+    if [[ "$AWG_IFACE" == "awg0" ]]; then
+        local key
+        for key in server_private.key server_public.key; do
+            [[ -f "$AWG_ROOT/$key" && ! -f "$AWG_DIR/$key" ]] || continue
+            if mv -f "$AWG_ROOT/$key" "$AWG_DIR/$key"; then
+                _fix_owner "$AWG_DIR/$key"
+                log "ключ сервера перенесён: $AWG_DIR/$key"
+            else
+                log_warn "не перенесён $AWG_ROOT/$key"
+            fi
+        done
+    fi
 
     # Каталог keys/ остаётся на месте, даже если опустел: удаление файлов —
     # отдельное решение, скрипт его за пользователя не принимает.
@@ -2417,7 +2468,7 @@ cmd_restart() {
 # сами: чистка — только явным --prune N, и с подтверждением.
 
 cmd_backup() {
-    local bdir="$AWG_DIR/backups"
+    local bdir="$AWG_ROOT/backups"
     mkdir -p "$bdir" || die "не создан $bdir"
     chmod 700 "$bdir"; _fix_owner "$bdir"
 
@@ -2546,7 +2597,7 @@ cmd_migrate_client() {
     # интерфейса — то есть переезда не случилось бы, а файлы перезаписались.
     [[ -z "$SERVER_CONF_EXPLICIT" ]] \
         || die "переезд несовместим с заданным AWG3_SERVER_CONF: путь вычисляется по интерфейсу"
-    [[ -z "$AWG_DIR_EXPLICIT" ]] \
+    [[ -z "$AWG_ROOT_EXPLICIT" ]] \
         || die "переезд несовместим с заданным AWG3_DIR: каталог вычисляется по интерфейсу"
     validate_client_name "$name"
 
@@ -2642,9 +2693,9 @@ cmd_iface_remove() {
     local conf="/etc/amnezia/amneziawg/${name}.conf"
     [[ -f "$conf" ]] || die "интерфейс $name не найден: $conf"
 
-    # Каталог клиентов вычисляется по тем же правилам, что и везде.
-    local dir
-    if [[ "$name" == "awg0" ]]; then dir="$SCRIPT_DIR"; else dir="$(dirname -- "$SCRIPT_DIR")/$name"; fi
+    # Каталог клиентов вычисляется по тем же правилам, что и везде. Сам
+    # awg3.sh лежит в корне, уровнем выше, — под удаление он не попадает.
+    local dir="$AWG_ROOT/$name"
 
     local clients port
     clients=$(grep -c '^[[:space:]]*\[Peer\]' "$conf" 2>/dev/null) || clients=0
@@ -2653,11 +2704,7 @@ cmd_iface_remove() {
     log_warn "Будет удалён интерфейс ${name}:"
     log "  конфиг:   $conf"
     log "  клиентов: $clients — их конфиги и ключи тоже"
-    if [[ "$name" == "awg0" ]]; then
-        log "  каталог:  $dir (только подкаталоги клиентов, сам каталог остаётся)"
-    else
-        log "  каталог:  $dir целиком"
-    fi
+    log "  каталог:  $dir целиком"
     [[ -z "$port" ]] || log "  порт:     ${port}/udp — правило ufw будет снято"
     confirm "Удалить $name?" || die "отменено"
 
@@ -2671,17 +2718,7 @@ cmd_iface_remove() {
     _backup_file "$conf"
     rm -f "$conf" || die "не удалён $conf"
 
-    # awg0 живёт в каталоге скрипта: снести его целиком нельзя — там сам
-    # awg3.sh. Удаляем только каталоги клиентов, перечисленные в конфиге.
-    if [[ "$name" == "awg0" ]]; then
-        local peer
-        while IFS= read -r peer; do
-            [[ -n "$peer" ]] || continue
-            rm -rf "${dir:?}/${peer}"
-        done < <(grep '^#_Name = ' "$BACKUP_LAST" 2>/dev/null | sed 's/^#_Name = //')
-    else
-        rm -rf "${dir:?}"
-    fi
+    rm -rf "${dir:?}"
 
     log_ok "интерфейс $name удалён (конфиг сохранён в $BACKUP_LAST)"
 }
@@ -2849,21 +2886,21 @@ awg3.sh ${SCRIPT_VERSION} — AmneziaWG ${AWG_PROTOCOL}: клиенты и па�
     источник истины, клиент обязан их повторить. Jc, Jmin, Jmax, I1-I5,
     ContentPaddingAddition и таймеры генерируются заново для каждого клиента.
 
-    Каждый клиент живёт в собственном каталоге:
-        ${AWG_DIR}/ИМЯ/ИМЯ.conf
-        ${AWG_DIR}/ИМЯ/ИМЯ.png
-        ${AWG_DIR}/ИМЯ/ИМЯ.vpnuri
-        ${AWG_DIR}/ИМЯ/ИМЯ.private, ИМЯ.public
-    Прежняя плоская раскладка ещё читается командами list и remove;
-    'migrate' переносит её на новую схему.
+    Всё лежит внутри ${AWG_ROOT}: журнал, бэкапы и по каталогу на интерфейс.
+    Клиент — ещё уровнем ниже, в собственном каталоге:
+        ${AWG_ROOT}/ИНТЕРФЕЙС/ИМЯ/ИМЯ.conf
+        ${AWG_ROOT}/ИНТЕРФЕЙС/ИМЯ/ИМЯ.png
+        ${AWG_ROOT}/ИНТЕРФЕЙС/ИМЯ/ИМЯ.vpnuri
+        ${AWG_ROOT}/ИНТЕРФЕЙС/ИМЯ/ИМЯ.private, ИМЯ.public
+    Прежние раскладки awg0 (клиенты в корне и совсем старая плоская) ещё
+    читаются командами list и remove; 'migrate' переносит их на текущую.
 
     Пути переопределяются переменными AWG3_DIR, AWG3_SERVER_CONF, AWG3_IFACE.
 
     Интерфейсов может быть несколько, и они независимы: у каждого свой порт,
-    подсеть, общие параметры и каталог клиентов. awg0 живёт в каталоге самого
-    скрипта, остальные — в соседнем каталоге по имени: ~/awg1/ИМЯ/ИМЯ.conf.
-    Одинаковые имена клиентов на РАЗНЫХ интерфейсах допустимы — на этом
-    держится безостановочный переезд через migrate-client.
+    подсеть, общие параметры и каталог клиентов. Одинаковые имена клиентов на
+    РАЗНЫХ интерфейсах допустимы — на этом держится безостановочный переезд
+    через migrate-client.
 EOF
 }
 
