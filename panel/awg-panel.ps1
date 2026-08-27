@@ -847,8 +847,20 @@ function Action-Ifaces {
     $idx = [int]$choice
     if ($idx -lt 1 -or $idx -gt $rows.Count) { Write-Warn 'Нет такого пункта.'; return }
 
-    Set-Iface $rows[$idx - 1][0]
+    $row = $rows[$idx - 1]
+    Set-Iface $row[0]
     Write-Ok "Панель работает с интерфейсом $script:Iface (клиенты в $script:RemoteDir)."
+
+    # Интерфейс, созданный до 3.1, выглядит рабочим, но выданный на нём ключ
+    # молча не подключится: RandomTrailers обязан совпадать на обоих концах.
+    # awg3 такой ключ выдать не даст — предупреждаем заранее, чтобы отказ в
+    # пункте «Создать ключ» не выглядел неожиданностью.
+    if ($row[3] -notmatch '^3\.1') {
+        Write-Host ''
+        Write-Warn "Интерфейс $($row[0]) создан до 3.1 — новых ключей на нём выдать нельзя."
+        Write-Dim 'Переведите его пунктом S (смена общих параметров): после этого'
+        Write-Dim 'клиентов придётся выдать заново — параметры интерфейса общие для всех.'
+    }
 }
 
 # Создание интерфейса. Имя не спрашиваем: awg3 сам берёт первое свободное, и
@@ -983,11 +995,82 @@ function Action-MigrateClient {
     }
 }
 
+# Смена параметров самого интерфейса: порт, подсеть, изоляция, IPv6.
+#
+# Делается через `server-init --force`: он переносит пиров в новый конфиг, но
+# общие параметры обфускации при этом генерируются заново — иначе и быть не
+# может, конфиг пересобирается целиком. Значит, выданные клиентские конфиги
+# перестанут подключаться, и сказать об этом надо прямо, а не мелким шрифтом.
+function Action-IfaceParams {
+    Write-Head "Параметры интерфейса $script:Iface"
+
+    # Текущие значения показываем из list: там они уже разобраны и это ровно
+    # то, что лежит в конфиге, а не то, что панель помнит о прошлом запуске.
+    $out = Invoke-Remote -CmdArgs @('list') -Quiet
+    foreach ($line in @($out)) {
+        if ("$line" -match 'порт:|изоляция|имя хоста') { Write-Dim ("$line".Trim()) }
+    }
+
+    Write-Host ''
+    Write-Warn 'ЭТО ОТКЛЮЧИТ ВСЕХ КЛИЕНТОВ ИНТЕРФЕЙСА.'
+    Write-Dim 'Конфиг пересобирается целиком, поэтому общие параметры обфускации'
+    Write-Dim 'генерируются заново. Пиры на сервере сохранятся, но выданные конфиги'
+    Write-Dim 'перестанут подключаться — каждый ключ придётся выдать заново.'
+    Write-Host ''
+    Write-Dim 'Enter оставляет текущее значение.'
+    Write-Host ''
+
+    $cmdArgs = @('server-init', '--force')
+
+    $port = (Read-Host '  UDP-порт (Enter — не менять)').Trim()
+    if ($port) {
+        if ($port -notmatch '^\d+$' -or [int]$port -lt 1 -or [int]$port -gt 65535) {
+            Write-Err 'Порт должен быть числом от 1 до 65535.'
+            return
+        }
+        $cmdArgs += @('--awg-port', $port)
+    }
+
+    $subnet = (Read-Host '  Подсеть туннеля, например 10.9.0.1/24 (Enter — не менять)').Trim()
+    if ($subnet) {
+        if ($subnet -notmatch '^\d+\.\d+\.\d+\.\d+/\d+$') {
+            Write-Err 'Подсеть указывается как адрес сервера с маской: 10.9.0.1/24.'
+            return
+        }
+        $cmdArgs += @('--subnet', $subnet)
+    }
+
+    $iso = (Read-Host '  Изолировать клиентов друг от друга? y/n (Enter — не менять)').Trim()
+    if ($iso) {
+        if ($iso -match '^[yYдД]') { $cmdArgs += @('--isolation', 'on') }
+        else                       { $cmdArgs += @('--isolation', 'off') }
+    }
+
+    $v6 = (Read-Host '  IPv6 в туннеле? y/n (Enter — не менять)').Trim()
+    if ($v6) {
+        if ($v6 -match '^[yYдД]') { $cmdArgs += @('--ipv6', 'on') }
+        else                      { $cmdArgs += @('--ipv6', 'off') }
+    }
+
+    if ($cmdArgs.Count -le 2) { Write-Dim 'Ничего не задано — отменено.'; return }
+
+    Write-Host ''
+    $word = Read-Host "  Наберите имя интерфейса целиком, чтобы подтвердить [$($script:Iface)]"
+    if ($word -cne $script:Iface) { Write-Dim 'Отменено.'; return }
+
+    Write-Host ''
+    Invoke-Remote -CmdArgs ($cmdArgs + '-y') | Out-Null
+    if ($script:LastRc -eq 0) {
+        Write-Warn 'Теперь пересоздайте ключи этого интерфейса и раздайте новые конфиги.'
+    }
+}
+
 function Action-ServerRekey {
-    Write-Head 'Смена общих параметров сервера'
-    Write-Warn 'ЭТО ОТКЛЮЧИТ ВСЕХ КЛИЕНТОВ РАЗОМ.'
-    Write-Dim 'Сервер получит новые S1-S4, H1-H4 и HeaderProtectionKey. Старые конфиги'
+    Write-Head "Смена общих параметров интерфейса $script:Iface"
+    Write-Warn 'ЭТО ОТКЛЮЧИТ ВСЕХ КЛИЕНТОВ ИНТЕРФЕЙСА.'
+    Write-Dim 'Интерфейс получит новые S1-S4, H1-H4 и HeaderProtectionKey. Старые конфиги'
     Write-Dim 'перестанут подключаться: каждого клиента придётся удалить и создать заново.'
+    Write-Dim 'Порт и подсеть при этом не меняются — для них пункт P.'
     Write-Host ''
     $word = Read-Host '  Наберите СМЕНИТЬ заглавными, чтобы подтвердить'
     if ($word -cne 'СМЕНИТЬ') { Write-Dim 'Отменено.'; return }
@@ -1189,6 +1272,9 @@ function Show-Banner {
     }
 }
 
+# Меню разбито по тому, чем управляем: ключи, текущий интерфейс, сервер
+# целиком. Раздел интерфейса подписан его именем — иначе непонятно, к чему
+# относятся «состояние» и «перезапустить», когда интерфейсов несколько.
 function Show-Menu {
     Write-Host ''
     Write-Host '   КЛЮЧИ' -ForegroundColor DarkCyan
@@ -1197,21 +1283,20 @@ function Show-Menu {
     Write-Host '    3  Создать ключ'
     Write-Host '    4  Скачать ключ (conf + QR + ссылка vpn://)'
     Write-Host '    5  Удалить ключ'
+    Write-Host '    T  Переселить ключ на другой интерфейс'
     Write-Host ''
-    Write-Host '   СЕРВЕР' -ForegroundColor DarkCyan
+    Write-Host ("   ИНТЕРФЕЙС {0}" -f $script:Iface) -ForegroundColor DarkCyan
     Write-Host '    6  Состояние (awg show)'
     Write-Host '    7  Перезапустить сервис'
-    Write-Host '    8  Резервная копия'
     Write-Host '    9  Имя хоста для клиентов'
-    Write-Host ''
-    Write-Host '   ИНТЕРФЕЙСЫ' -ForegroundColor DarkCyan
-    Write-Host ("    I  Интерфейсы сервера (сейчас: {0})" -f $script:Iface)
-    Write-Host '    T  Переезд клиента на другой интерфейс'
-    Write-Host ''
-    Write-Host '   ПРОЧЕЕ' -ForegroundColor DarkCyan
     Write-Host '    G  Показать набор параметров обфускации'
+    Write-Host '    P  Порт, подсеть, изоляция, IPv6' -ForegroundColor DarkYellow
+    Write-Host '    S  Сменить общие параметры обфускации' -ForegroundColor DarkYellow
+    Write-Host ''
+    Write-Host '   СЕРВЕР' -ForegroundColor DarkCyan
+    Write-Host '    I  Интерфейсы: список, создать, удалить, переключиться'
+    Write-Host '    8  Резервная копия'
     Write-Host '    M  Разложить файлы по каталогам'
-    Write-Host '    S  Сменить общие параметры сервера' -ForegroundColor DarkYellow
     Write-Host ''
     Write-Host '    Q  Выход' -ForegroundColor DarkGray
     Write-Host ''
@@ -1283,6 +1368,7 @@ try {
             '^[gG]$' { Action-Gen;         Pause-Panel }
             '^[mM]$' { Action-Migrate;     Pause-Panel }
             '^[sS]$' { Action-ServerRekey; Pause-Panel }
+            '^[pP]$' { Action-IfaceParams;  Pause-Panel }
             '^[qQ]$' { return }
             default  { Write-Warn 'Нет такого пункта.'; Start-Sleep -Milliseconds 700 }
         }

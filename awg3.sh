@@ -1679,8 +1679,23 @@ cmd_server_init() {
 
     # Прежний порт нужен до перезаписи конфига: по нему снимается старое
     # правило ufw, если порт сменился.
-    local old_port=""
-    [[ ! -f "$SERVER_CONF" ]] || old_port=$(_iface_value ListenPort)
+    local old_port="" old_subnet=""
+    if [[ -f "$SERVER_CONF" ]]; then
+        old_port=$(_iface_value ListenPort)
+        old_subnet=$(_iface_value Address)
+        old_subnet="${old_subnet%%,*}"
+        old_subnet="${old_subnet//[[:space:]]/}"
+    fi
+
+    # Смена подсети при переносе пиров: адреса у них остаются прежние и в новую
+    # подсеть не попадают. Туннель для таких клиентов не поднимется, и по
+    # конфигу этого не видно — предупреждаем до записи, а не после.
+    if [[ -n "$old_subnet" && "$old_subnet" != "$SRV_SUBNET" ]] \
+       && grep -q '^[[:space:]]*\[Peer\]' "$SERVER_CONF" 2>/dev/null; then
+        log_warn "подсеть меняется: ${old_subnet} -> ${SRV_SUBNET}"
+        log_warn "Перенесённые пиры сохранят прежние адреса и окажутся вне новой подсети."
+        log_warn "Их придётся выдать заново: $0 --iface ${AWG_IFACE} remove ИМЯ, затем add ИМЯ"
+    fi
 
     local nic
     nic=$(get_main_nic) \

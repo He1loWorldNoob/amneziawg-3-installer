@@ -340,3 +340,23 @@ Hit:7 https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu noble InRelease')
     # Успешные строки в список не попадают.
     [[ "$out" != *"ppa.launchpadcontent.net"* ]]
 }
+
+# ── Панель ──────────────────────────────────────────────────────────────────
+
+@test "панель зовёт только существующие команды awg3" {
+    # Панель — второй потребитель CLI после человека: переименование команды,
+    # не отражённое в ней, всплывает уже у пользователя.
+    local panel="$REPO_ROOT/panel/awg-panel.ps1"
+    local cmd
+    for cmd in $(grep -oE "CmdArgs @\('[a-z-]+" "$panel" | sed "s/.*'//" | sort -u); do
+        grep -qE "^        ${cmd}[)|]|\|${cmd}[)|]|${cmd}\|" "$REPO_ROOT/awg3.sh" \
+            || grep -q "\"$cmd\"" "$REPO_ROOT/awg3.sh" \
+            || false
+    done
+}
+
+@test "панель работает с каталогом ~/awg/ИНТЕРФЕЙС" {
+    # Раскладка должна совпадать с awg3.sh, иначе панель скачивала бы файлы
+    # не того интерфейса, что показывает в списке.
+    grep -q 'RemoteDir = "$($script:HomeDir)/awg/$Name"' "$REPO_ROOT/panel/awg-panel.ps1"
+}
