@@ -804,7 +804,7 @@ function Get-Ifaces {
         if ($text -notmatch "`t") { continue }
         $cells = $text -split "`t"
         if ($cells[0] -eq 'ИНТЕРФЕЙС') { continue }
-        if ($cells.Count -lt 7) { continue }
+        if ($cells.Count -lt 6) { continue }
         $rows += , $cells
     }
     return $rows
@@ -817,15 +817,14 @@ function Action-Ifaces {
     if ($rows.Count -eq 0) { return }
 
     Write-Host ''
-    Write-Host ('   {0,2}  {1,-8} {2,-6} {3,-18} {4,-6} {5,-8} {6}' -f `
-        '', 'ИМЯ', 'ПОРТ', 'ПОДСЕТЬ', 'ВЕРС', 'КЛИЕНТОВ', 'СЕРВИС') -ForegroundColor DarkCyan
+    Write-Host ('   {0,2}  {1,-8} {2,-6} {3,-18} {4,-22} {5,-8} {6}' -f `
+        '', 'ИМЯ', 'ПОРТ', 'ПОДСЕТЬ', 'ВЕРСИЯ', 'КЛИЕНТОВ', 'СЕРВИС') -ForegroundColor DarkCyan
     for ($i = 0; $i -lt $rows.Count; $i++) {
         $r = $rows[$i]
-        # RandomTrailers — единственное, что отличает 3.1 от 3.0 на проводе,
-        # поэтому версия показывается по нему, а не по версии пакета.
-        $ver = if ($r[3] -eq 'on') { '3.1' } else { '3.0' }
-        $line = ('   {0,2}  {1,-8} {2,-6} {3,-18} {4,-6} {5,-8} {6}' -f `
-            ($i + 1), $r[0], $r[1], $r[2], $ver, $r[5], $r[6])
+        # Версию считает сам awg3.sh: интерфейс без RandomTrailers создан до
+        # 3.1, и в этой колонке приезжает не число, а «нужен server-rekey».
+        $line = ('   {0,2}  {1,-8} {2,-6} {3,-18} {4,-22} {5,-8} {6}' -f `
+            ($i + 1), $r[0], $r[1], $r[2], $r[3], $r[4], $r[5])
         if ($r[0] -eq $script:Iface) {
             Write-Host "$line  <- текущий" -ForegroundColor Green
         } else {

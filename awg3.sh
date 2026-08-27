@@ -34,10 +34,9 @@
 set -Eeuo pipefail
 
 # Версия самого скрипта. Не путать с версией протокола: в исходном awg-gen.sh
-# она задавалась флагом -v (1.0|1.5|2.0|3.0), здесь же выбора нет — новые
-# интерфейсы всегда 3.1, а более старые режимы не поддерживаются намеренно.
-# Единственная степень свободы — --random-trailers off: он оставляет интерфейс
-# на 3.0, чтобы к нему подключались приложения старше 5.0.1.5.
+# она задавалась флагом -v (1.0|1.5|2.0|3.0), здесь же выбора нет — интерфейс
+# всегда 3.1. Более старые режимы не поддерживаются намеренно: нужен клиент
+# Amnezia 5.0.1.5 или новее.
 SCRIPT_VERSION="1.2.0"
 readonly AWG_PROTOCOL="3.1"
 
@@ -135,7 +134,8 @@ SRV_IPV6="off"
 SRV_IPV6_SUBNET="fddd:2c4:2c4:2c4::/64"
 SRV_FORCE=0
 
-# Параметры AmneziaWG 3.1.
+# Параметры AmneziaWG 3.1. Выключателей у них нет намеренно: 3.0 из проекта
+# убран, и интерфейс либо 3.1, либо не наш.
 #
 # RandomTrailers дописывает к каждому служебному пакету случайный хвост, снимая
 # постоянную длину рукопожатия (без него init всегда 148+S1, ответ 92+S2 — по
@@ -146,14 +146,9 @@ SRV_FORCE=0
 # его за сервером, как S1-S4 и HeaderProtectionKey.
 #
 # DisableCookies запрещает отвечать на cookie-запросы. Он односторонний:
-# включается на любом конце независимо и старую сторону не ломает.
-SRV_RANDOM_TRAILERS="on"
-SRV_DISABLE_COOKIES="on"
-# Задан ли флаг явно. Нужно, чтобы server-rekey на legacy-интерфейсе сохранял
-# его текущее состояние, а не включал RandomTrailers молча по умолчанию:
-# это отключило бы всех выданных клиентов разом.
-SRV_RT_EXPLICIT=0
-SRV_DC_EXPLICIT=0
+# включается на любом конце независимо.
+#
+# Требуется клиент Amnezia 5.0.1.5 или новее, а на сервере — модуль и tools 3.1.
 
 # Переезд клиента между интерфейсами: куда и с каким ключом.
 MIGRATE_TO=""
@@ -436,14 +431,12 @@ gen_sender_params() {
     G_MHA="${at_lo}-${at_hi}"
 
     # PersistentKeepalive: постоянный интервал сам по себе признак, поэтому
-    # он тоже разный у каждого клиента. Диапазон понимают только tools 3.1 и
-    # приложение от 5.0.1.5, так что для legacy-интерфейса остаётся число —
-    # его примет кто угодно.
+    # он тоже разный у каждого клиента. Диапазон понимают tools 3.1 и
+    # приложение от 5.0.1.5 — то есть всё, с чем мы работаем.
     local pk_lo pk_hi
     rand_int 22 30; pk_lo=$REPLY
     rand_int 6 14;  pk_hi=$((pk_lo + REPLY))
-    G_PKA_RANGE="${pk_lo}-${pk_hi}"
-    rand_int 25 40; G_PKA_ONE=$REPLY
+    G_PKA="${pk_lo}-${pk_hi}"
 }
 
 # gen_shared_params: то, что обязано совпадать на обоих концах.
@@ -529,18 +522,11 @@ load_server_params() {
     S_MTU=$(_iface_value MTU)
     S_PORT=$(_iface_value ListenPort)
 
-    # RandomTrailers обязан совпадать с сервером, поэтому клиент получает его
-    # отсюда, а не генерирует. Отсутствие строки означает выключено: так
-    # выглядят все конфиги, созданные до 3.1.
+    # Отсутствие строки означает выключено — так выглядят все конфиги,
+    # созданные до 3.1. Читается не ради клиента (тот получает параметр
+    # всегда), а ради опознания такого интерфейса: см. require_iface_awg31.
     S_RTR=$(_iface_value RandomTrailers)
     [[ -n "$S_RTR" ]] || S_RTR="off"
-
-    # DisableCookies односторонний, туннель от рассинхрона не рвётся. Но клиент
-    # всё равно повторяет за сервером: интерфейс, у которого его выключили
-    # намеренно, заводят ради приложений, которые этого ключа не знают, — и
-    # строка в их конфиге всё испортила бы ровно там, где её избегали.
-    S_DC=$(_iface_value DisableCookies)
-    [[ -n "$S_DC" ]] || S_DC="off"
 
     local addr_line
     addr_line=$(_iface_value Address)
@@ -648,6 +634,24 @@ require_server_awg3() {
     if server_is_awg3; then return 0; fi
     log_err "в $SERVER_CONF нет HeaderProtectionKey — это не конфиг AWG 3.x."
     log_err "Проверьте, тот ли это конфиг: $SERVER_CONF"
+    exit 1
+}
+
+# require_iface_awg31 — не даёт выдать клиента на интерфейсе, созданном до 3.1.
+#
+# Молчаливый отказ здесь дороже любого другого: клиент получил бы
+# RandomTrailers, которого нет у сервера, и туннель не встал бы ВООБЩЕ — без
+# ошибки в логах, без единого пакета, просто тишина. Отличить это от «провайдер
+# режет» человек не может, поэтому ловим до выдачи конфига.
+#
+# Чинится одной командой, и она же — единственный способ: параметры интерфейса
+# общие для всех его клиентов, выборочно перевести одного нельзя.
+require_iface_awg31() {
+    if [[ "${S_RTR:-off}" == "on" ]]; then return 0; fi
+    log_err "интерфейс ${AWG_IFACE} создан до 3.1: в $SERVER_CONF нет RandomTrailers."
+    log_err "Выдать на нём клиента 3.1 нельзя — туннель молча не встанет."
+    log_err "Переведите интерфейс: $0 --iface ${AWG_IFACE} server-rekey"
+    log_err "Клиентов после этого придётся выдать заново — параметры интерфейса общие."
     exit 1
 }
 
@@ -1047,24 +1051,16 @@ render_client_conf() {
         printf 'RejectAfterTime = %s\n' "$G_RJ"
         printf 'KeepaliveTimeout = %s\n' "$G_KA"
         printf 'MaxHandshakeAttempts = %s\n' "$G_MHA"
-        # Повторяется за сервером: рассинхрон рвёт туннель целиком. Строка
-        # пишется только когда включено — иначе конфиг перестал бы читаться
-        # приложениями старше 5.0.1.5, которые этого ключа не знают.
-        if [[ "${S_RTR:-off}" == "on" ]]; then
-            printf 'RandomTrailers = on\n'
-        fi
-        if [[ "${S_DC:-off}" == "on" ]]; then
-            printf 'DisableCookies = on\n'
-        fi
-        local keepalive="$G_PKA_ONE"
-        if [[ "${S_RTR:-off}" == "on" ]]; then keepalive="$G_PKA_RANGE"; fi
+        # Повторяется за сервером: рассинхрон рвёт туннель целиком.
+        printf 'RandomTrailers = on\n'
+        printf 'DisableCookies = on\n'
         printf '\n'
         printf '[Peer]\n'
         printf 'PublicKey = %s\n' "$srv_pub"
         if [[ -n "$psk" ]]; then printf 'PresharedKey = %s\n' "$psk"; fi
         printf 'Endpoint = %s:%s\n' "$endpoint" "$port"
         printf 'AllowedIPs = %s\n' "$CLIENT_ALLOWED_IPS"
-        printf 'PersistentKeepalive = %s\n' "$keepalive"
+        printf 'PersistentKeepalive = %s\n' "$G_PKA"
     } > "$tmp"
 
     mv -f "$tmp" "$out" || { rm -f "$tmp"; die "не записан $out"; }
@@ -1160,10 +1156,8 @@ render_server_conf() {
         printf 'RejectAfterTime = %s\n' "$G_RJ"
         printf 'KeepaliveTimeout = %s\n' "$G_KA"
         printf 'MaxHandshakeAttempts = %s\n' "$G_MHA"
-        # Пишутся только когда включены: строка со значением off ничего не
-        # добавляет, а на модуле ниже 3.1 сделала бы конфиг незагружаемым.
-        if [[ "$SRV_RANDOM_TRAILERS" == "on" ]]; then printf 'RandomTrailers = on\n'; fi
-        if [[ "$SRV_DISABLE_COOKIES" == "on" ]]; then printf 'DisableCookies = on\n'; fi
+        printf 'RandomTrailers = on\n'
+        printf 'DisableCookies = on\n'
     } > "$tmp"
 
     if [[ -n "$peers_src" && -f "$peers_src" ]]; then
@@ -1510,13 +1504,7 @@ cmd_server_init() {
     # модуле ниже 3.1 не ломает уже поднятый интерфейс — он ломает СЛЕДУЮЩИЙ
     # запуск: awg setconf отдаёт «Invalid argument», awg-quick сносит
     # устройство, сервис уходит в failed. Такую мину лучше не закладывать.
-    if [[ "$SRV_RANDOM_TRAILERS" == "on" ]]; then
-        require_awg31 "RandomTrailers" || exit 1
-    elif [[ "$SRV_DISABLE_COOKIES" == "on" ]]; then
-        # Модулю ниже 3.1 этот ключ так же неизвестен, и конфиг с ним не
-        # загрузится — проверять надо и когда RandomTrailers выключен.
-        require_awg31 "DisableCookies" || exit 1
-    fi
+    require_awg31 "параметры 3.1" || exit 1
 
     [[ -n "$SRV_PORT" ]] || { rand_int 1024 65000; SRV_PORT=$REPLY; }
     validate_awg_port "$SRV_PORT" || exit 1
@@ -1577,9 +1565,7 @@ cmd_server_init() {
             || log_warn "сервис не запустился, смотрите: systemctl status awg-quick@${AWG_IFACE}"
     fi
 
-    local ver="3.0"
-    [[ "$SRV_RANDOM_TRAILERS" == "on" ]] && ver="3.1"
-    log_ok "интерфейс ${AWG_IFACE}: сервер AWG ${ver} создан, $SERVER_CONF"
+    log_ok "интерфейс ${AWG_IFACE}: сервер AWG 3.1 создан, $SERVER_CONF"
     log "  порт: ${SRV_PORT}/udp, подсеть: ${SRV_SUBNET}, MTU: ${SRV_MTU}"
     log "  изоляция клиентов: ${SRV_ISOLATION}, IPv6: ${SRV_IPV6}"
     # Подсказка обязана нести --iface: без него add уйдёт на awg0, а человек
@@ -1672,6 +1658,7 @@ cmd_add() {
     validate_client_name "$name"
     load_server_params
     require_server_awg3
+    require_iface_awg31
 
     local cdir conf
     cdir=$(client_dir "$name")
@@ -1770,9 +1757,7 @@ cmd_add() {
     log "  каталог: $cdir"
     log "  конфиг: $conf"
     if [[ -f "${conf%.conf}.vpnuri" ]]; then log "  ссылка: ${conf%.conf}.vpnuri"; fi
-    local ver="3.0"
-    [[ "${S_RTR:-off}" == "on" ]] && ver="3.1"
-    log "  профиль обфускации: AWG ${ver} / ${PROFILE} / ${INTENSITY}"
+    log "  профиль обфускации: AWG 3.1 / ${PROFILE} / ${INTENSITY}"
 }
 
 _rollback_add() {
@@ -1927,16 +1912,14 @@ cmd_list() {
     done < <(list_client_names)
 
     printf '\n'
-    if server_is_awg3; then
-        if [[ "${S_RTR:-off}" == "on" ]]; then
-            printf 'Интерфейс %s: AWG 3.1 (S1=%s H1=%s, RandomTrailers on)\n' \
-                "$AWG_IFACE" "$S_S1" "$S_H1"
-        else
-            printf 'Интерфейс %s: AWG 3.0 (S1=%s H1=%s, RandomTrailers off)\n' \
-                "$AWG_IFACE" "$S_S1" "$S_H1"
-        fi
-    else
+    if ! server_is_awg3; then
         printf 'Интерфейс %s: конфиг не похож на наш — нет HeaderProtectionKey\n' "$AWG_IFACE"
+    elif [[ "${S_RTR:-off}" == "on" ]]; then
+        printf 'Интерфейс %s: AWG 3.1 (S1=%s H1=%s)\n' \
+            "$AWG_IFACE" "$S_S1" "$S_H1"
+    else
+        printf 'Интерфейс %s: AWG 3.0 — новых клиентов на нём выдать нельзя\n' "$AWG_IFACE"
+        printf '  переведите на 3.1: %s --iface %s server-rekey\n' "$0" "$AWG_IFACE"
     fi
     printf '  порт: %s/udp, подсеть: %s, MTU: %s\n' \
         "${S_PORT:-?}" "${S_ADDR:-?}" "${S_MTU:-?}"
@@ -2422,9 +2405,9 @@ cmd_migrate_client() {
 # нечему. Формат — колонки с разделителем табуляцией, чтобы панель могла
 # разобрать вывод, не вглядываясь в выравнивание.
 cmd_ifaces() {
-    local conf name port addr rtr dc clients state dir found=0
+    local conf name port addr rtr ver clients state found=0
 
-    printf 'ИНТЕРФЕЙС\tПОРТ\tПОДСЕТЬ\tRANDOMTRAILERS\tDISABLECOOKIES\tКЛИЕНТОВ\tСЕРВИС\n'
+    printf 'ИНТЕРФЕЙС\tПОРТ\tПОДСЕТЬ\tВЕРСИЯ\tКЛИЕНТОВ\tСЕРВИС\n'
     for conf in /etc/amnezia/amneziawg/*.conf; do
         [[ -f "$conf" ]] || continue
         name=$(basename "$conf" .conf)
@@ -2436,17 +2419,17 @@ cmd_ifaces() {
         port=$(awk -F'=' '/^[[:space:]]*\[Peer\]/{exit} /^[[:space:]]*ListenPort[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$conf")
         addr=$(awk -F'=' '/^[[:space:]]*\[Peer\]/{exit} /^[[:space:]]*Address[[:space:]]*=/{sub(/^[^=]*=[[:space:]]*/,""); print; exit}' "$conf")
         rtr=$(awk -F'=' '/^[[:space:]]*\[Peer\]/{exit} /^[[:space:]]*RandomTrailers[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$conf")
-        dc=$(awk -F'=' '/^[[:space:]]*\[Peer\]/{exit} /^[[:space:]]*DisableCookies[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$conf")
         # grep -c печатает 0 и при этом возвращает 1: ветка `|| printf 0`
         # дописывала бы второй ноль через перевод строки, и колонки разъезжались.
         clients=$(grep -c '^[[:space:]]*\[Peer\]' "$conf" 2>/dev/null) || clients=0
         state=$(systemctl is-active "awg-quick@${name}" 2>/dev/null || printf 'unknown')
 
-        if [[ "$name" == "awg0" ]]; then dir="$SCRIPT_DIR"; else dir="$(dirname -- "$SCRIPT_DIR")/$name"; fi
-        [[ -d "$dir" ]] || dir="—"
+        # Версия видна только по RandomTrailers: интерфейс без него создан до
+        # 3.1, и клиента на нём выдать нельзя, пока не прошёл server-rekey.
+        if [[ "$rtr" == "on" ]]; then ver="3.1"; else ver="3.0 — нужен server-rekey"; fi
 
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "$name" "${port:-?}" "${addr:-?}" "${rtr:-off}" "${dc:-off}" "$clients" "$state"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$name" "${port:-?}" "${addr:-?}" "$ver" "$clients" "$state"
     done
 
     [[ "$found" -eq 1 ]] || log_warn "ни одного интерфейса в /etc/amnezia/amneziawg не найдено"
@@ -2457,23 +2440,12 @@ cmd_ifaces() {
 cmd_server_rekey() {
     load_server_params
 
-    # Без явного флага сохраняем режим интерфейса: молча включить
-    # RandomTrailers на legacy-интерфейсе значит отключить всех его клиентов.
-    # С DisableCookies то же самое, только мягче: туннель он не рвёт, но
-    # появившаяся строка сломала бы разбор конфига у старых приложений — а
-    # именно ради них его и выключали.
-    if [[ "$SRV_RT_EXPLICIT" -eq 0 ]]; then
-        SRV_RANDOM_TRAILERS="${S_RTR:-off}"
-    fi
-    if [[ "$SRV_DC_EXPLICIT" -eq 0 ]]; then
-        SRV_DISABLE_COOKIES="${S_DC:-off}"
-    fi
-    if [[ "$SRV_RANDOM_TRAILERS" == "on" ]]; then
-        require_awg31 "RandomTrailers" || exit 1
-    elif [[ "$SRV_DISABLE_COOKIES" == "on" ]]; then
-        # Модулю ниже 3.1 этот ключ так же неизвестен, и конфиг с ним не
-        # загрузится — проверять надо и когда RandomTrailers выключен.
-        require_awg31 "DisableCookies" || exit 1
+    require_awg31 "параметры 3.1" || exit 1
+
+    # Для интерфейса, созданного до 3.1, это ещё и перевод на 3.1 — другого
+    # способа нет, параметры интерфейса общие для всех его клиентов.
+    if [[ "${S_RTR:-off}" != "on" ]]; then
+        log_warn "Интерфейс ${AWG_IFACE} создан до 3.1 — он будет переведён на 3.1."
     fi
 
     log_warn "Будут сгенерированы НОВЫЕ общие параметры — все текущие подключения оборвутся."
@@ -2496,15 +2468,14 @@ cmd_server_rekey() {
     # список пиров — переносится дословно.
     awk -v s1="$G_S1" -v s2="$G_S2" -v s3="$G_S3" -v s4="$G_S4" \
         -v h1="$G_H1" -v h2="$G_H2" -v h3="$G_H3" -v h4="$G_H4" \
-        -v hpk="$G_HPK" -v cpa="$G_CPA" \
-        -v rtr="$SRV_RANDOM_TRAILERS" -v dc="$SRV_DISABLE_COOKIES" '
+        -v hpk="$G_HPK" -v cpa="$G_CPA" '
         function emit_block() {
             printf "\nS1 = %s\nS2 = %s\nS3 = %s\nS4 = %s\n", s1, s2, s3, s4
             printf "H1 = %s\nH2 = %s\nH3 = %s\nH4 = %s\n", h1, h2, h3, h4
             printf "HeaderProtectionKey = %s\n", hpk
             printf "ContentPaddingAddition = %s\n", cpa
-            if (rtr == "on") printf "RandomTrailers = on\n"
-            if (dc  == "on") printf "DisableCookies = on\n"
+            printf "RandomTrailers = on\n"
+            printf "DisableCookies = on\n"
         }
         BEGIN { in_iface = 0; done = 0 }
         /^[[:space:]]*\[Interface\]/ { in_iface = 1; print; next }
@@ -2589,15 +2560,6 @@ awg3.sh ${SCRIPT_VERSION} — AmneziaWG ${AWG_PROTOCOL}: клиенты и па�
         --ipv6-subnet CIDR
                           (server-init) подсеть IPv6       (по умолч.: ${SRV_IPV6_SUBNET})
         --force           (server-init) пересоздать сервер, перенеся пиров
-        --random-trailers on|off
-                          (server-init, server-rekey) RandomTrailers 3.1.
-                          ОБЯЗАН совпадать на сервере и всех его клиентах:
-                          включённый на одной стороне рвёт туннель. Требует
-                          модуль и tools 3.1  (по умолч.: ${SRV_RANDOM_TRAILERS})
-        --disable-cookies on|off
-                          (server-init, server-rekey) не отвечать на
-                          cookie-запросы. Односторонний, старых клиентов не
-                          ломает                 (по умолч.: ${SRV_DISABLE_COOKIES})
         --iface NAME      серверный интерфейс    (по умолч.: awg0)
                           Принимается и перед командой: awg3 --iface awg1 list
         --to IFACE        (migrate-client) целевой интерфейс
@@ -2671,8 +2633,6 @@ main() {
             --force)        SRV_FORCE=1; shift ;;
             --iface)        AWG_IFACE="${2:-}"; shift 2 ;;
             --to)           MIGRATE_TO="${2:-}"; shift 2 ;;
-            --random-trailers) SRV_RANDOM_TRAILERS="${2:-}"; SRV_RT_EXPLICIT=1; shift 2 ;;
-            --disable-cookies) SRV_DISABLE_COOKIES="${2:-}"; SRV_DC_EXPLICIT=1; shift 2 ;;
             -y|--yes)       ASSUME_YES=1; shift ;;
             -h|--help)      usage; exit 0 ;;
             -*)             die "неизвестная опция: $1  (см. --help)" ;;
@@ -2703,14 +2663,6 @@ main() {
     case "$SRV_IPV6" in
         on|off) ;;
         *) die "--ipv6 ожидает on|off: $SRV_IPV6" ;;
-    esac
-    case "$SRV_RANDOM_TRAILERS" in
-        on|off) ;;
-        *) die "--random-trailers ожидает on|off: $SRV_RANDOM_TRAILERS" ;;
-    esac
-    case "$SRV_DISABLE_COOKIES" in
-        on|off) ;;
-        *) die "--disable-cookies ожидает on|off: $SRV_DISABLE_COOKIES" ;;
     esac
     if [[ -n "$PRUNE_KEEP" ]]; then
         [[ "$PRUNE_KEEP" =~ ^[0-9]+$ ]] && (( PRUNE_KEEP >= 1 )) \

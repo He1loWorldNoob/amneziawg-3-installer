@@ -42,56 +42,72 @@ ${1:-}
 EOF
 }
 
-# ── Клиент повторяет параметры за интерфейсом ───────────────────────────────
-#
-# RandomTrailers обязан совпадать: включённый на одной стороне рвёт туннель
-# целиком. Поэтому источник истины — конфиг сервера, а не флаги командной
-# строки, с которыми запустили add.
 
-@test "RandomTrailers сервера попадает в конфиг клиента" {
-    S_RTR=on S_DC=off
+# ── Параметры 3.1 в конфигах ────────────────────────────────────────────────
+#
+# Выключателей у них больше нет: 3.0 из проекта убран, интерфейс либо 3.1,
+# либо не наш. Проверяем, что параметры доходят до обоих концов — рассинхрон
+# RandomTrailers рвёт туннель целиком.
+
+@test "клиент получает оба параметра 3.1" {
     render_client_conf "$OUT" "PRIV" "10.9.9.2/32" "SRVPUB" "vpn.example.com" 48872
     grep -qx "RandomTrailers = on" "$OUT"
-}
-
-@test "на интерфейсе без RandomTrailers строки в клиенте нет" {
-    # Приложения Amnezia старше 5.0.1.5 этого ключа не знают: лишняя строка
-    # сломала бы им разбор конфига ровно там, где параметр и выключали.
-    S_RTR=off S_DC=off
-    render_client_conf "$OUT" "PRIV" "10.9.9.2/32" "SRVPUB" "vpn.example.com" 48872
-    ! grep -q "RandomTrailers" "$OUT"
-}
-
-@test "DisableCookies берётся у интерфейса, а не из умолчания командной строки" {
-    # Регрессия: клиент получал DisableCookies = on даже на интерфейсе, где
-    # его не было, потому что читалась глобальная переменная сервера.
-    SRV_DISABLE_COOKIES=on
-    S_RTR=off S_DC=off
-    render_client_conf "$OUT" "PRIV" "10.9.9.2/32" "SRVPUB" "vpn.example.com" 48872
-    ! grep -q "DisableCookies" "$OUT"
-}
-
-@test "включённый на интерфейсе DisableCookies доходит до клиента" {
-    SRV_DISABLE_COOKIES=off
-    S_RTR=off S_DC=on
-    render_client_conf "$OUT" "PRIV" "10.9.9.2/32" "SRVPUB" "vpn.example.com" 48872
     grep -qx "DisableCookies = on" "$OUT"
 }
 
-# ── PersistentKeepalive ─────────────────────────────────────────────────────
-
-@test "на 3.1 keepalive идёт диапазоном" {
+@test "keepalive у клиента идёт диапазоном" {
     # Постоянный интервал сам по себе признак, поэтому у каждого клиента он
-    # свой. Диапазон понимают только tools 3.1 и приложение от 5.0.1.5.
-    S_RTR=on S_DC=on
+    # свой. Диапазон понимают tools 3.1 и приложение от 5.0.1.5.
     render_client_conf "$OUT" "PRIV" "10.9.9.2/32" "SRVPUB" "vpn.example.com" 48872
     grep -qE "^PersistentKeepalive = [0-9]+-[0-9]+$" "$OUT"
 }
 
-@test "на legacy-интерфейсе keepalive остаётся числом" {
-    S_RTR=off S_DC=off
-    render_client_conf "$OUT" "PRIV" "10.9.9.2/32" "SRVPUB" "vpn.example.com" 48872
-    grep -qE "^PersistentKeepalive = [0-9]+$" "$OUT"
+@test "конфиг сервера тоже несёт оба параметра" {
+    render_server_conf "$TEST_TMP/srv.conf" "PRIV" "10.9.9.1/24" 48872 1280 "PU" "PD"
+    grep -qx "RandomTrailers = on" "$TEST_TMP/srv.conf"
+    grep -qx "DisableCookies = on" "$TEST_TMP/srv.conf"
+}
+
+@test "сервер получает и свои таймеры: он тоже инициатор при пересогласовании" {
+    render_server_conf "$TEST_TMP/srv.conf" "PRIV" "10.9.9.1/24" 48872 1280 "PU" "PD"
+    grep -qE "^RekeyAfterTime = " "$TEST_TMP/srv.conf"
+    grep -qE "^MaxHandshakeAttempts = " "$TEST_TMP/srv.conf"
+}
+
+# ── Интерфейс, созданный до 3.1 ─────────────────────────────────────────────
+
+@test "load_server_params опознаёт интерфейс без RandomTrailers" {
+    # Отсутствие строки — это выключено: так выглядят все конфиги до 3.1.
+    load_server_params
+    [ "$S_RTR" = "off" ]
+}
+
+@test "с RandomTrailers интерфейс опознаётся как 3.1" {
+    write_server_conf "RandomTrailers = on"
+    load_server_params
+    [ "$S_RTR" = "on" ]
+}
+
+@test "на интерфейсе до 3.1 клиента выдать нельзя" {
+    # Самый дорогой из возможных отказов, если его не сделать: клиент получил
+    # бы RandomTrailers, которого нет у сервера, и туннель не встал бы ВООБЩЕ
+    # — без ошибки, без пакета, просто тишина.
+    S_RTR=off
+    run require_iface_awg31
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"server-rekey"* ]]
+}
+
+@test "на интерфейсе 3.1 сторож пропускает" {
+    S_RTR=on
+    run require_iface_awg31
+    [ "$status" -eq 0 ]
+}
+
+@test "add зовёт сторожа, а не только проверку HeaderProtectionKey" {
+    local body
+    body=$(sed -n '/^cmd_add() {/,/^}/p' "$REPO_ROOT/awg3.sh")
+    [[ "$body" == *require_iface_awg31* ]]
 }
 
 # ── Проверка версий модуля и tools ──────────────────────────────────────────
@@ -112,6 +128,14 @@ EOF
 @test "сравнивается major.minor, а не дата сборки" {
     # Патч-часть у amneziawg — дата сборки, на возможности она не влияет.
     run awg_version_ge "3.1.20250101"; [ "$status" -eq 0 ]
+}
+
+@test "server-init требует 3.1 безусловно" {
+    # Раньше проверка висела на флаге --random-trailers; флага больше нет.
+    local body
+    body=$(sed -n '/^cmd_server_init() {/,/^}/p' "$REPO_ROOT/awg3.sh")
+    [[ "$body" == *require_awg31* ]]
+    [[ "$body" != *SRV_RANDOM_TRAILERS* ]]
 }
 
 # ── Пути по интерфейсу ──────────────────────────────────────────────────────
@@ -143,63 +167,6 @@ EOF
     [ "$LEGACY_KEYS_DIR" = "/home/user/awg1/keys" ]
 }
 
-# ── Конфиг сервера ──────────────────────────────────────────────────────────
-
-@test "включённые параметры 3.1 пишутся в конфиг сервера" {
-    SRV_RANDOM_TRAILERS=on SRV_DISABLE_COOKIES=on
-    render_server_conf "$TEST_TMP/srv.conf" "PRIV" "10.9.9.1/24" 48872 1280 "PU" "PD"
-    grep -qx "RandomTrailers = on" "$TEST_TMP/srv.conf"
-    grep -qx "DisableCookies = on" "$TEST_TMP/srv.conf"
-}
-
-@test "выключенные параметры не пишутся вовсе" {
-    # Строка со значением off ничего не добавляет, а модуль ниже 3.1 на ней
-    # откажется загружать конфиг — и сервис уйдёт в failed при следующем старте.
-    SRV_RANDOM_TRAILERS=off SRV_DISABLE_COOKIES=off
-    render_server_conf "$TEST_TMP/srv.conf" "PRIV" "10.9.9.1/24" 48872 1280 "PU" "PD"
-    ! grep -q "RandomTrailers" "$TEST_TMP/srv.conf"
-    ! grep -q "DisableCookies" "$TEST_TMP/srv.conf"
-}
-
-@test "сервер получает и свои таймеры 3.0: он тоже инициатор при пересогласовании" {
-    render_server_conf "$TEST_TMP/srv.conf" "PRIV" "10.9.9.1/24" 48872 1280 "PU" "PD"
-    grep -qE "^RekeyAfterTime = " "$TEST_TMP/srv.conf"
-    grep -qE "^MaxHandshakeAttempts = " "$TEST_TMP/srv.conf"
-}
-
-# ── Состояние интерфейса из конфига ─────────────────────────────────────────
-
-@test "load_server_params читает RandomTrailers и DisableCookies" {
-    cat > "$AWG3_SERVER_CONF" <<EOF
-[Interface]
-PrivateKey = PRIV
-Address = 10.9.9.1/24
-ListenPort = 48872
-MTU = 1280
-HeaderProtectionKey = KEY
-RandomTrailers = on
-DisableCookies = on
-EOF
-    load_server_params
-    [ "$S_RTR" = "on" ]
-    [ "$S_DC" = "on" ]
-}
-
-@test "конфиг без этих строк читается как выключенные, а не как пустые" {
-    # Так выглядят все конфиги, созданные до 3.1: отсутствие строки — это off.
-    cat > "$AWG3_SERVER_CONF" <<EOF
-[Interface]
-PrivateKey = PRIV
-Address = 10.9.9.1/24
-ListenPort = 48872
-MTU = 1280
-HeaderProtectionKey = KEY
-EOF
-    load_server_params
-    [ "$S_RTR" = "off" ]
-    [ "$S_DC" = "off" ]
-}
-
 # ── server-rekey ────────────────────────────────────────────────────────────
 
 need_awg() { command -v awg >/dev/null 2>&1 || skip "awg не установлен"; }
@@ -209,10 +176,11 @@ need_awg() { command -v awg >/dev/null 2>&1 || skip "awg не установле
     # ContentPaddingAddition заполняет gen_sender_params — падение с
     # 'G_CPA: unbound variable' случалось уже ПОСЛЕ снятия бэкапа.
     need_awg
-    write_server_conf
+    write_server_conf "RandomTrailers = on"
     printf '\n[Peer]\nPublicKey = PEERPUB\nAllowedIPs = 10.9.9.2/32\n' >> "$AWG3_SERVER_CONF"
 
     ASSUME_YES=1
+    require_awg31() { :; }
     apply_restart() { :; }
     run cmd_server_rekey
     [ "$status" -eq 0 ]
@@ -225,30 +193,30 @@ need_awg() { command -v awg >/dev/null 2>&1 || skip "awg не установле
     grep -qx "PublicKey = PEERPUB" "$AWG3_SERVER_CONF"
 }
 
-@test "server-rekey не включает RandomTrailers на legacy-интерфейсе молча" {
-    # Иначе одна команда «сменить параметры» отключила бы всех клиентов
-    # интерфейса, который держат на 3.0 ради старых приложений.
+@test "server-rekey переводит интерфейс до 3.1 на 3.1" {
+    # Единственный способ это сделать: параметры интерфейса общие для всех его
+    # клиентов, выборочно перевести одного нельзя.
     need_awg
     write_server_conf
+    load_server_params
+    [ "$S_RTR" = "off" ]
 
     ASSUME_YES=1
-    apply_restart() { :; }
-    run cmd_server_rekey
-    [ "$status" -eq 0 ]
-    ! grep -q "RandomTrailers" "$AWG3_SERVER_CONF"
-    ! grep -q "DisableCookies" "$AWG3_SERVER_CONF"
-}
-
-@test "явный --random-trailers on сильнее прежнего состояния интерфейса" {
-    need_awg
-    write_server_conf
-
-    ASSUME_YES=1
-    SRV_RT_EXPLICIT=1
-    SRV_RANDOM_TRAILERS=on
     require_awg31() { :; }
     apply_restart() { :; }
     run cmd_server_rekey
     [ "$status" -eq 0 ]
     grep -qx "RandomTrailers = on" "$AWG3_SERVER_CONF"
+    grep -qx "DisableCookies = on" "$AWG3_SERVER_CONF"
+}
+
+@test "server-rekey не плодит вторую строку параметров" {
+    need_awg
+    write_server_conf "RandomTrailers = on"
+    ASSUME_YES=1
+    require_awg31() { :; }
+    apply_restart() { :; }
+    run cmd_server_rekey
+    [ "$status" -eq 0 ]
+    [ "$(grep -c '^RandomTrailers' "$AWG3_SERVER_CONF")" -eq 1 ]
 }
