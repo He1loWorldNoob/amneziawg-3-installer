@@ -153,23 +153,23 @@ run_isolated() {
     grep -q "bootstrap.sh --user" "$SCRIPT"
 }
 
-@test "порт VPN в ufw установщик не открывает" {
-    # Порт знает только тот, кто создаёт интерфейс, а интерфейсов может быть
-    # несколько. Общая часть фаервола — политики и лимит на SSH — остаётся.
-    ! grep -q 'ufw allow "${AWG_PORT}/udp"' "$SCRIPT"
-    ! grep -q "ufw route allow in on awg0" "$SCRIPT"
-    grep -q "SSH Rate Limit" "$SCRIPT"
+@test "фаервол установщик не настраивает вовсе" {
+    # Стартовый фаервол — дело bootstrap.sh, порт интерфейса открывает
+    # awg3 server-init: он один знает, какой порт у какого интерфейса.
+    ! grep -q "setup_improved_firewall" "$SCRIPT"
+    ! grep -q "detect_ssh_ports" "$SCRIPT"
+    ! grep -q "step4_setup_firewall" "$SCRIPT"
+    grep -q "ufw_setup" "$REPO_ROOT/bootstrap.sh"
 }
 
-@test "стек установки состоит только из шагов установки" {
+@test "стек установки — только пакеты и модуль" {
     local body
     body=$(sed -n '/^install_amneziawg_stack() {/,/^}/p' "$SCRIPT")
-    [[ "$body" == *step1_update_and_optimize* ]]
+    [[ "$body" == *step1_prepare_apt* ]]
     [[ "$body" == *step2_install_amnezia* ]]
     [[ "$body" == *step3_check_module* ]]
-    [[ "$body" == *step4_setup_firewall* ]]
+    [[ "$body" != *step4* ]]
     [[ "$body" != *ask_params* ]]
-    [[ "$body" != *sync_ipv6_settings* ]]
 }
 
 @test "финальное сообщение отправляет к server-init" {
@@ -178,21 +178,35 @@ run_isolated() {
     [[ "$body" == *"awg3 server-init"* ]]
 }
 
-@test "fail2ban переехал к фаерволу, а не пропал вместе с шагом 7" {
-    ! grep -q "step7_start_service" "$SCRIPT"
-    local body
-    body=$(sed -n '/^step4_setup_firewall() {/,/^}/p' "$SCRIPT")
-    [[ "$body" == *setup_fail2ban* ]]
+@test "подготовка системы уехала в bootstrap целиком" {
+    # Установщик AmneziaWG не должен решать, как настроен чужой сервер:
+    # swap, sysctl, тюнинг сетевой карты, снос пакетов и fail2ban — не его дело.
+    local f
+    for f in cleanup_system optimize_system optimize_swap optimize_nic              setup_advanced_sysctl setup_minimal_sysctl apply_sysctl_profile              setup_fail2ban step7_start_service; do
+        ! grep -q "^${f}() {" "$SCRIPT"
+        grep -q "$f" "$REPO_ROOT/bootstrap.sh" || [[ "$f" == step7_start_service ]]
+    done
+}
+
+@test "обновление системы установщик не делает — оно в bootstrap" {
+    # Иначе то же самое делалось бы дважды, и перезагрузка после обновления
+    # ядра случалась бы в середине установки.
+    ! grep -q "full-upgrade" "$SCRIPT"
+    grep -q "full-upgrade" "$REPO_ROOT/bootstrap.sh"
 }
 
 # ── Разбор аргументов ───────────────────────────────────────────────────────
 
 @test "оставшиеся флаги разбираются" {
-    parse_args --awg-dir "$TEST_TMP/data" --no-tweaks --yes --verbose
+    parse_args --awg-dir "$TEST_TMP/data" --yes --verbose
     [ "$AWG3_DIR" = "$TEST_TMP/data" ]
-    [ "$NO_TWEAKS" -eq 1 ]
     [ "$AUTO_YES" -eq 1 ]
     [ "$VERBOSE" -eq 1 ]
+}
+
+@test "--no-tweaks у установщика больше нет: тюнинг не его задача" {
+    run_isolated 'parse_args --no-tweaks'
+    [ "$status" -ne 0 ]
 }
 
 @test "неизвестная опция отвергается" {
@@ -225,20 +239,104 @@ run_isolated() {
 
 # ── sysctl ──────────────────────────────────────────────────────────────────
 
-@test "шаг 1 пишет sysctl одной функцией" {
-    # Профиль выбирается в одном месте: --no-tweaks не должен расходиться с
-    # обычным путём в том, какой файл и с каким IPv6 окажется на диске.
+@test "шаг 1 остался только ради работоспособного apt" {
+    # Без gpg и curl не добавить репозиторий Amnezia; всё остальное из шага 1
+    # уехало в bootstrap.
     local body
-    body=$(sed -n '/^step1_update_and_optimize() {/,/^}/p' "$SCRIPT")
-    [[ "$body" == *apply_sysctl_profile* ]]
-    [[ "$body" != *setup_advanced_sysctl* ]]
+    body=$(sed -n '/^step1_prepare_apt() {/,/^}/p' "$SCRIPT")
+    [[ "$body" == *apt_update_tolerant* ]]
+    [[ "$body" == *"install_packages curl wget gpg"* ]]
+    [[ "$body" != *optimize_system* ]]
+    [[ "$body" != *cleanup_system* ]]
 }
 
-@test "установщик глушит IPv6, снимать отключение — дело server-init" {
-    # Он ставится до того, как известно, нужен ли IPv6 в туннеле. Ответ есть
-    # только у awg3 server-init, и его enable_forwarding пишет свой файл
-    # sysctl.d, который применяется после установщикова.
-    ! grep -q "sync_ipv6_settings" "$SCRIPT"
-    grep -q "disable_ipv6" "$SCRIPT"
+@test "IPv6 глушит bootstrap, снимает отключение server-init" {
+    # Bootstrap отрабатывает до того, как известно, нужен ли IPv6 в туннеле.
+    # Ответ есть только у awg3 server-init, и его enable_forwarding пишет свой
+    # файл sysctl.d, который применяется после bootstrap-овского.
+    grep -q "disable_ipv6" "$REPO_ROOT/bootstrap.sh"
     grep -q "disable_ipv6" "$REPO_ROOT/awg3.sh"
+    # В установщике упоминания остались только в удалении и диагностике —
+    # писать sysctl он больше не умеет.
+    ! grep -q "setup_advanced_sysctl" "$SCRIPT"
+    ! grep -q "setup_minimal_sysctl" "$SCRIPT"
+}
+
+# ── Загрузка модуля ─────────────────────────────────────────────────────────
+
+@test "Secure Boot отличается от устаревшего ядра, а не уводит в перезагрузки" {
+    # Раньше любой отказ modprobe объявлялся следствием обновления ядра. При
+    # включённом Secure Boot модуль не грузится никогда — и человек ходил по
+    # кругу: перезагрузка, то же сообщение, снова перезагрузка.
+    modprobe() { echo "modprobe: ERROR: could not insert 'amneziawg': Key was rejected by service" >&2; return 1; }
+    run load_amneziawg_module
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"Secure Boot"* ]]
+    [[ "$output" == *"mokutil"* ]]
+}
+
+@test "модуль, собранный под работающее ядро, перезагрузкой не лечится" {
+    modprobe() { echo "modprobe: ERROR: could not insert 'amneziawg': Invalid argument" >&2; return 1; }
+    compgen() { return 0; }
+    run load_amneziawg_module
+    [ "$status" -eq 2 ]
+}
+
+@test "модуль под другое ядро — случай, когда перезагрузка помогает" {
+    modprobe() { echo "modprobe: FATAL: Module amneziawg not found" >&2; return 1; }
+    compgen() { return 1; }
+    run load_amneziawg_module
+    [ "$status" -eq 1 ]
+}
+
+@test "загруженный модуль — успех без единого сообщения" {
+    modprobe() { return 0; }
+    run load_amneziawg_module
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "слепого modprobe в установке не осталось" {
+    # Проверяем по всему файлу, а не по телу шага 2: внутри него лежит
+    # heredoc со вспомогательным скриптом, и его закрывающая скобка в первой
+    # колонке обрывает выборку функции на середине.
+    grep -q "load_amneziawg_module" "$SCRIPT"
+    run grep -c "modprobe amneziawg 2>/dev/null" "$SCRIPT"
+    [ "$output" = "0" ]
+}
+
+@test "текст перезагрузки не обещает несуществующих параметров" {
+    # Флагов VPN у установщика больше нет, и повторять «те же параметры»
+    # незачем: единственное, что влияет на каталог данных, — --awg-dir.
+    local body
+    body=$(sed -n '/^request_reboot() {/,/^}/p' "$SCRIPT")
+    [[ "$body" != *"те же параметры"* ]]
+    [[ "$body" != *"домашний каталог лягут конфиги"* ]]
+}
+
+# ── Недоступные репозитории ─────────────────────────────────────────────────
+
+@test "пустой каталог индексов apt считается непригодным" {
+    # apt-get update выходит с нулём, даже не скачав ни одного индекса:
+    # недоступное зеркало для него предупреждение, а не ошибка. Дальше
+    # установка падала на «Unable to locate package gpg» — сообщении, которое
+    # отправляет искать пропавший пакет вместо недоступной сети.
+    mkdir -p "$TEST_TMP/lists"
+    run apt_lists_usable "$TEST_TMP/lists"
+    [ "$status" -ne 0 ]
+
+    touch "$TEST_TMP/lists/mirror.example.com_debian_dists_trixie_main_binary-amd64_Packages"
+    run apt_lists_usable "$TEST_TMP/lists"
+    [ "$status" -eq 0 ]
+}
+
+@test "недоступные хосты вытаскиваются из вывода apt" {
+    local out
+    out=$(apt_failed_hosts 'Err:6 https://deb.debian.org/debian-security trixie-security InRelease
+  Cannot initiate the connection
+W: Failed to fetch mirror+file:/etc/apt/mirrors/debian.list/dists/trixie/InRelease
+Hit:7 https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu noble InRelease')
+    [[ "$out" == *"deb.debian.org"* ]]
+    # Успешные строки в список не попадают.
+    [[ "$out" != *"ppa.launchpadcontent.net"* ]]
 }

@@ -64,11 +64,8 @@ prepare_awg_dir() {
 }
 
 # CLI flags
-UNINSTALL=0; HELP=0; HELP_EXIT_RC=0; DIAGNOSTIC=0; VERBOSE=0; NO_COLOR=0; AUTO_YES=0; NO_TWEAKS=0
+UNINSTALL=0; HELP=0; HELP_EXIT_RC=0; DIAGNOSTIC=0; VERBOSE=0; NO_COLOR=0; AUTO_YES=0
 _APT_UPDATED=0
-# CLI_SSH_PORT — порт SSH для правила ufw, если автоопределение ошибается.
-# CLI_NO_TWEAKS дублирует NO_TWEAKS ради кода, унаследованного от апстрима.
-CLI_SSH_PORT=""; CLI_NO_TWEAKS=0
 
 # --- Auto-cleanup of temporary files ---
 _install_temp_files=()
@@ -148,6 +145,25 @@ die()       { log_error "CRITICAL ERROR: $1"; log_error "Installation aborted. L
 # to ignore. Returns 0 if update succeeded OR if all errors are on source markers.
 # Any other error (GPG, binary-package network, silent crash / OOM / SIGKILL) → non-zero.
 # ==============================================================================
+# apt_lists_usable [каталог] — есть ли на диске хоть один индекс пакетов.
+#
+# Пустой /var/lib/apt/lists означает, что ставить не из чего, чем бы ни
+# закончился apt update. Каталог берётся аргументом только ради тестов: путь на
+# Debian и Ubuntu один и тот же, а других систем скрипт не поддерживает.
+# shellcheck disable=SC2120  # в установщике зовётся без аргумента, bats передаёт каталог
+apt_lists_usable() {
+    local dir="${1:-/var/lib/apt/lists}" n
+    n=$(find "$dir" -maxdepth 1 -type f -name '*_Packages*' 2>/dev/null | wc -l)
+    [[ "${n:-0}" -gt 0 ]]
+}
+
+# apt_failed_hosts <вывод apt update> — хосты, до которых apt не достучался.
+# Нужны в сообщении: без них человек видит стену одинаковых строк и не понимает,
+# какое из зеркал его подвело.
+apt_failed_hosts() {
+    printf '%s' "$1"         | grep -E '^(Err:|W: Failed to fetch)'         | grep -oE 'https?://[^/ ]+'         | sed 's|https\?://||'         | sort -u
+}
+
 apt_update_tolerant() {
     # --ppa-amnezia-tolerant: also ignore errors from the Amnezia PPA. Used
     # in step 2 — apt_wait_for_ppa_package below already retries for the
@@ -165,8 +181,32 @@ apt_update_tolerant() {
     rc=$?
     echo "$err_output"
 
+    # rc=0 ещё ничего не значит: недоступное зеркало для apt-get update —
+    # предупреждение, а не ошибка, и он выходит с нулём, не скачав НИ ОДНОГО
+    # индекса. Дальше установка шла с пустым кэшем и падала через минуту на
+    # «Unable to locate package gpg» — сообщении, которое отправляет искать
+    # пропавший пакет вместо недоступного зеркала.
     if [[ $rc -eq 0 ]]; then
-        return 0
+        if apt_lists_usable; then
+            local failed
+            failed=$(apt_failed_hosts "$err_output")
+            if [[ -n "$failed" ]]; then
+                log_warn "часть репозиториев недоступна, продолжаю с тем, что скачалось:"
+                printf '%s
+' "$failed" | while IFS= read -r h; do log_warn "  $h"; done
+            fi
+            return 0
+        fi
+
+        log_error "apt update завершился без ошибки, но не скачал ни одного индекса пакетов."
+        log_error "Ставить не из чего. Недоступны:"
+        apt_failed_hosts "$err_output" | while IFS= read -r h; do log_error "  $h"; done
+        log_error " "
+        log_error "Проверьте с этой машины: curl -4 -sI https://deb.debian.org/debian/dists/stable/InRelease"
+        log_error "Если зеркало недоступно именно из вашей сети, замените его:"
+        log_error "  Debian 13:  /etc/apt/mirrors/debian.list и debian-security.list"
+        log_error "  остальные:  /etc/apt/sources.list, /etc/apt/sources.list.d/"
+        return 1
     fi
 
     # Filter error lines. Ignore:
@@ -287,8 +327,14 @@ update_state() {
     log "State: next step - $next_step"
 }
 
+# request_reboot <следующий шаг> [причина]
+#
+# Причина передаётся аргументом: перезагрузка нужна и после обновления ядра, и
+# когда модуль собран под другое ядро, а объяснение у них разное. Раньше текст
+# был один на оба случая и всегда говорил про обновление ядра.
 request_reboot() {
     local next_step=$1
+    local reason="${2:-Обновилось ядро.}"
     update_state "$next_step"
 
     # Capture boot_id before the 1→2 reboot gate. On step 2 entry we
@@ -306,15 +352,13 @@ request_reboot() {
     echo "" >> "$LOG_FILE"
     log_warn "=============================================================="
     log_warn "  НУЖНА ПЕРЕЗАГРУЗКА"
-    log_warn "  Обновилось ядро. Модуль AmneziaWG должен собираться под то"
-    log_warn "  ядро, которое реально работает, иначе после следующей"
-    log_warn "  перезагрузки он не загрузится."
+    log_warn "  ${reason} Модуль AmneziaWG должен собираться под то ядро,"
+    log_warn "  которое реально работает, иначе он не загрузится."
     log_warn " "
-    log_warn "  После перезагрузки повторите ТУ ЖЕ команду целиком:"
-    log_warn "    sudo $0 ${ORIGINAL_ARGS:-<те же параметры>}"
+    log_warn "  После перезагрузки повторите:"
+    log_warn "    sudo $0 ${ORIGINAL_ARGS}"
     log_warn " "
-    log_warn "  Важно повторить именно её: от параметров зависит, в чей"
-    log_warn "  домашний каталог лягут конфиги клиентов."
+    log_warn "  Установка продолжится с того места, где остановилась."
     log_warn "=============================================================="
     echo "" >> "$LOG_FILE"
     local confirm="y"
@@ -653,517 +697,27 @@ validate_cidr_list() {
 # System optimization (new in v5.0)
 # ==============================================================================
 
-# Detect hardware characteristics
-detect_hardware() {
-    TOTAL_RAM_MB=$(awk '/MemTotal/ {printf "%.0f", $2/1024}' /proc/meminfo)
-    CPU_CORES=$(nproc)
-    MAIN_NIC=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
-    log "Hardware: RAM=${TOTAL_RAM_MB}MB, CPU=${CPU_CORES} cores, NIC=${MAIN_NIC}"
-}
 
-# Remove unnecessary packages and services
-cleanup_system() {
-    log "Cleaning system of unnecessary components..."
 
-    # Snapshot default route BEFORE cleanup - detects when we break the network.
-    # Issue #84: on clean Ubuntu 26.04 server (subiquity, no cloud-init netplan
-    # markers) apt-get autoremove after purging cloud-init removed
-    # netplan-generator as a transitive dep, and the server lost its IP on reboot.
-    local pre_default_route
-    pre_default_route="$(ip -4 route show default 2>/dev/null | head -1 || true)"
-    log_debug "Pre-cleanup default route: ${pre_default_route:-<none>}"
 
-    # apt-mark hold for critical network stack packages: defence against
-    # accidental removal via transitive deps. Covers both netplan naming
-    # variants (netplan.io on 24.04, netplan-generator on 25.10/26.04) plus
-    # systemd-resolved and netcfg/ifupdown legacy. There is no standalone
-    # systemd-networkd package - the binary lives inside systemd, nothing to hold.
-    # Before holding we snapshot the user's existing holds so we never strip
-    # holds we did not place (e.g. on linux-image-* held by the user).
-    local _hold_pkgs="netplan.io netplan-generator systemd-resolved netcfg ifupdown"
-    local _preexisting_holds=""
-    _preexisting_holds="$(apt-mark showhold 2>/dev/null || true)"
-    local _held_actual=()
-    local _hpkg
-    for _hpkg in $_hold_pkgs; do
-        if dpkg-query -W -f='${Status}' "$_hpkg" 2>/dev/null | grep -q "ok installed"; then
-            # Skip if user already held - that hold is not ours to release.
-            if grep -qxF "$_hpkg" <<<"$_preexisting_holds"; then
-                continue
-            fi
-            apt-mark hold "$_hpkg" >/dev/null 2>&1 && _held_actual+=("$_hpkg")
-        fi
-    done
-    [ ${#_held_actual[@]} -gt 0 ] && log_debug "Apt-mark hold: ${_held_actual[*]}"
 
-    # Packages to remove (safe for VPS)
-    # snapd and lxd-agent-loader — Ubuntu only, not present on Debian
-    local packages_to_remove=()
-    local pkg
-    local cleanup_list="modemmanager networkd-dispatcher unattended-upgrades packagekit udisks2"
-    if [[ "${OS_ID:-ubuntu}" == "ubuntu" ]]; then
-        cleanup_list="snapd $cleanup_list lxd-agent-loader"
-    fi
-    for pkg in $cleanup_list; do
-        if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "ok installed"; then
-            packages_to_remove+=("$pkg")
-        fi
-    done
-
-    if [ ${#packages_to_remove[@]} -gt 0 ]; then
-        log "Removing: ${packages_to_remove[*]}"
-        DEBIAN_FRONTEND=noninteractive apt-get purge -y "${packages_to_remove[@]}" || log_warn "Error removing some packages"
-    fi
-
-    # Cleaning snap artifacts (Ubuntu only)
-    if [[ "${OS_ID:-ubuntu}" == "ubuntu" && -d /snap ]]; then
-        log "Cleaning snap artifacts..."
-        rm -rf /snap /var/snap /var/lib/snapd 2>/dev/null || log_warn "snap cleanup error"
-    fi
-
-    # cloud-init: remove only if NOT managing network
-    # Conservative approach: check cloud-init markers first, then renderer
-    if dpkg-query -W -f='${Status}' cloud-init 2>/dev/null | grep -q "ok installed"; then
-        local cloud_manages_network=0
-        # Check cloud-init markers (priority — safety)
-        if ls /etc/netplan/*cloud-init* &>/dev/null 2>&1; then
-            cloud_manages_network=1
-        elif grep -rq "cloud-init" /etc/netplan/ 2>/dev/null; then
-            cloud_manages_network=1
-        elif [[ -f /etc/network/interfaces ]] && grep -q "cloud-init" /etc/network/interfaces 2>/dev/null; then
-            cloud_manages_network=1
-        fi
-        if [[ $cloud_manages_network -eq 0 ]]; then
-            log "Removing cloud-init (network doesn't depend on it)..."
-            DEBIAN_FRONTEND=noninteractive apt-get purge -y cloud-init 2>/dev/null || log_warn "cloud-init removal error"
-            rm -rf /etc/cloud /var/lib/cloud 2>/dev/null
-        else
-            log_warn "cloud-init manages network — skipping removal."
-        fi
-    fi
-
-    # apt-get autoremove dropped (was the source of Issue #84 on Ubuntu 26.04
-    # ISO): autoremove zapped netplan-generator as a transitive dep of
-    # cloud-init. Orphans left after purge take ~50-200 MB - acceptable trade
-    # for stability. User can manually run apt-get autoremove --no-install-recommends.
-
-    # Release apt-mark holds so packages do not stay frozen for the user.
-    local _upkg
-    for _upkg in "${_held_actual[@]}"; do
-        apt-mark unhold "$_upkg" >/dev/null 2>&1 || true
-    done
-
-    # Verify default route is still present. If lost, attempt recovery.
-    # We reinstall netplan.io unconditionally (present on every supported
-    # distro). netplan-generator only ships from Ubuntu 25.10+ / Debian 13+ -
-    # gate the install behind apt-cache show so Debian 12 does not abort the
-    # transaction trying to fetch a non-existent package.
-    local post_default_route
-    post_default_route="$(ip -4 route show default 2>/dev/null | head -1 || true)"
-    if [[ -n "$pre_default_route" && -z "$post_default_route" ]]; then
-        log_error "Default route lost after cleanup. Attempting recovery..."
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            netplan.io 2>/dev/null || true
-        if apt-cache show netplan-generator &>/dev/null; then
-            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                netplan-generator 2>/dev/null || true
-        fi
-        systemctl restart systemd-networkd 2>/dev/null || true
-        netplan apply 2>/dev/null || true
-        # Route-wait loop: up to ~26 seconds, polling every 1-5 seconds.
-        # Fixed sleeps are unreliable - DHCP route appearance on slow VMs is
-        # unpredictable.
-        local _wait
-        for _wait in 1 2 3 5 5 5 5; do
-            post_default_route="$(ip -4 route show default 2>/dev/null | head -1 || true)"
-            [[ -n "$post_default_route" ]] && break
-            sleep "$_wait"
-        done
-        # Last-ditch: bring up the interface from pre_default_route. Try
-        # networkctl renew first (for systemd-networkd-managed link); if the
-        # route still does not come back, fall through to dhclient (ifupdown).
-        if [[ -z "$post_default_route" ]]; then
-            local _iface
-            _iface="$(awk '{for (i=1; i<=NF; i++) if ($i == "dev") { print $(i+1); exit } }' <<<"$pre_default_route")"
-            if [[ -n "$_iface" ]]; then
-                log_warn "Last-ditch attempt to bring $_iface up..."
-                ip link set "$_iface" up 2>/dev/null || true
-                if command -v networkctl &>/dev/null; then
-                    networkctl renew "$_iface" 2>/dev/null || true
-                    sleep 3
-                    post_default_route="$(ip -4 route show default 2>/dev/null | head -1 || true)"
-                fi
-                # If networkctl did not bring the route back (or is absent) - dhclient.
-                if [[ -z "$post_default_route" ]] && command -v dhclient &>/dev/null; then
-                    dhclient -4 "$_iface" 2>/dev/null || true
-                    sleep 3
-                    post_default_route="$(ip -4 route show default 2>/dev/null | head -1 || true)"
-                fi
-            fi
-        fi
-        if [[ -z "$post_default_route" ]]; then
-            die "Network did not recover after cleanup_system. Restore it from the console (e.g. sudo dhclient -4 <iface>) and retry the installer with --no-tweaks flag."
-        fi
-        log_warn "Network recovered: $post_default_route"
-    fi
-
-    log "System cleanup completed."
-}
-
-# Swap configuration
-optimize_swap() {
-    log "Optimizing swap..."
-    local target_swap_mb
-
-    if [[ $TOTAL_RAM_MB -le 2048 ]]; then
-        target_swap_mb=1024
-    else
-        target_swap_mb=512
-    fi
-
-    # Check current swap
-    local current_swap_mb
-    current_swap_mb=$(free -m | awk '/Swap:/ {print $2}')
-
-    if [[ $current_swap_mb -ge $target_swap_mb ]]; then
-        log "Swap is already sufficient: ${current_swap_mb}MB (target: ${target_swap_mb}MB)"
-    else
-        log "Creating swap file: ${target_swap_mb}MB"
-        # Disable existing swap file if present
-        if [[ -f /swapfile ]]; then
-            swapoff /swapfile 2>/dev/null
-            rm -f /swapfile
-        fi
-        dd if=/dev/zero of=/swapfile bs=1M count="$target_swap_mb" status=none 2>/dev/null || {
-            log_warn "Error creating swap file"
-            return 1
-        }
-        chmod 600 /swapfile
-        mkswap /swapfile >/dev/null 2>&1 || { log_warn "mkswap error"; return 1; }
-        swapon /swapfile || { log_warn "swapon error"; return 1; }
-        # Add to fstab if missing. Precise field match: ignore commented
-        # lines and partial matches (e.g. `/swapfile.bak` or an old entry
-        # left in a comment).
-        if ! awk '!/^[[:space:]]*#/ && $1 == "/swapfile" && $3 == "swap" {found=1} END {exit !(found+0)}' \
-             /etc/fstab; then
-            echo '/swapfile none swap sw 0 0' >> /etc/fstab
-        fi
-        log "Swap file created: ${target_swap_mb}MB"
-    fi
-
-    # Setting swappiness
-    sysctl -w vm.swappiness=10 >/dev/null 2>&1
-}
-
-# Network interface optimization
-optimize_nic() {
-    if [[ -z "$MAIN_NIC" ]]; then
-        log_warn "Main NIC not detected, skipping optimization."
-        return 1
-    fi
-
-    if ! command -v ethtool &>/dev/null; then
-        log_debug "ethtool not found, skipping NIC optimization."
-        return 0
-    fi
-
-    log "NIC optimization: $MAIN_NIC"
-    # Disable GRO/GSO/TSO — may interfere with VPN traffic
-    ethtool -K "$MAIN_NIC" gro off 2>/dev/null || log_debug "GRO: not supported/already off."
-    ethtool -K "$MAIN_NIC" gso off 2>/dev/null || log_debug "GSO: not supported/already off."
-    ethtool -K "$MAIN_NIC" tso off 2>/dev/null || log_debug "TSO: not supported/already off."
-    log "NIC optimization completed."
-}
-
-# Full system optimization
-optimize_system() {
-    log "Optimizing system for VPN server..."
-    detect_hardware
-    optimize_swap
-    optimize_nic
-    log "System optimization completed."
-}
 
 # ==============================================================================
 # Sysctl configuration (minimal, for --no-tweaks)
 # ==============================================================================
 
-# Какой из двух наборов sysctl писать, решает --no-tweaks. Оба переписывают
-# свой файл целиком, поэтому функцию можно звать повторно: именно так решение
-# про IPv6, ставшее известным уже после шага 1, попадает в файл до следующей
-# перезагрузки.
-apply_sysctl_profile() {
-    if [[ "$NO_TWEAKS" -eq 0 ]]; then
-        setup_advanced_sysctl
-    else
-        setup_minimal_sysctl
-    fi
-}
 
-setup_minimal_sysctl() {
-    log "Configuring minimal sysctl (--no-tweaks)..."
-    local f="/etc/sysctl.d/99-amneziawg-forwarding.conf"
-    cat > "$f" << SYSEOF
-# AmneziaWG — minimal settings (--no-tweaks)
-net.ipv4.ip_forward = 1
-SYSEOF
-    if [[ "${DISABLE_IPV6:-1}" -eq 1 ]]; then
-        cat >> "$f" << SYSEOF
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
-net.ipv6.conf.lo.disable_ipv6 = 1
-SYSEOF
-    else
-        cat >> "$f" << SYSEOF
-net.ipv6.conf.all.forwarding = 1
-SYSEOF
-    fi
-    sysctl -p "$f" >/dev/null 2>&1 || log_warn "sysctl -p error"
-    log "Minimal sysctl configured."
-}
 
 # ==============================================================================
 # Sysctl configuration (extended)
 # ==============================================================================
 
-setup_advanced_sysctl() {
-    log "Configuring sysctl..."
-    local f="/etc/sysctl.d/99-amneziawg-security.conf"
-
-    # Adaptive buffers based on RAM
-    local rmem_max wmem_max netdev_backlog
-    if [[ ${TOTAL_RAM_MB:-1024} -ge 2048 ]]; then
-        rmem_max=16777216    # 16MB
-        wmem_max=16777216
-        netdev_backlog=5000
-    else
-        rmem_max=4194304     # 4MB
-        wmem_max=4194304
-        netdev_backlog=2500
-    fi
-
-    cat > "$f" << EOF
-# AmneziaWG Security/Performance Settings - $(date)
-# Auto-generated by install_amneziawg_en.sh v${SCRIPT_VERSION}
-
-# --- IP Forwarding ---
-net.ipv4.ip_forward = 1
-$(if [[ "${DISABLE_IPV6:-1}" -eq 1 ]]; then
-    echo "net.ipv6.conf.all.disable_ipv6 = 1"
-    echo "net.ipv6.conf.default.disable_ipv6 = 1"
-    echo "net.ipv6.conf.lo.disable_ipv6 = 1"
-else
-    echo "# IPv6 not disabled"
-    echo "net.ipv6.conf.all.forwarding = 1"
-fi)
-
-# --- TCP/IP Hardening ---
-# rp_filter = 2 (loose mode): validates source IP against ANY route in the
-# table, not against the reverse path through the same interface. Strict mode
-# (=1) breaks routing on cloud hosters (Hetzner and similar) where the gateway
-# is in a different subnet than the VPS IP — reply packets fail the strict
-# reverse path check. Loose mode is safe: spoofed source IPs are still dropped
-# if no route exists for them at all. Discussion #41 (z036).
-net.ipv4.conf.all.rp_filter = 2
-net.ipv4.conf.default.rp_filter = 2
-net.ipv4.icmp_echo_ignore_broadcasts = 1
-net.ipv4.icmp_ignore_bogus_error_responses = 1
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_max_syn_backlog = 4096
-net.ipv4.tcp_synack_retries = 2
-net.ipv4.tcp_syn_retries = 5
-net.ipv4.tcp_rfc1337 = 1
-
-# --- Redirects ---
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv4.conf.default.accept_redirects = 0
-net.ipv4.conf.all.secure_redirects = 0
-net.ipv4.conf.default.secure_redirects = 0
-net.ipv4.conf.all.send_redirects = 0
-net.ipv4.conf.default.send_redirects = 0
-net.ipv4.conf.all.accept_source_route = 0
-net.ipv4.conf.default.accept_source_route = 0
-$(if [[ "${DISABLE_IPV6:-1}" -ne 1 ]]; then
-    echo "net.ipv6.conf.all.accept_redirects = 0"
-    echo "net.ipv6.conf.default.accept_redirects = 0"
-fi)
-
-# --- BBR Congestion Control ---
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-
-# --- Network Buffers (adaptive) ---
-net.core.rmem_max = ${rmem_max}
-net.core.wmem_max = ${wmem_max}
-net.core.netdev_max_backlog = ${netdev_backlog}
-
-# --- Conntrack ---
-net.netfilter.nf_conntrack_max = 65536
-
-# --- Security ---
-vm.swappiness = 10
-kernel.sysrq = 0
-
-# Suppress kernel warning/notice messages in the hoster VNC console.
-# Without this, fail2ban UFW blocks spam the VNC window with "[UFW BLOCK]"
-# lines and make the console unusable.
-# Format: console_loglevel default_msg_loglevel min_console_loglevel default_console_loglevel
-# Value 3 = KERN_ERR — only errors and above reach the console.
-# Discussion #41 (z036).
-kernel.printk = 3 4 1 3
-EOF
-
-    log "Applying sysctl..."
-    if ! sysctl -p "$f" >/dev/null 2>&1; then
-        # nf_conntrack may be unavailable before module is loaded
-        log_warn "Some sysctl parameters did not apply (nf_conntrack will be available later)."
-        sysctl -p "$f" 2>/dev/null || true
-    fi
-}
 
 # ==============================================================================
 # Firewall and security
 # ==============================================================================
 
-# Detect the real SSH port(s) so the UFW rule does not lock you out.
-# Without this, ufw limit 22/tcp + default deny incoming cuts server access
-# after ufw enable when SSH runs on a non-standard port (Issue #91).
-# Самодостаточно: вызывается на шаге 4.
-# Sources:
-#   1. CLI_SSH_PORT (--ssh-port=, manual override, comma-separated list) - authoritative
-#   otherwise UNION (not fallback - so we never miss the real port):
-#   2. sshd -T   (effective config: `Port` AND `ListenAddress host:port`, honours drop-ins)
-#   3. ss -tlnp  (real sshd listening sockets: ground truth for ListenAddress)
-#   4. /etc/ssh/sshd_config + sshd_config.d/*.conf (parsing, only if 2-3 are empty)
-#   5. 22 (default, if nothing is found)
-# Prints unique valid ports (1-65535) space-separated to stdout.
-# IMPORTANT: only log_warn/log_error (stderr) inside; log() writes to stdout
-# and would corrupt the $(detect_ssh_ports) capture.
-detect_ssh_ports() {
-    local ports="" p pp valid=""
-    # awk: pulls the port from `port N` and `listenaddress host:port` lines
-    # (IPv4 and [IPv6]); a bare address without a port is skipped.
-    local awk_ports='tolower($1)=="port"&&$2~/^[0-9]+$/{print $2} tolower($1)=="listenaddress"{v=$2; if(v~/\]:[0-9]+$/){sub(/.*\]:/,"",v); print v} else if(v~/^[0-9.]+:[0-9]+$/){sub(/.*:/,"",v); print v}}'
 
-    if [[ -n "$CLI_SSH_PORT" ]]; then
-        # 1. Manual override - authoritative source
-        ports="${CLI_SSH_PORT//,/ }"
-    else
-        # 2. sshd -T: effective configuration (Port + ListenAddress, drop-ins)
-        if command -v sshd &>/dev/null; then
-            ports+=" $(sshd -T 2>/dev/null | awk "$awk_ports" | tr '\n' ' ')"
-        fi
-        # 3. ss: real sshd listening sockets. Merged, not fallback - catches the
-        #    ListenAddress port even when sshd -T prints the default port 22.
-        if command -v ss &>/dev/null; then
-            ports+=" $(ss -H -tlnp 2>/dev/null | awk '/"sshd"/{n=split($4,a,":"); print a[n]}' | tr '\n' ' ')"
-        fi
-        # 4. Parse config files - only if sshd -T and ss yielded nothing
-        if [[ -z "${ports// }" ]]; then
-            local cfgs=() d
-            [[ -f /etc/ssh/sshd_config ]] && cfgs+=(/etc/ssh/sshd_config)
-            for d in /etc/ssh/sshd_config.d/*.conf; do
-                [[ -f "$d" ]] && cfgs+=("$d")
-            done
-            if [[ "${#cfgs[@]}" -gt 0 ]]; then
-                ports+=" $(awk "$awk_ports" "${cfgs[@]}" 2>/dev/null | tr '\n' ' ')"
-            fi
-        fi
-    fi
-
-    # Validate (decimal 1-65535, 10# guards against octal) + dedup preserving order
-    for p in $ports; do
-        if [[ "$p" =~ ^[0-9]+$ ]]; then
-            pp=$((10#$p))
-            if (( pp >= 1 && pp <= 65535 )); then
-                case " $valid " in
-                    *" $pp "*) ;;
-                    *) valid+="${valid:+ }$pp" ;;
-                esac
-            fi
-        fi
-    done
-
-    # 5. Default if detection produced nothing valid
-    if [[ -z "$valid" ]]; then
-        [[ -n "$CLI_SSH_PORT" ]] && log_warn "--ssh-port has no valid ports, falling back to 22."
-        valid="22"
-    fi
-    printf '%s' "$valid"
-}
-
-setup_improved_firewall() {
-    log "Configuring UFW..."
-    if ! command -v ufw &>/dev/null; then install_packages ufw; fi
-
-    # Detect main network interface for route rule
-    local main_nic
-    main_nic=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
-    if [[ -z "$main_nic" ]]; then
-        log_warn "Could not detect network interface for UFW route."
-    fi
-
-    # Detect the real SSH port(s) so we do not lock out access on a non-standard port (Issue #91)
-    local ssh_ports _sp
-    ssh_ports=$(detect_ssh_ports)
-    log "SSH port(s) for the UFW rule: ${ssh_ports}"
-
-
-    local ufw_errors=0
-    if ufw status 2>/dev/null | grep -q inactive; then
-        log "UFW is inactive. Configuring..."
-        ufw default deny incoming  || { log_warn "UFW: failed to set default deny incoming"; ufw_errors=1; }
-        ufw default allow outgoing || { log_warn "UFW: failed to set default allow outgoing"; ufw_errors=1; }
-        for _sp in $ssh_ports; do
-            ufw limit "${_sp}/tcp" comment "SSH Rate Limit" || { log_warn "UFW: failed to limit SSH (port ${_sp})"; ufw_errors=1; }
-        done
-        if [[ "$ufw_errors" -ne 0 ]]; then
-            log_error "One or more UFW rules failed to apply. Check settings manually."
-            return 1
-        fi
-        log "UFW rules added."
-        log_warn "--- ENABLING UFW ---"
-        log_warn "UFW will allow SSH ONLY on port(s): ${ssh_ports}. Make sure you connect over it."
-        if [[ "$ssh_ports" != "22" ]]; then
-            log_warn "NOTE: SSH on a non-standard port. If the port is detected wrong, you will lose server access."
-            log_warn "Override if needed: --ssh-port=PORT"
-        fi
-        local confirm_ufw="y"
-        if [[ "$AUTO_YES" -eq 0 ]]; then
-            sleep 5
-            read -rp "Enable UFW? [y/N]: " confirm_ufw < /dev/tty
-        else
-            log "Auto-enabling UFW (--yes)."
-        fi
-        if ! [[ "$confirm_ufw" =~ ^[[:space:]]*[Yy]([Ee][Ss])?[[:space:]]*$ ]]; then
-            log_warn "UFW configured but not activated by your choice."
-            log_warn "The server is running WITHOUT a firewall. Enable later: sudo ufw enable"
-            return 0
-        fi
-        if ! ufw --force enable; then die "UFW enable error."; fi
-        log "UFW enabled."
-        # Marker: UFW was enabled by our installer (not by the user beforehand).
-        # Used in step_uninstall to decide whether disabling UFW is safe.
-        # Protects against destructive uninstall on a VPS where UFW was used
-        # for SSH/web hardening BEFORE our script was installed (audit).
-        touch "$AWG_DIR/.ufw_enabled_by_installer" 2>/dev/null || \
-            log_warn "Failed to create UFW marker — uninstall will not disable UFW automatically."
-    else
-        log "UFW is active. Updating rules..."
-        for _sp in $ssh_ports; do
-            ufw limit "${_sp}/tcp" comment "SSH Rate Limit" || { log_warn "UFW: failed to limit SSH (port ${_sp})"; ufw_errors=1; }
-        done
-        if [[ "$ufw_errors" -ne 0 ]]; then
-            log_error "One or more UFW rules failed to apply. Check settings manually."
-            return 1
-        fi
-        ufw reload || log_warn "UFW reload error."
-        log "Rules updated."
-    fi
-    log "UFW configured."
-    log "$(ufw status verbose 2>&1)"
-    return 0
-}
 
 secure_files() {
     log "Setting secure file permissions..."
@@ -1185,63 +739,6 @@ secure_files() {
     log "File permissions set."
 }
 
-setup_fail2ban() {
-    log "Configuring Fail2Ban..."
-    if ! command -v fail2ban-client &>/dev/null; then
-        install_packages fail2ban
-        # Marker: the fail2ban package was installed by our installer (rather
-        # than being present before it). step_uninstall purges fail2ban only
-        # when the marker exists, so it never wipes SSH protection the user
-        # had set up beforehand (symmetric to .ufw_enabled_by_installer).
-        if command -v fail2ban-client &>/dev/null; then
-            touch "$AWG_DIR/.fail2ban_installed_by_installer" 2>/dev/null || \
-                log_warn "Failed to create the fail2ban marker - uninstall will not remove the fail2ban package."
-        fi
-    fi
-    if ! command -v fail2ban-client &>/dev/null; then
-        log_warn "Fail2Ban not installed, skipping."
-        return 1
-    fi
-
-    # banaction=ufw only takes effect with UFW active: if the user declined to
-    # enable UFW at step 4, bans land in an inactive ruleset and effectively
-    # do nothing (while fail2ban itself looks "green").
-    if ufw status 2>/dev/null | grep -q inactive; then
-        log_warn "UFW is not active: fail2ban bans (banaction=ufw) have no effect while UFW is off. Enable with: sudo ufw enable"
-    fi
-
-    # Debian: journald instead of rsyslog, needs python3-systemd
-    if [[ "${OS_ID:-}" == "debian" ]]; then
-        install_packages python3-systemd
-    fi
-
-    mkdir -p /etc/fail2ban/jail.d 2>/dev/null
-
-    # Backend: systemd for Debian and Ubuntu (no rsyslog)
-    local f2b_backend="systemd"
-
-    cat > /etc/fail2ban/jail.d/amneziawg.conf << JAILEOF || { log_warn "jail.d/amneziawg.conf write error"; return 1; }
-# AmneziaWG — SSH protection (managed by amneziawg-installer)
-[sshd]
-enabled = true
-backend = ${f2b_backend}
-maxretry = 5
-findtime = 10m
-bantime  = 1h
-banaction = ufw
-JAILEOF
-
-    systemctl restart fail2ban
-    # Wait a second, service is restarting...
-    sleep 1
-
-    if systemctl is-active --quiet fail2ban; then
-        log "Fail2Ban configured and restarted."
-    else
-        log_warn "fail2ban restart error"
-    fi
-    return 0
-}
 
 # ==============================================================================
 # Service status check
@@ -1361,10 +858,6 @@ step_uninstall() {
             log_warn "Backup failed — check $bf manually before continuing"
         fi
     fi
-    # Файла настроек больше нет, откуда читать прежний --no-tweaks: берём
-    # текущее значение флага. Правила UFW и sysctl всё равно снимаются
-    # идемпотентно, лишний проход безвреден.
-    local saved_no_tweaks="${NO_TWEAKS:-0}"
     log "Stopping service..."
     systemctl stop awg-quick@awg0 2>/dev/null
     # Isolation DROP rules (issue #178): the on-disk config's PostDown may no
@@ -1397,7 +890,7 @@ step_uninstall() {
     rm -f /var/log/amneziawg-ensure-module.log* 2>/dev/null || true
     rm -rf /var/lib/amneziawg 2>/dev/null || true
     systemctl daemon-reload 2>/dev/null || true
-    if [[ "$saved_no_tweaks" -eq 0 ]]; then
+    if true; then
         log "Cleaning up AmneziaWG UFW rules..."
         if command -v ufw &>/dev/null; then
             # Порт для снятия правила читается из живого awg0.conf, пока он
@@ -1455,7 +948,7 @@ step_uninstall() {
             echo "$_hp deinstall" | dpkg --set-selections >/dev/null 2>&1 || true
         fi
     done
-    if [[ "$saved_no_tweaks" -eq 0 ]]; then
+    if true; then
         local _purge_pkgs=(amneziawg-dkms amneziawg-tools qrencode)
         # Purge fail2ban only if we installed it ourselves (marker from
         # setup_fail2ban) - otherwise SSH protection the user had before the
@@ -1483,7 +976,7 @@ step_uninstall() {
         /etc/sysctl.d/99-amneziawg-security.conf \
         /etc/sysctl.d/99-amneziawg-forwarding.conf \
         /etc/logrotate.d/amneziawg* || log_warn "File removal error."
-    if [[ "$saved_no_tweaks" -eq 0 ]]; then
+    if true; then
         # Remove only our own jail file.
         # Previously there was a heuristic "if jail.local contains banaction = ufw,
         # remove the whole file" — too broad a filter, could wipe an unrelated
@@ -1539,77 +1032,41 @@ step_uninstall() {
 
 
 # ==============================================================================
-# STEP 1: System update, cleanup, and optimization
+# ШАГ 1: apt в рабочем состоянии
 # ==============================================================================
-
-step1_update_and_optimize() {
+#
+# Обновление системы, чистка пакетов, swap, тюнинг NIC и sysctl переехали в
+# bootstrap.sh: это подготовка машины, а не установка AmneziaWG. Здесь остаётся
+# ровно то, без чего нельзя добавить репозиторий и поставить пакеты.
+#
+# Вместе с обновлением системы отсюда ушла и перезагрузка: она была нужна
+# только потому, что установщик сам менял ядро. Осталась единственная — если
+# модуль собран под другое ядро (шаг 2).
+step1_prepare_apt() {
     update_state 1
-    log "### STEP 1: System update, cleanup, and optimization ###"
+    log "### ШАГ 1: подготовка apt ###"
 
-    # First-boot dpkg-lock resilience: unattended-upgrades and apt-daily often
-    # hold the lock for several minutes (issue #150 - apt full-upgrade used to
-    # fail immediately). DPkg::Lock::Timeout makes apt wait for the lock to be
-    # released instead of erroring out.
+    # unattended-upgrades и apt-daily часто держат dpkg-lock по несколько минут
+    # после первой загрузки (issue #150), и apt падал сразу.
+    # DPkg::Lock::Timeout заставляет его дождаться.
     mkdir -p /etc/apt/apt.conf.d
-    printf 'DPkg::Lock::Timeout "300";\n' > /etc/apt/apt.conf.d/99-amneziawg-lock-timeout \
-        || log_warn "Failed to write apt lock-timeout (issue #150 mitigation)."
+    printf 'DPkg::Lock::Timeout "300";
+' > /etc/apt/apt.conf.d/99-amneziawg-lock-timeout         || log_warn "не записан apt lock-timeout"
 
-    # Clean unnecessary components (BEFORE update to save bandwidth/time)
-    if [[ "$NO_TWEAKS" -eq 0 ]]; then
-        cleanup_system
-    else
-        log "Skipping system cleanup (--no-tweaks)."
-    fi
-
-    log "Updating package lists..."
-    apt_update_tolerant || die "apt update error."
-    # Cache is fresh: install_packages below must not rerun apt update
-    # (sources do not change in step 1).
+    log "Обновление списков пакетов..."
+    apt_update_tolerant || die "apt update не отработал."
+    # Кэш свежий: install_packages ниже не должен повторять update.
     _APT_UPDATED=1
 
-    log "Unlocking dpkg..."
     if ! apt-get check &>/dev/null; then
-        log_warn "dpkg locked or corrupted, fixing..."
-        DEBIAN_FRONTEND=noninteractive dpkg --configure -a || log_warn "dpkg --configure -a."
+        log_warn "dpkg занят или повреждён, чиню..."
+        DEBIAN_FRONTEND=noninteractive dpkg --configure -a             || log_warn "dpkg --configure -a не отработал"
     fi
 
-    log "Updating system..."
-    if ! DEBIAN_FRONTEND=noninteractive apt full-upgrade -y; then
-        _lock_holder="$(fuser /var/lib/dpkg/lock-frontend 2>/dev/null | tr -s ' ' || true)"
-        if [[ -n "$_lock_holder" ]]; then
-            log_warn "dpkg-lock is held by:${_lock_holder} (usually first-boot unattended-upgrades)."
-        fi
-        log_warn "apt full-upgrade failed, fixing dpkg and retrying..."
-        DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
-        DEBIAN_FRONTEND=noninteractive apt full-upgrade -y \
-            || die "apt full-upgrade error. Another apt/unattended-upgrades process is likely holding the dpkg lock. Wait for it to finish (check: fuser /var/lib/dpkg/lock-frontend) or run: systemctl stop unattended-upgrades; dpkg --configure -a - then run the script again."
-    fi
-    log "System updated."
+    # gpg нужен для ключа репозитория Amnezia, curl и wget — чтобы его забрать.
+    install_packages curl wget gpg
 
-    install_packages curl wget gpg sudo ethtool
-
-    if [[ "$NO_TWEAKS" -eq 0 ]]; then
-        optimize_system
-    else
-        log "Skipping optimization and hardening (--no-tweaks)."
-    fi
-    apply_sysctl_profile
-
-    log "Step 1 completed successfully."
-
-    # Апстрим здесь перезагружался БЕЗУСЛОВНО и полагался на то, что человек
-    # запустит скрипт заново, а state-машина продолжит со второго шага. Мы
-    # выполняем шаги подряд, поэтому безусловная перезагрузка означала бы
-    # бесконечный цикл: обновлять уже нечего, а reboot всё равно происходит.
-    #
-    # Перезагрузка нужна ровно в одном случае — обновилось ядро. Иначе DKMS
-    # соберёт модуль под работающее (старое) ядро, а после следующего ребута
-    # он окажется несовместим. Признак берём из штатного маркера apt.
-    if [[ -f /var/run/reboot-required ]]; then
-        log_warn "обновилось ядро — нужна перезагрузка перед сборкой модуля"
-        request_reboot 2
-    fi
-    log "Перезагрузка не требуется, продолжаю."
+    log "Шаг 1 завершён."
     update_state 2
 }
 
@@ -2232,18 +1689,66 @@ AWG_SYSTEMD_UNIT_EOF
     # обычно в том, что работающее ядро старше того, под которое собран
     # модуль. Если modprobe проходит, перезагружаться незачем: step3 всё
     # равно проверит модуль ещё раз.
-    if modprobe amneziawg 2>/dev/null; then
-        log "Модуль amneziawg загружен, перезагрузка не требуется."
-        update_state 3
-        return 0
-    fi
-    log_warn "модуль не загрузился сразу — требуется перезагрузка"
-    request_reboot 3
+    local load_rc=0
+    load_amneziawg_module || load_rc=$?
+    case "$load_rc" in
+        0)
+            log "Модуль amneziawg загружен, перезагрузка не требуется."
+            update_state 3
+            return 0
+            ;;
+        2)
+            die "модуль AmneziaWG не загружается, и перезагрузка этого не изменит."
+            ;;
+    esac
+    log_warn "модуль собран под другое ядро — нужна перезагрузка"
+    request_reboot 3 "Модуль AmneziaWG собран под другое ядро, чем работает сейчас."
 }
 
 # ==============================================================================
 # STEP 3: Kernel module check
 # ==============================================================================
+
+# load_amneziawg_module — загрузить модуль и, если не вышло, объяснить почему.
+#
+#   0 — загружен
+#   1 — не загружен, перезагрузка поможет
+#   2 — не загружен, перезагрузка НЕ поможет (причина уже выведена)
+#
+# Различать эти два случая обязательно. Раньше любой отказ modprobe объявлялся
+# следствием обновления ядра и приводил к перезагрузке — а при включённом
+# Secure Boot модуль не грузится никогда, и человек ходил по кругу: ребут,
+# то же сообщение, снова ребут.
+load_amneziawg_module() {
+    local err
+    if err=$(modprobe amneziawg 2>&1); then
+        return 0
+    fi
+
+    # Ядро отвергло неподписанный DKMS-модуль. Единственное лекарство — снять
+    # Secure Boot или подписать модуль; перезагрузка тут бесполезна.
+    if printf '%s' "$err" | grep -qiE 'key was rejected|required key not available'; then
+        log_error "ядро отказалось грузить модуль: $err"
+        log_error "Причина — Secure Boot: DKMS-модуль не подписан."
+        log_error "Проверить: mokutil --sb-state"
+        log_error "Выключите Secure Boot в BIOS/UEFI прошивке сервера"
+        log_error "(в Proxmox: Hardware → EFI Disk, pre-enrolled-keys=0)"
+        log_error "либо подпишите модуль собственным MOK-ключом."
+        return 2
+    fi
+
+    # Модуль уже собран под РАБОТАЮЩЕЕ ядро и всё равно не грузится.
+    # Перезагрузка ничего не изменит — показываем настоящую ошибку.
+    if compgen -G "/lib/modules/$(uname -r)/updates/dkms/amneziawg.ko*" >/dev/null 2>&1; then
+        log_error "модуль для ядра $(uname -r) собран, но не загружается: $err"
+        log_error "Собранные версии: $(dkms status -m amneziawg 2>/dev/null | tr '
+' ' ')"
+        return 2
+    fi
+
+    log_warn "модуль не загрузился: $err"
+    return 1
+}
 
 step3_check_module() {
     update_state 3
@@ -2252,7 +1757,7 @@ step3_check_module() {
 
     if ! lsmod | grep -q -w amneziawg; then
         log "Module not loaded. Loading..."
-        modprobe amneziawg || die "modprobe amneziawg error."
+        load_amneziawg_module             || die "модуль AmneziaWG не загрузился — см. сообщения выше."
         log "Module loaded."
         local mf="/etc/modules-load.d/amneziawg.conf"
         mkdir -p "$(dirname "$mf")"
@@ -2298,28 +1803,6 @@ step3_check_module() {
 # STEP 4: Firewall configuration
 # ==============================================================================
 
-step4_setup_firewall() {
-    update_state 4
-    if [[ "$NO_TWEAKS" -eq 0 ]]; then
-        log "### STEP 4: UFW firewall configuration ###"
-        install_packages ufw
-        setup_improved_firewall || die "UFW configuration error."
-        log "Step 4 completed."
-    else
-        log "### STEP 4: Skipping UFW configuration (--no-tweaks) ###"
-    fi
-
-    # Fail2Ban жил на шаге 7 вместе с запуском сервиса. Сервис теперь поднимает
-    # awg3.sh, а защита SSH к нему отношения не имеет — её место здесь, рядом
-    # с фаерволом.
-    if [[ "$NO_TWEAKS" -eq 0 ]]; then
-        setup_fail2ban
-    else
-        log "Skipping Fail2Ban (--no-tweaks)."
-    fi
-
-    update_state 5
-}
 
 # ==============================================================================
 # STEP 5: Downloading scripts (NO Python!)
@@ -2386,7 +1869,6 @@ install-awg3.sh ${SCRIPT_VERSION} — установка AmneziaWG 3.1
 ОПЦИИ
     --awg-dir PATH        каталог данных   (по умолч.: ~/awg текущего пользователя)
     -y, --yes             не задавать вопросов
-        --no-tweaks       не трогать sysctl, swap и fail2ban
         --uninstall       удалить AmneziaWG
         --diagnostic      собрать диагностический отчёт
         --verbose         подробный вывод
@@ -2400,13 +1882,13 @@ install-awg3.sh ${SCRIPT_VERSION} — установка AmneziaWG 3.1
     sudo awg3 add ИМЯ                                     выдать клиента
 
 ПРИМЕЧАНИЯ
-    Установка может потребовать перезагрузки — если обновилось ядро или модуль
-    не загрузился сразу. После неё запустите эту же команду ещё раз, она
-    продолжит с нужного места.
+    Систему этот скрипт не настраивает: обновление, swap, sysctl, фаервол и
+    fail2ban — задача bootstrap.sh. Порт интерфейса открывает
+    'awg3 server-init'. Здесь только пакеты, модуль ядра и awg3 в PATH.
 
-    Фаервол здесь настраивается только в общей части: политики и лимит на SSH.
-    Порт интерфейса открывает 'awg3 server-init' — он один знает, какой порт у
-    какого интерфейса, а интерфейсов может быть несколько.
+    Перезагрузка нужна в одном случае: модуль собран под другое ядро, чем
+    работает сейчас. Тогда скрипт скажет об этом — перезагрузитесь и запустите
+    ту же команду, установка продолжится с нужного места.
 EOF
     exit "${HELP_EXIT_RC:-0}"
 }
@@ -2436,10 +1918,9 @@ install_awg3_script() {
 # Вопросов о VPN здесь нет ни одного — ни до перезагрузок, ни после. Их задаёт
 # 'awg3 server-init', то есть тот, кто эти ответы применяет.
 install_amneziawg_stack() {
-    step1_update_and_optimize
+    step1_prepare_apt
     step2_install_amnezia
     step3_check_module
-    step4_setup_firewall
 }
 
 # Исходные аргументы запоминаются, чтобы предложить их дословно при
@@ -2451,9 +1932,7 @@ parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --awg-dir)           AWG3_DIR="${2:-}"; shift 2 ;;
-            --ssh-port-fw)       CLI_SSH_PORT="${2:-}"; shift 2 ;;
             -y|--yes)            AUTO_YES=1; shift ;;
-            --no-tweaks)         NO_TWEAKS=1; CLI_NO_TWEAKS=1; shift ;;
             --uninstall)         UNINSTALL=1; shift ;;
             --diagnostic)        DIAGNOSTIC=1; shift ;;
             --verbose)           VERBOSE=1; shift ;;

@@ -29,6 +29,8 @@ DISABLE_ROOT_SSH="no"
 PASSWORD_FILE=""
 NEW_PASSWORD=""
 ASSUME_YES=0
+# --no-tweaks: не трогать swap, sysctl, сетевую карту и лишние пакеты.
+NO_TWEAKS=0
 
 OLD_SSH_PORT=""
 NEEDS_REBOOT=0
@@ -51,6 +53,9 @@ log_ok()   { printf '%s[ OK ]%s %s\n' "$C_GRN" "$C_OFF" "$1"; }
 log_warn() { printf '%s[WARN]%s %s\n' "$C_YEL" "$C_OFF" "$1" >&2; }
 log_err()  { printf '%s[ERR ]%s %s\n' "$C_RED" "$C_OFF" "$1" >&2; }
 die()      { log_err "$1"; exit 1; }
+# Псевдонимы для кода, перенесённого из установщика: там имена другие.
+log_error() { log_err "$1"; }
+log_debug() { [[ "${VERBOSE:-0}" -eq 1 ]] && printf '  %s\n' "$1" >&2; return 0; }
 
 # ── Предполётные проверки ───────────────────────────────────────────────────
 
@@ -576,9 +581,429 @@ write_summary() {
     fi
 }
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Подготовка машины
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Чистка лишних пакетов, swap, тюнинг сетевой карты и sysctl. Раньше это делал
+# install-awg3.sh, и это было неправильно: установщик AmneziaWG не должен
+# решать, как настроен чужой сервер. Подготовка машины — задача этого скрипта.
+#
+# Отключается флагом --no-tweaks: на сервере, настроенном под себя, чужое
+# мнение о swap и sysctl не нужно.
+#
+# Код перенесён из установщика почти дословно (туда он, в свою очередь, попал
+# из апстрима bivlked/amneziawg-installer) — поэтому комментарии внутри
+# английские.
+
+# Detect hardware characteristics
+detect_hardware() {
+    TOTAL_RAM_MB=$(awk '/MemTotal/ {printf "%.0f", $2/1024}' /proc/meminfo)
+    CPU_CORES=$(nproc)
+    MAIN_NIC=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
+    log "Hardware: RAM=${TOTAL_RAM_MB}MB, CPU=${CPU_CORES} cores, NIC=${MAIN_NIC}"
+}
+# Remove unnecessary packages and services
+cleanup_system() {
+    log "Cleaning system of unnecessary components..."
+
+    # Snapshot default route BEFORE cleanup - detects when we break the network.
+    # Issue #84: on clean Ubuntu 26.04 server (subiquity, no cloud-init netplan
+    # markers) apt-get autoremove after purging cloud-init removed
+    # netplan-generator as a transitive dep, and the server lost its IP on reboot.
+    local pre_default_route
+    pre_default_route="$(ip -4 route show default 2>/dev/null | head -1 || true)"
+    log_debug "Pre-cleanup default route: ${pre_default_route:-<none>}"
+
+    # apt-mark hold for critical network stack packages: defence against
+    # accidental removal via transitive deps. Covers both netplan naming
+    # variants (netplan.io on 24.04, netplan-generator on 25.10/26.04) plus
+    # systemd-resolved and netcfg/ifupdown legacy. There is no standalone
+    # systemd-networkd package - the binary lives inside systemd, nothing to hold.
+    # Before holding we snapshot the user's existing holds so we never strip
+    # holds we did not place (e.g. on linux-image-* held by the user).
+    local _hold_pkgs="netplan.io netplan-generator systemd-resolved netcfg ifupdown"
+    local _preexisting_holds=""
+    _preexisting_holds="$(apt-mark showhold 2>/dev/null || true)"
+    local _held_actual=()
+    local _hpkg
+    for _hpkg in $_hold_pkgs; do
+        if dpkg-query -W -f='${Status}' "$_hpkg" 2>/dev/null | grep -q "ok installed"; then
+            # Skip if user already held - that hold is not ours to release.
+            if grep -qxF "$_hpkg" <<<"$_preexisting_holds"; then
+                continue
+            fi
+            apt-mark hold "$_hpkg" >/dev/null 2>&1 && _held_actual+=("$_hpkg")
+        fi
+    done
+    [ ${#_held_actual[@]} -gt 0 ] && log_debug "Apt-mark hold: ${_held_actual[*]}"
+
+    # Packages to remove (safe for VPS)
+    # snapd and lxd-agent-loader — Ubuntu only, not present on Debian
+    local packages_to_remove=()
+    local pkg
+    local cleanup_list="modemmanager networkd-dispatcher unattended-upgrades packagekit udisks2"
+    if [[ "${OS_ID:-ubuntu}" == "ubuntu" ]]; then
+        cleanup_list="snapd $cleanup_list lxd-agent-loader"
+    fi
+    for pkg in $cleanup_list; do
+        if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "ok installed"; then
+            packages_to_remove+=("$pkg")
+        fi
+    done
+
+    if [ ${#packages_to_remove[@]} -gt 0 ]; then
+        log "Removing: ${packages_to_remove[*]}"
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y "${packages_to_remove[@]}" || log_warn "Error removing some packages"
+    fi
+
+    # Cleaning snap artifacts (Ubuntu only)
+    if [[ "${OS_ID:-ubuntu}" == "ubuntu" && -d /snap ]]; then
+        log "Cleaning snap artifacts..."
+        rm -rf /snap /var/snap /var/lib/snapd 2>/dev/null || log_warn "snap cleanup error"
+    fi
+
+    # cloud-init: remove only if NOT managing network
+    # Conservative approach: check cloud-init markers first, then renderer
+    if dpkg-query -W -f='${Status}' cloud-init 2>/dev/null | grep -q "ok installed"; then
+        local cloud_manages_network=0
+        # Check cloud-init markers (priority — safety)
+        if ls /etc/netplan/*cloud-init* &>/dev/null 2>&1; then
+            cloud_manages_network=1
+        elif grep -rq "cloud-init" /etc/netplan/ 2>/dev/null; then
+            cloud_manages_network=1
+        elif [[ -f /etc/network/interfaces ]] && grep -q "cloud-init" /etc/network/interfaces 2>/dev/null; then
+            cloud_manages_network=1
+        fi
+        if [[ $cloud_manages_network -eq 0 ]]; then
+            log "Removing cloud-init (network doesn't depend on it)..."
+            DEBIAN_FRONTEND=noninteractive apt-get purge -y cloud-init 2>/dev/null || log_warn "cloud-init removal error"
+            rm -rf /etc/cloud /var/lib/cloud 2>/dev/null
+        else
+            log_warn "cloud-init manages network — skipping removal."
+        fi
+    fi
+
+    # apt-get autoremove dropped (was the source of Issue #84 on Ubuntu 26.04
+    # ISO): autoremove zapped netplan-generator as a transitive dep of
+    # cloud-init. Orphans left after purge take ~50-200 MB - acceptable trade
+    # for stability. User can manually run apt-get autoremove --no-install-recommends.
+
+    # Release apt-mark holds so packages do not stay frozen for the user.
+    local _upkg
+    for _upkg in "${_held_actual[@]}"; do
+        apt-mark unhold "$_upkg" >/dev/null 2>&1 || true
+    done
+
+    # Verify default route is still present. If lost, attempt recovery.
+    # We reinstall netplan.io unconditionally (present on every supported
+    # distro). netplan-generator only ships from Ubuntu 25.10+ / Debian 13+ -
+    # gate the install behind apt-cache show so Debian 12 does not abort the
+    # transaction trying to fetch a non-existent package.
+    local post_default_route
+    post_default_route="$(ip -4 route show default 2>/dev/null | head -1 || true)"
+    if [[ -n "$pre_default_route" && -z "$post_default_route" ]]; then
+        log_error "Default route lost after cleanup. Attempting recovery..."
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            netplan.io 2>/dev/null || true
+        if apt-cache show netplan-generator &>/dev/null; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                netplan-generator 2>/dev/null || true
+        fi
+        systemctl restart systemd-networkd 2>/dev/null || true
+        netplan apply 2>/dev/null || true
+        # Route-wait loop: up to ~26 seconds, polling every 1-5 seconds.
+        # Fixed sleeps are unreliable - DHCP route appearance on slow VMs is
+        # unpredictable.
+        local _wait
+        for _wait in 1 2 3 5 5 5 5; do
+            post_default_route="$(ip -4 route show default 2>/dev/null | head -1 || true)"
+            [[ -n "$post_default_route" ]] && break
+            sleep "$_wait"
+        done
+        # Last-ditch: bring up the interface from pre_default_route. Try
+        # networkctl renew first (for systemd-networkd-managed link); if the
+        # route still does not come back, fall through to dhclient (ifupdown).
+        if [[ -z "$post_default_route" ]]; then
+            local _iface
+            _iface="$(awk '{for (i=1; i<=NF; i++) if ($i == "dev") { print $(i+1); exit } }' <<<"$pre_default_route")"
+            if [[ -n "$_iface" ]]; then
+                log_warn "Last-ditch attempt to bring $_iface up..."
+                ip link set "$_iface" up 2>/dev/null || true
+                if command -v networkctl &>/dev/null; then
+                    networkctl renew "$_iface" 2>/dev/null || true
+                    sleep 3
+                    post_default_route="$(ip -4 route show default 2>/dev/null | head -1 || true)"
+                fi
+                # If networkctl did not bring the route back (or is absent) - dhclient.
+                if [[ -z "$post_default_route" ]] && command -v dhclient &>/dev/null; then
+                    dhclient -4 "$_iface" 2>/dev/null || true
+                    sleep 3
+                    post_default_route="$(ip -4 route show default 2>/dev/null | head -1 || true)"
+                fi
+            fi
+        fi
+        if [[ -z "$post_default_route" ]]; then
+            die "сеть не поднялась после чистки пакетов. Восстановите её из консоли (например, dhclient -4 <интерфейс>) и запустите bootstrap.sh с --no-tweaks."
+        fi
+        log_warn "Network recovered: $post_default_route"
+    fi
+
+    log "System cleanup completed."
+}
+# Swap configuration
+optimize_swap() {
+    log "Optimizing swap..."
+    local target_swap_mb
+
+    if [[ $TOTAL_RAM_MB -le 2048 ]]; then
+        target_swap_mb=1024
+    else
+        target_swap_mb=512
+    fi
+
+    # Check current swap
+    local current_swap_mb
+    current_swap_mb=$(free -m | awk '/Swap:/ {print $2}')
+
+    if [[ $current_swap_mb -ge $target_swap_mb ]]; then
+        log "Swap is already sufficient: ${current_swap_mb}MB (target: ${target_swap_mb}MB)"
+    else
+        log "Creating swap file: ${target_swap_mb}MB"
+        # Disable existing swap file if present
+        if [[ -f /swapfile ]]; then
+            swapoff /swapfile 2>/dev/null
+            rm -f /swapfile
+        fi
+        dd if=/dev/zero of=/swapfile bs=1M count="$target_swap_mb" status=none 2>/dev/null || {
+            log_warn "Error creating swap file"
+            return 1
+        }
+        chmod 600 /swapfile
+        mkswap /swapfile >/dev/null 2>&1 || { log_warn "mkswap error"; return 1; }
+        swapon /swapfile || { log_warn "swapon error"; return 1; }
+        # Add to fstab if missing. Precise field match: ignore commented
+        # lines and partial matches (e.g. `/swapfile.bak` or an old entry
+        # left in a comment).
+        if ! awk '!/^[[:space:]]*#/ && $1 == "/swapfile" && $3 == "swap" {found=1} END {exit !(found+0)}' \
+             /etc/fstab; then
+            echo '/swapfile none swap sw 0 0' >> /etc/fstab
+        fi
+        log "Swap file created: ${target_swap_mb}MB"
+    fi
+
+    # Setting swappiness
+    sysctl -w vm.swappiness=10 >/dev/null 2>&1
+}
+# Network interface optimization
+optimize_nic() {
+    if [[ -z "$MAIN_NIC" ]]; then
+        log_warn "Main NIC not detected, skipping optimization."
+        return 1
+    fi
+
+    if ! command -v ethtool &>/dev/null; then
+        log_debug "ethtool not found, skipping NIC optimization."
+        return 0
+    fi
+
+    log "NIC optimization: $MAIN_NIC"
+    # Disable GRO/GSO/TSO — may interfere with VPN traffic
+    ethtool -K "$MAIN_NIC" gro off 2>/dev/null || log_debug "GRO: not supported/already off."
+    ethtool -K "$MAIN_NIC" gso off 2>/dev/null || log_debug "GSO: not supported/already off."
+    ethtool -K "$MAIN_NIC" tso off 2>/dev/null || log_debug "TSO: not supported/already off."
+    log "NIC optimization completed."
+}
+# Full system optimization
+optimize_system() {
+    log "Optimizing system for VPN server..."
+    detect_hardware
+    optimize_swap
+    optimize_nic
+    log "System optimization completed."
+}
+# Какой из двух наборов sysctl писать, решает --no-tweaks. Оба переписывают
+# свой файл целиком, поэтому функцию можно звать повторно: именно так решение
+# про IPv6, ставшее известным уже после шага 1, попадает в файл до следующей
+# перезагрузки.
+apply_sysctl_profile() {
+    if [[ "$NO_TWEAKS" -eq 0 ]]; then
+        setup_advanced_sysctl
+    else
+        setup_minimal_sysctl
+    fi
+}
+setup_minimal_sysctl() {
+    log "Configuring minimal sysctl (--no-tweaks)..."
+    local f="/etc/sysctl.d/99-amneziawg-forwarding.conf"
+    cat > "$f" << SYSEOF
+# AmneziaWG — minimal settings (--no-tweaks)
+net.ipv4.ip_forward = 1
+SYSEOF
+    if [[ "${DISABLE_IPV6:-1}" -eq 1 ]]; then
+        cat >> "$f" << SYSEOF
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+SYSEOF
+    else
+        cat >> "$f" << SYSEOF
+net.ipv6.conf.all.forwarding = 1
+SYSEOF
+    fi
+    sysctl -p "$f" >/dev/null 2>&1 || log_warn "sysctl -p error"
+    log "Minimal sysctl configured."
+}
+setup_advanced_sysctl() {
+    log "Configuring sysctl..."
+    local f="/etc/sysctl.d/99-amneziawg-security.conf"
+
+    # Adaptive buffers based on RAM
+    local rmem_max wmem_max netdev_backlog
+    if [[ ${TOTAL_RAM_MB:-1024} -ge 2048 ]]; then
+        rmem_max=16777216    # 16MB
+        wmem_max=16777216
+        netdev_backlog=5000
+    else
+        rmem_max=4194304     # 4MB
+        wmem_max=4194304
+        netdev_backlog=2500
+    fi
+
+    cat > "$f" << EOF
+# AmneziaWG Security/Performance Settings - $(date)
+# Создано bootstrap.sh v${BOOTSTRAP_VERSION}
+
+# --- IP Forwarding ---
+net.ipv4.ip_forward = 1
+$(if [[ "${DISABLE_IPV6:-1}" -eq 1 ]]; then
+    echo "net.ipv6.conf.all.disable_ipv6 = 1"
+    echo "net.ipv6.conf.default.disable_ipv6 = 1"
+    echo "net.ipv6.conf.lo.disable_ipv6 = 1"
+else
+    echo "# IPv6 not disabled"
+    echo "net.ipv6.conf.all.forwarding = 1"
+fi)
+
+# --- TCP/IP Hardening ---
+# rp_filter = 2 (loose mode): validates source IP against ANY route in the
+# table, not against the reverse path through the same interface. Strict mode
+# (=1) breaks routing on cloud hosters (Hetzner and similar) where the gateway
+# is in a different subnet than the VPS IP — reply packets fail the strict
+# reverse path check. Loose mode is safe: spoofed source IPs are still dropped
+# if no route exists for them at all. Discussion #41 (z036).
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_max_syn_backlog = 4096
+net.ipv4.tcp_synack_retries = 2
+net.ipv4.tcp_syn_retries = 5
+net.ipv4.tcp_rfc1337 = 1
+
+# --- Redirects ---
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+$(if [[ "${DISABLE_IPV6:-1}" -ne 1 ]]; then
+    echo "net.ipv6.conf.all.accept_redirects = 0"
+    echo "net.ipv6.conf.default.accept_redirects = 0"
+fi)
+
+# --- BBR Congestion Control ---
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+# --- Network Buffers (adaptive) ---
+net.core.rmem_max = ${rmem_max}
+net.core.wmem_max = ${wmem_max}
+net.core.netdev_max_backlog = ${netdev_backlog}
+
+# --- Conntrack ---
+net.netfilter.nf_conntrack_max = 65536
+
+# --- Security ---
+vm.swappiness = 10
+kernel.sysrq = 0
+
+# Suppress kernel warning/notice messages in the hoster VNC console.
+# Without this, fail2ban UFW blocks spam the VNC window with "[UFW BLOCK]"
+# lines and make the console unusable.
+# Format: console_loglevel default_msg_loglevel min_console_loglevel default_console_loglevel
+# Value 3 = KERN_ERR — only errors and above reach the console.
+# Discussion #41 (z036).
+kernel.printk = 3 4 1 3
+EOF
+
+    log "Applying sysctl..."
+    if ! sysctl -p "$f" >/dev/null 2>&1; then
+        # nf_conntrack may be unavailable before module is loaded
+        log_warn "Some sysctl parameters did not apply (nf_conntrack will be available later)."
+        sysctl -p "$f" 2>/dev/null || true
+    fi
+}
+setup_fail2ban() {
+    log "Configuring Fail2Ban..."
+    if ! command -v fail2ban-client &>/dev/null; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban >/dev/null 2>&1 || log_warn "fail2ban не установился"
+    fi
+    if ! command -v fail2ban-client &>/dev/null; then
+        log_warn "Fail2Ban not installed, skipping."
+        return 1
+    fi
+
+    # banaction=ufw only takes effect with UFW active: if the user declined to
+    # enable UFW at step 4, bans land in an inactive ruleset and effectively
+    # do nothing (while fail2ban itself looks "green").
+    if ufw status 2>/dev/null | grep -q inactive; then
+        log_warn "UFW is not active: fail2ban bans (banaction=ufw) have no effect while UFW is off. Enable with: sudo ufw enable"
+    fi
+
+    # Debian: journald instead of rsyslog, needs python3-systemd
+    if [[ "${OS_ID:-}" == "debian" ]]; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y python3-systemd >/dev/null 2>&1 || log_warn "python3-systemd не установился"
+    fi
+
+    mkdir -p /etc/fail2ban/jail.d 2>/dev/null
+
+    # Backend: systemd for Debian and Ubuntu (no rsyslog)
+    local f2b_backend="systemd"
+
+    cat > /etc/fail2ban/jail.d/bootstrap-sshd.conf << JAILEOF || { log_warn "jail.d/bootstrap-sshd.conf не записан"; return 1; }
+# Защита SSH (создано bootstrap.sh)
+[sshd]
+enabled = true
+backend = ${f2b_backend}
+maxretry = 5
+findtime = 10m
+bantime  = 1h
+banaction = ufw
+JAILEOF
+
+    systemctl restart fail2ban
+    # Wait a second, service is restarting...
+    sleep 1
+
+    if systemctl is-active --quiet fail2ban; then
+        log "Fail2Ban configured and restarted."
+    else
+        log_warn "fail2ban restart error"
+    fi
+    return 0
+}
 usage() {
     cat <<EOF
 bootstrap.sh ${BOOTSTRAP_VERSION} — подготовка сервера перед установкой AmneziaWG
+
+Делает машину пригодной для работы: sudo-пользователь, порт SSH, фаервол,
+fail2ban, обновление системы, swap, sysctl и чистка лишних пакетов. AmneziaWG
+не ставит — это следующая команда, install-awg3.sh.
 
 ИСПОЛЬЗОВАНИЕ
     bootstrap.sh [опции]
@@ -589,8 +1014,16 @@ bootstrap.sh ${BOOTSTRAP_VERSION} — подготовка сервера пер
         --ssh-port N          новый порт SSH                (по умолч.: ${NEW_SSH_PORT})
         --disable-root-ssh yes|no
                               отключить вход root по SSH    (по умолч.: ${DISABLE_ROOT_SSH})
+        --no-tweaks           не трогать swap, sysctl, сетевую карту и не
+                              сносить лишние пакеты
     -y, --yes                 не задавать вопросов
     -h, --help                эта справка
+
+ПОРЯДОК РАЗВЁРТЫВАНИЯ
+    sudo ./bootstrap.sh --user vpnadmin --ssh-port 2222   этот скрипт
+    sudo ./install-awg3.sh                                пакеты и модуль
+    sudo awg3 server-init                                 создать интерфейс
+    sudo awg3 add ИМЯ                                     выдать клиента
 
 ПРИМЕЧАНИЯ
     Пароль нельзя передать аргументом: аргументы видны в ps и попадают в
@@ -598,6 +1031,10 @@ bootstrap.sh ${BOOTSTRAP_VERSION} — подготовка сервера пер
 
     Старый и новый порты SSH открыты одновременно; старый закрывается лишь
     после того, как вы подтвердите работу нового доступа.
+
+    Фаервол настраивается только в общей части: политики и лимит на SSH. Порт
+    VPN открывает 'awg3 server-init' — он один знает, какой порт у какого
+    интерфейса, а интерфейсов может быть несколько.
 EOF
 }
 
@@ -608,6 +1045,7 @@ main() {
             --password-file)     PASSWORD_FILE="${2:-}"; shift 2 ;;
             --ssh-port)          NEW_SSH_PORT="${2:-}"; shift 2 ;;
             --disable-root-ssh)  DISABLE_ROOT_SSH="${2:-}"; shift 2 ;;
+            --no-tweaks)         NO_TWEAKS=1; shift ;;
             -y|--yes)            ASSUME_YES=1; shift ;;
             -h|--help)           usage; exit 0 ;;
             *)                   die "неизвестная опция: $1  (см. --help)" ;;
@@ -631,11 +1069,27 @@ main() {
     OLD_SSH_PORT=$(detect_current_ssh_port)
     log "текущий SSH-порт: $OLD_SSH_PORT"
 
+    if [[ "$NO_TWEAKS" -eq 0 ]]; then
+        cleanup_system
+    else
+        log "Чистка лишних пакетов пропущена (--no-tweaks)."
+    fi
+
     apt_upgrade_system
     read_password
     create_sudo_user "$NEW_USER" "$NEW_PASSWORD"
     ufw_setup "$OLD_SSH_PORT" "$NEW_SSH_PORT"
     apply_ssh_port "$NEW_SSH_PORT"
+
+    # После смены порта: jail для sshd читает порт из конфига при рестарте, а
+    # sysctl с форвардингом должен лечь до того, как машину перезагрузят.
+    if [[ "$NO_TWEAKS" -eq 0 ]]; then
+        optimize_system
+        setup_fail2ban || log_warn "fail2ban не настроен"
+    else
+        log "Тюнинг системы пропущен (--no-tweaks)."
+    fi
+    apply_sysctl_profile
 
     if [[ "$DISABLE_ROOT_SSH" == "yes" ]]; then
         if confirm_new_access "$SERVER_ADDR" "$NEW_SSH_PORT" "$NEW_USER"; then

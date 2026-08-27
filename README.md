@@ -15,8 +15,8 @@
 
 | Файл | Назначение |
 |---|---|
-| `bootstrap.sh` | подготовка свежего сервера: обновление, `sudo`, новый sudo-пользователь, SSH-порт, отключение root по SSH, фаервол |
-| `install-awg3.sh` | пакеты, DKMS-модуль, общая часть фаервола; конфигурацию не трогает. Форк [bivlked/amneziawg-installer](https://github.com/bivlked/amneziawg-installer) v5.23.0 |
+| `bootstrap.sh` | подготовка свежего сервера: обновление системы, `sudo`-пользователь, порт SSH, отключение root, фаервол, fail2ban, swap, sysctl |
+| `install-awg3.sh` | пакеты AmneziaWG, DKMS-модуль, `awg3` в `PATH`. Ни систему, ни фаервол, ни сервер не настраивает. Форк [bivlked/amneziawg-installer](https://github.com/bivlked/amneziawg-installer) v5.23.0 |
 | `awg3.sh` | интерфейсы и клиенты: `server-init`, `add`, `remove`, `link`, `list`, `stats`, `backup`, `show`, `restart`, `ifaces`, `migrate-client`, `server-rekey` |
 | `panel/` | необязательная панель управления с Windows: то же самое, но меню вместо SSH-команд |
 
@@ -55,7 +55,7 @@ sudo ./bootstrap.sh --user vpnadmin --ssh-port 2222 --disable-root-ssh yes
 
 # переподключиться: ssh -p 2222 vpnadmin@СЕРВЕР, затем снова скачать репозиторий
 
-# 2. установка AmneziaWG: пакеты и модуль ядра, про VPN не спрашивает ничего
+# 2. установка AmneziaWG: пакеты и модуль ядра, больше ничего
 sudo ./install-awg3.sh
 
 # 3. создать интерфейс — спросит порт, подсеть, IPv6 и остальное
@@ -65,8 +65,9 @@ sudo awg3 server-init
 sudo awg3 add my_phone
 ```
 
-Второй шаг может потребовать перезагрузки — если обновилось ядро. После неё
-запустите ту же команду ещё раз, она продолжит с нужного места.
+Перезагрузка может понадобиться после первого шага — если обновилось ядро.
+Второй шаг просит её только в одном случае: модуль собран под другое ядро, чем
+работает сейчас.
 
 Всё без вопросов:
 
@@ -174,7 +175,7 @@ sudo apt-get install -y bats shellcheck
 ./tests/run.sh postup   # только tests/unit/postup.bats
 ```
 
-220 юнит-тестов. Плюс интеграционные прогоны на живых Ubuntu 24.04 и
+239 юнит-тестов. Плюс интеграционные прогоны на живых Ubuntu 24.04 и
 Debian 13, включая реальное подключение клиента и проверку после
 перезагрузки — журнал и список найденных ими дефектов в
 [`tests/integration/README.md`](tests/integration/README.md).
