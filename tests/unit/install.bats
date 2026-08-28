@@ -427,3 +427,18 @@ Hit:7 https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu noble InRelease')
     [[ "$body" == *"authorized_keys"* ]]
     [[ "$body" == *"sudoers.d/awg3-panel"* ]]
 }
+
+@test "панель не падает и не крутится на конце ввода" {
+    # Read-Host отдаёт $null, когда ввод кончился: EOF в конвейере, Ctrl+Z в
+    # консоли. .Trim() на нём роняет панель сырым исключением PowerShell, а
+    # молчаливый возврат пустой строки хуже — экран, ждущий выбора, крутится
+    # вечно, потому что Read-Host дальше отдаёт $null бесконечно.
+    local panel="$REPO_ROOT/panel/awg-panel.ps1"
+    grep -q "function Read-Line" "$panel"
+    grep -q 'script:InputClosed = $true' "$panel"
+    # Прямых чтений с .Trim() не осталось.
+    run grep -cE '\(Read-Host [^)]*\)\.Trim\(\)' "$panel"
+    [ "$output" = "0" ]
+    # Каждый из четырёх экранов выходит, а не крутится.
+    [ "$(grep -c "if (\$script:InputClosed) { return 'exit' }" "$panel")" -eq 4 ]
+}

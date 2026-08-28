@@ -61,6 +61,8 @@ $PeerRow     = @()
 $ProfileName = ''
 # Вошли ли мы на сервер. До этого показывать крошки не о чем.
 $Connected   = $false
+# Кончился ли ввод. См. Read-Line: без этого экран крутился бы вечно.
+$InputClosed = $false
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
@@ -76,10 +78,28 @@ function Write-Warn ($text) { Write-Host "  [ ! ]  $text"    -ForegroundColor Ye
 function Write-Err  ($text) { Write-Host "  [ОШИБКА] $text"  -ForegroundColor Red }
 function Write-Dim  ($text) { Write-Host "  $text"           -ForegroundColor DarkGray }
 
+# Read-Host возвращает $null, когда ввод кончился: EOF в конвейере, Ctrl+Z в
+# консоли. Вызов .Trim() на нём роняет панель сырым исключением PowerShell —
+# вместо понятного выхода человек видит «You cannot call a method on a
+# null-valued expression». Здесь пустая строка равнозначна «ничего не ввели».
+# Просто вернуть пустую строку нельзя: дальше Read-Host будет отдавать $null
+# бесконечно, и экран, который ждёт выбора, закрутится навсегда. Поэтому конец
+# ввода запоминается флагом, и каждый экран на нём выходит.
+function Read-Line {
+    param([string] $Prompt)
+    if ($script:InputClosed) { return '' }
+    $answer = if ($Prompt) { Read-Host $Prompt } else { Read-Host }
+    if ($null -eq $answer) {
+        $script:InputClosed = $true
+        return ''
+    }
+    return $answer.Trim()
+}
+
 function Pause-Panel {
     Write-Host ''
     Write-Host '  Enter — назад в меню' -ForegroundColor DarkGray -NoNewline
-    [void](Read-Host)
+    [void](Read-Line)
 }
 
 
@@ -497,7 +517,7 @@ function Select-Client {
     }
     Write-Host '    0  отмена' -ForegroundColor DarkGray
     Write-Host ''
-    $choice = Read-Host '  Номер'
+    $choice = Read-Line '  Номер'
     if ($choice -notmatch '^\d+$') { return $null }
     $idx = [int]$choice
     if ($idx -lt 1 -or $idx -gt $names.Count) { return $null }
@@ -507,7 +527,7 @@ function Select-Client {
 function Confirm-Action {
     param([string] $Question)
     Write-Host ''
-    $answer = Read-Host "  $Question [y/N]"
+    $answer = Read-Line "  $Question [y/N]"
     return ($answer -match '^[yYдД]')
 }
 
@@ -632,21 +652,21 @@ function Action-Stats {
 
 function Action-Add {
     Write-Head 'Новый ключ'
-    $name = (Read-Host '  Имя ключа (латиница, цифры, дефис)').Trim()
+    $name = (Read-Line '  Имя ключа (латиница, цифры, дефис)')
     if ($name -notmatch '^[a-zA-Z0-9_-]{1,32}$') {
         Write-Err 'Недопустимое имя: разрешены латинские буквы, цифры, дефис и подчёркивание, до 32 символов.'
         return
     }
 
     Write-Dim 'Профиль мимикрии: quic (по умолчанию), tls, dtls, sip, dns, noise'
-    $profile = (Read-Host '  Профиль [quic]').Trim()
+    $profile = (Read-Line '  Профиль [quic]')
     if (-not $profile) { $profile = 'quic' }
     if ($profile -notin @('quic', 'tls', 'dtls', 'sip', 'dns', 'noise')) {
         Write-Err "Неизвестный профиль '$profile'."
         return
     }
 
-    $intensity = (Read-Host '  Интенсивность low/medium/high [medium]').Trim()
+    $intensity = (Read-Line '  Интенсивность low/medium/high [medium]')
     if (-not $intensity) { $intensity = 'medium' }
     if ($intensity -notin @('low', 'medium', 'high')) {
         Write-Err "Неизвестная интенсивность '$intensity'."
@@ -659,7 +679,7 @@ function Action-Add {
     # поэтому даём заменить.
     Write-Host ''
     Write-Dim "Адрес в конфиге клиента (Endpoint). Сейчас подключение идёт по: $VpsHost"
-    $endpoint = (Read-Host "  Имя хоста для клиента [$VpsHost]").Trim()
+    $endpoint = (Read-Line "  Имя хоста для клиента [$VpsHost]")
     if (-not $endpoint) { $endpoint = $VpsHost }
     if ($endpoint -notmatch '^[a-zA-Z0-9._-]+$') {
         Write-Err "Недопустимое имя хоста '$endpoint'."
@@ -749,7 +769,7 @@ function Action-Restart {
 function Action-Backup {
     Write-Head 'Резервная копия'
     Write-Dim 'Архив с конфигами и ключами останется на сервере в ~/awg/backups.'
-    $keep = (Read-Host '  Сколько последних архивов оставить (Enter — ничего не удалять)').Trim()
+    $keep = (Read-Line '  Сколько последних архивов оставить (Enter — ничего не удалять)')
 
     $cmdArgs = @('backup')
     if ($keep) {
@@ -790,7 +810,7 @@ function Action-Endpoint {
     Write-Dim 'Этот адрес попадёт в Endpoint новых конфигов. DNS-имя лучше IP:'
     Write-Dim 'при смене адреса сервера выданные конфиги продолжат работать.'
     Write-Host ''
-    $name = (Read-Host '  Новое имя хоста (Enter — отмена)').Trim()
+    $name = (Read-Line '  Новое имя хоста (Enter — отмена)')
     if (-not $name) { Write-Dim 'Отменено.'; return }
     if ($name -notmatch '^[a-zA-Z0-9._-]+$') {
         Write-Err "Недопустимое имя хоста '$name'."
@@ -838,12 +858,12 @@ function Action-IfaceAdd {
     Write-Dim 'Порт в фаерволе awg3 откроет сам.'
     Write-Host ''
 
-    $port = (Read-Host '  UDP-порт (Enter — случайный)').Trim()
+    $port = (Read-Line '  UDP-порт (Enter — случайный)')
     if ($port -and ($port -notmatch '^\d+$' -or [int]$port -lt 1 -or [int]$port -gt 65535)) {
         Write-Err 'Порт должен быть числом от 1 до 65535.'
         return
     }
-    $subnet = (Read-Host '  Подсеть туннеля, например 10.9.1.1/24 (Enter — по умолчанию)').Trim()
+    $subnet = (Read-Line '  Подсеть туннеля, например 10.9.1.1/24 (Enter — по умолчанию)')
     if ($subnet -and $subnet -notmatch '^\d+\.\d+\.\d+\.\d+/\d+$') {
         Write-Err 'Подсеть указывается как адрес сервера с маской: 10.9.1.1/24.'
         return
@@ -886,14 +906,14 @@ function Action-IfaceRemove {
     }
     Write-Host '    0  отмена' -ForegroundColor DarkGray
     Write-Host ''
-    $choice = (Read-Host '  Номер').Trim()
+    $choice = (Read-Line '  Номер')
     if ($choice -notmatch '^\d+$') { Write-Dim 'Отменено.'; return }
     $idx = [int]$choice
     if ($idx -lt 1 -or $idx -gt $Rows.Count) { Write-Dim 'Отменено.'; return }
     $target = $Rows[$idx - 1][0]
 
     Write-Host ''
-    $word = Read-Host "  Наберите имя интерфейса целиком, чтобы подтвердить [$target]"
+    $word = Read-Line "  Наберите имя интерфейса целиком, чтобы подтвердить [$target]"
     if ($word -cne $target) { Write-Dim 'Отменено.'; return }
 
     Write-Host ''
@@ -940,7 +960,7 @@ function Action-MigrateClient {
     }
     Write-Host '    0  отмена' -ForegroundColor DarkGray
     Write-Host ''
-    $choice = (Read-Host '  Номер').Trim()
+    $choice = (Read-Line '  Номер')
     if ($choice -notmatch '^\d+$') { Write-Dim 'Отменено.'; return }
     $idx = [int]$choice
     if ($idx -lt 1 -or $idx -gt $targets.Count) { Write-Dim 'Отменено.'; return }
@@ -994,7 +1014,7 @@ function Action-ServerRekey {
     Write-Dim 'Порт и подсеть при этом не меняются: их смена — это пересоздание'
     Write-Dim 'интерфейса, то есть удалить (пункт I → D) и создать заново (I → N).'
     Write-Host ''
-    $word = Read-Host '  Наберите СМЕНИТЬ заглавными, чтобы подтвердить'
+    $word = Read-Line '  Наберите СМЕНИТЬ заглавными, чтобы подтвердить'
     if ($word -cne 'СМЕНИТЬ') { Write-Dim 'Отменено.'; return }
 
     Write-Host ''
@@ -1018,27 +1038,30 @@ function Read-Connection {
     # незачем, поэтому при отсутствии подсказки просто требуем ввод.
     while ($true) {
         $prompt = if ($DefaultHost) { "  Имя хоста или IP [$DefaultHost]" } else { '  Имя хоста или IP' }
-        $answer = (Read-Host $prompt).Trim()
+        $answer = Read-Line $prompt
         if ($answer) { $script:VpsHost = $answer; break }
         if ($DefaultHost) { $script:VpsHost = $DefaultHost; break }
+        if ($script:InputClosed) { return }
         Write-Err 'Адрес сервера обязателен.'
     }
 
     while ($true) {
-        $answer = (Read-Host "  Порт SSH [$DefaultPort]").Trim()
+        $answer = (Read-Line "  Порт SSH [$DefaultPort]")
         if (-not $answer) { $script:VpsPort = $DefaultPort; break }
         if ($answer -match '^\d+$' -and [int]$answer -ge 1 -and [int]$answer -le 65535) {
             $script:VpsPort = [int]$answer; break
         }
+        if ($script:InputClosed) { return }
         Write-Err 'Порт должен быть числом от 1 до 65535.'
     }
 
     # Как и с адресом: без подсказки просто требуем ввод.
     while ($true) {
         $prompt = if ($DefaultUser) { "  Пользователь [$DefaultUser]" } else { '  Пользователь' }
-        $answer = (Read-Host $prompt).Trim()
+        $answer = Read-Line $prompt
         if ($answer) { $script:VpsUser = $answer; break }
         if ($DefaultUser) { $script:VpsUser = $DefaultUser; break }
+        if ($script:InputClosed) { return }
         Write-Err 'Имя пользователя обязательно.'
     }
 
@@ -1147,7 +1170,7 @@ function New-ServerProfile {
         return $false
     }
 
-    $name = (Read-Host "  Название для этого сервера [$VpsHost]").Trim()
+    $name = (Read-Line "  Название для этого сервера [$VpsHost]")
     if (-not $name) { $name = $VpsHost }
 
     $items = @(Get-Profiles | Where-Object { $_.name -ne $name })
@@ -1169,7 +1192,7 @@ function Remove-ServerProfile {
         Write-Host ("   {0,2}  {1}" -f ($i + 1), $items[$i].name)
     }
     Write-Host '    0  отмена' -ForegroundColor DarkGray
-    $choice = Read-Host '  Номер'
+    $choice = Read-Line '  Номер'
     if ($choice -notmatch '^\d+$') { return }
     $idx = [int]$choice
     if ($idx -lt 1 -or $idx -gt $items.Count) { return }
@@ -1230,7 +1253,8 @@ function Screen-Servers {
         Write-Host '    Q  выход' -ForegroundColor DarkGray
         Write-Host ''
 
-        $choice = (Read-Host '  Выберите').Trim()
+        $choice = (Read-Line '  Выберите')
+        if ($script:InputClosed) { return 'exit' }
 
         switch -Regex ($choice) {
             '^[Qq]$' { return 'exit' }
@@ -1275,7 +1299,7 @@ function Connect-Server {
         # Подтверждение строгое — «yes» целиком, как при отключении root в
         # bootstrap.sh. Беглое «y» здесь означало бы согласиться разговаривать
         # с тем, кто выдаёт себя за ваш сервер.
-        $answer = Read-Host '  Забыть прежний отпечаток и подключиться? Введите yes целиком'
+        $answer = Read-Line '  Забыть прежний отпечаток и подключиться? Введите yes целиком'
         if ($answer -ne 'yes') { Write-Err 'Отменено. Прежний отпечаток сохранён.'; return $false }
         if (Remove-KnownHost -ServerHost $VpsHost -ServerPort $VpsPort) {
             Write-Ok 'Прежний отпечаток удалён, подключаюсь заново...'
@@ -1338,7 +1362,8 @@ function Screen-Ifaces {
         Write-Host '    Q  выход' -ForegroundColor DarkGray
         Write-Host ''
 
-        $choice = (Read-Host '  Выберите').Trim()
+        $choice = (Read-Line '  Выберите')
+        if ($script:InputClosed) { return 'exit' }
 
         switch -Regex ($choice) {
             '^[Qq]$' { return 'exit' }
@@ -1406,7 +1431,8 @@ function Screen-Peers {
         Write-Host '    Q  выход' -ForegroundColor DarkGray
         Write-Host ''
 
-        $choice = (Read-Host '  Выберите').Trim()
+        $choice = (Read-Line '  Выберите')
+        if ($script:InputClosed) { return 'exit' }
 
         switch -Regex ($choice) {
             '^[Qq]$' { return 'exit' }
@@ -1459,7 +1485,8 @@ function Screen-Peer {
         Write-Host '    Q  выход' -ForegroundColor DarkGray
         Write-Host ''
 
-        $choice = (Read-Host '  Выберите').Trim()
+        $choice = (Read-Line '  Выберите')
+        if ($script:InputClosed) { return 'exit' }
 
         switch -Regex ($choice) {
             '^[Qq]$' { return 'exit' }
