@@ -13,7 +13,8 @@ setup_bootstrap() {
 
     BOOTSTRAP_LIB_ONLY=1 source "$REPO_ROOT/bootstrap.sh"
 
-    SSHD_DROPIN="$TEST_TMP/99-awg3-hardening.conf"
+    SSHD_DROPIN="$TEST_TMP/00-awg3.conf"
+    SSHD_DROPIN_LEGACY="$TEST_TMP/99-awg3-hardening.conf"
     SSH_SOCKET_DROPIN="$TEST_TMP/ssh.socket.d/99-awg3-port.conf"
 }
 

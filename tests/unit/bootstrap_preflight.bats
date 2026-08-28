@@ -77,3 +77,51 @@ EOF
     run os_supported
     [ "$status" -eq 0 ]
 }
+
+# ── Смена ядра ──────────────────────────────────────────────────────────────
+
+@test "сборка ядра отделяется от версии и ABI" {
+    # Debian: версия+сборка. Ubuntu вставляет между ними ABI-номер, он к
+    # сборке не относится — иначе каждое обновление выглядело бы её сменой.
+    [ "$(kernel_flavor 6.12.105+deb13-cloud-amd64)" = "cloud-amd64" ]
+    [ "$(kernel_flavor 6.12.90+deb13.1-cloud-amd64)" = "cloud-amd64" ]
+    [ "$(kernel_flavor 6.8.0-51-generic)" = "generic" ]
+    [ "$(kernel_flavor 6.8.0-52-lowlatency)" = "lowlatency" ]
+}
+
+@test "новое ядро той же сборки означает перезагрузку" {
+    mkdir -p "$TEST_TMP/mods/6.12.90+deb13.1-cloud-amd64"
+    mkdir -p "$TEST_TMP/mods/6.12.105+deb13-cloud-amd64"
+    run kernel_upgrade_pending "6.12.90+deb13.1-cloud-amd64" "$TEST_TMP/mods"
+    [ "$status" -eq 0 ]
+    run kernel_upgrade_pending "6.12.105+deb13-cloud-amd64" "$TEST_TMP/mods"
+    [ "$status" -ne 0 ]
+}
+
+@test "чужая сборка за обновление не считается" {
+    # cloud-amd64 и amd64 лежат рядом; переход между ними перезагрузкой не
+    # случается, и предупреждать о нём незачем.
+    mkdir -p "$TEST_TMP/mods/6.12.105+deb13-cloud-amd64"
+    mkdir -p "$TEST_TMP/mods/6.12.200+deb13-amd64"
+    run kernel_upgrade_pending "6.12.105+deb13-cloud-amd64" "$TEST_TMP/mods"
+    [ "$status" -ne 0 ]
+}
+
+@test "ubuntu: обновление ABI-номера — это новое ядро" {
+    mkdir -p "$TEST_TMP/mods/6.8.0-51-generic"
+    mkdir -p "$TEST_TMP/mods/6.8.0-52-generic"
+    run kernel_upgrade_pending "6.8.0-51-generic" "$TEST_TMP/mods"
+    [ "$status" -eq 0 ]
+}
+
+@test "reboot_required смотрит и на маркер, и на ядра" {
+    # Маркер /var/run/reboot-required создаёт update-notifier, которого в
+    # облачных образах Debian нет: bootstrap молчал о смене ядра, а установщик
+    # потом всё равно требовал перезагрузку.
+    mkdir -p "$TEST_TMP/mods/$(uname -r)"
+    run reboot_required "$TEST_TMP/нет-такого-файла"
+    [ "$status" -ne 0 ]
+    touch "$TEST_TMP/marker"
+    run reboot_required "$TEST_TMP/marker"
+    [ "$status" -eq 0 ]
+}

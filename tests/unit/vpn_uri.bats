@@ -182,6 +182,29 @@ print(json.dumps(v) if isinstance(v, (list, dict)) else v)
     [[ "$conf_field" == *"Endpoint = vpn.example.com:48872"* ]]
 }
 
+@test "параметры 3.1 едут отдельными полями" {
+    # Приложение строит туннель по полям ссылки, а не по тексту в config: без
+    # них клиент из ссылки оказался бы с выключенным RandomTrailers против
+    # сервера с включённым — и туннель молча не встал бы.
+    have_python || skip "нет рабочего python3 для разбора JSON"
+    local json
+    printf 'RandomTrailers = on
+DisableCookies = on
+' > "$TEST_TMP/extra"
+    sed -i "/^MaxHandshakeAttempts = /r $TEST_TMP/extra" "$CONF"
+    json=$(decode_uri "$(build_vpn_uri "$CONF")")
+    [ "$(inner_field "$json" RandomTrailers)" = "on" ]
+    [ "$(inner_field "$json" DisableCookies)" = "on" ]
+}
+
+@test "версия протокола в ссылке — 3.1" {
+    # Ту же метку ставит официальное приложение (awgV3 в protocolConstants.h).
+    have_python || skip "нет рабочего python3 для разбора JSON"
+    local json
+    json=$(decode_uri "$(build_vpn_uri "$CONF")")
+    [[ "$json" == *'"protocol_version":"3.1"'* ]]
+}
+
 @test "пустых I2-I5 в ссылке нет" {
     have_python || skip "нет рабочего python3 для разбора JSON"
     local json

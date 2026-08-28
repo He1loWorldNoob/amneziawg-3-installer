@@ -51,6 +51,18 @@ $VpsPort      = $DefaultPort
 $VpsUser      = $DefaultUser
 $RemoteScript = ''
 $RemoteDir    = ''
+$HomeDir      = ''
+
+# Где мы сейчас в дереве сервер → интерфейс → ключ. Интерфейсов на сервере
+# может быть несколько, и они независимы: свой порт, своя подсеть, свои ключи.
+$Iface       = 'awg0'
+$Peer        = ''
+$PeerRow     = @()
+$ProfileName = ''
+# Вошли ли мы на сервер. До этого показывать крошки не о чем.
+$Connected   = $false
+# Кончился ли ввод. См. Read-Line: без этого экран крутился бы вечно.
+$InputClosed = $false
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
@@ -66,10 +78,28 @@ function Write-Warn ($text) { Write-Host "  [ ! ]  $text"    -ForegroundColor Ye
 function Write-Err  ($text) { Write-Host "  [ОШИБКА] $text"  -ForegroundColor Red }
 function Write-Dim  ($text) { Write-Host "  $text"           -ForegroundColor DarkGray }
 
+# Read-Host возвращает $null, когда ввод кончился: EOF в конвейере, Ctrl+Z в
+# консоли. Вызов .Trim() на нём роняет панель сырым исключением PowerShell —
+# вместо понятного выхода человек видит «You cannot call a method on a
+# null-valued expression». Здесь пустая строка равнозначна «ничего не ввели».
+# Просто вернуть пустую строку нельзя: дальше Read-Host будет отдавать $null
+# бесконечно, и экран, который ждёт выбора, закрутится навсегда. Поэтому конец
+# ввода запоминается флагом, и каждый экран на нём выходит.
+function Read-Line {
+    param([string] $Prompt)
+    if ($script:InputClosed) { return '' }
+    $answer = if ($Prompt) { Read-Host $Prompt } else { Read-Host }
+    if ($null -eq $answer) {
+        $script:InputClosed = $true
+        return ''
+    }
+    return $answer.Trim()
+}
+
 function Pause-Panel {
     Write-Host ''
     Write-Host '  Enter — назад в меню' -ForegroundColor DarkGray -NoNewline
-    [void](Read-Host)
+    [void](Read-Line)
 }
 
 
@@ -234,6 +264,16 @@ function Test-HostKeyChanged {
     return [bool]($Out | Select-String -SimpleMatch -Quiet 'REMOTE HOST IDENTIFICATION HAS CHANGED')
 }
 
+# Переключает панель на интерфейс сервера. Каталог клиентов вычисляется по тем
+# же правилам, что и в awg3.sh: ~/awg/ИНТЕРФЕЙС/ИМЯ. Разъехаться эти два знания
+# не должны, иначе панель скачивала бы файлы не того интерфейса, что показывает
+# в списке.
+function Set-Iface {
+    param([string] $Name)
+    $script:Iface = $Name
+    $script:RemoteDir = "$($script:HomeDir)/awg/$Name"
+}
+
 # Выполняет awg3.sh с аргументами. Возвращает строки вывода, код — в
 # $script:LastRc.
 function Invoke-Remote {
@@ -244,6 +284,12 @@ function Invoke-Remote {
     # почему-то не сработало, пусть будет честное «требуется пароль» вместо
     # молчаливого ожидания ввода, которого некому сделать.
     $remote = 'sudo -n ' + (Quote-Sh $RemoteScript)
+    # --iface добавляется ТОЛЬКО для неосновного интерфейса. На сервере со
+    # старым awg3.sh этого флага нет, и он принял бы его за имя команды; пока
+    # панель работает с awg0, она остаётся совместимой с такими серверами.
+    if ($script:Iface -and $script:Iface -ne 'awg0') {
+        $remote += ' ' + (Quote-Sh '--iface') + ' ' + (Quote-Sh $script:Iface)
+    }
     foreach ($arg in $CmdArgs) { $remote += ' ' + (Quote-Sh $arg) }
 
     $out = Invoke-Ssh $remote
@@ -425,12 +471,25 @@ function Invoke-Setup {
         "sudo sh -c $inner _ `$t"
     ) -join ' && '
 
+    # Ключ панели ставится тем доступом, который у человека УЖЕ есть: своим
+    # ключом из агента, ключом по умолчанию, а если сервер разрешает — паролем.
+    #
+    # Раньше здесь стояло PubkeyAuthentication=no вместе с конфигом панели
+    # (IdentitiesOnly и единственный, ещё не установленный ключ). На сервере,
+    # где вход по паролю выключен — а это умолчание облачных образов Debian и
+    # Ubuntu, — не оставалось ни одного способа войти, и панель упиралась в
+    # «Permission denied (publickey)» на сервере, куда сам человек прекрасно
+    # заходит.
+    #
+    # Свой ssh_config тоже не подставляется: у человека в ~/.ssh/config может
+    # быть описан рабочий доступ именно к этому серверу.
     Invoke-Native $ssh @(
-        '-F', $SshConfigPath,
         '-t',
-        '-o', 'PubkeyAuthentication=no',
+        '-p', "$VpsPort",
+        '-o', "UserKnownHostsFile=`"$KnownHostsPath`"",
+        '-o', 'HashKnownHosts=no',
         '-o', 'StrictHostKeyChecking=ask',
-        $SshAlias, $remote
+        "$VpsUser@$VpsHost", $remote
     ) -Interactive
     return $LASTEXITCODE
 }
@@ -458,7 +517,7 @@ function Select-Client {
     }
     Write-Host '    0  отмена' -ForegroundColor DarkGray
     Write-Host ''
-    $choice = Read-Host '  Номер'
+    $choice = Read-Line '  Номер'
     if ($choice -notmatch '^\d+$') { return $null }
     $idx = [int]$choice
     if ($idx -lt 1 -or $idx -gt $names.Count) { return $null }
@@ -468,7 +527,7 @@ function Select-Client {
 function Confirm-Action {
     param([string] $Question)
     Write-Host ''
-    $answer = Read-Host "  $Question [y/N]"
+    $answer = Read-Line "  $Question [y/N]"
     return ($answer -match '^[yYдД]')
 }
 
@@ -593,21 +652,21 @@ function Action-Stats {
 
 function Action-Add {
     Write-Head 'Новый ключ'
-    $name = (Read-Host '  Имя ключа (латиница, цифры, дефис)').Trim()
+    $name = (Read-Line '  Имя ключа (латиница, цифры, дефис)')
     if ($name -notmatch '^[a-zA-Z0-9_-]{1,32}$') {
         Write-Err 'Недопустимое имя: разрешены латинские буквы, цифры, дефис и подчёркивание, до 32 символов.'
         return
     }
 
     Write-Dim 'Профиль мимикрии: quic (по умолчанию), tls, dtls, sip, dns, noise'
-    $profile = (Read-Host '  Профиль [quic]').Trim()
+    $profile = (Read-Line '  Профиль [quic]')
     if (-not $profile) { $profile = 'quic' }
     if ($profile -notin @('quic', 'tls', 'dtls', 'sip', 'dns', 'noise')) {
         Write-Err "Неизвестный профиль '$profile'."
         return
     }
 
-    $intensity = (Read-Host '  Интенсивность low/medium/high [medium]').Trim()
+    $intensity = (Read-Line '  Интенсивность low/medium/high [medium]')
     if (-not $intensity) { $intensity = 'medium' }
     if ($intensity -notin @('low', 'medium', 'high')) {
         Write-Err "Неизвестная интенсивность '$intensity'."
@@ -620,7 +679,7 @@ function Action-Add {
     # поэтому даём заменить.
     Write-Host ''
     Write-Dim "Адрес в конфиге клиента (Endpoint). Сейчас подключение идёт по: $VpsHost"
-    $endpoint = (Read-Host "  Имя хоста для клиента [$VpsHost]").Trim()
+    $endpoint = (Read-Line "  Имя хоста для клиента [$VpsHost]")
     if (-not $endpoint) { $endpoint = $VpsHost }
     if ($endpoint -notmatch '^[a-zA-Z0-9._-]+$') {
         Write-Err "Недопустимое имя хоста '$endpoint'."
@@ -649,7 +708,9 @@ function Action-Add {
 }
 
 function Action-Download {
-    $name = Select-Client 'Какой ключ скачать'
+    param([string] $Name)
+    $name = $Name
+    if (-not $name) { $name = Select-Client 'Какой ключ скачать' }
     if (-not $name) { return }
 
     $outDir = Join-Path $ScriptDir $name
@@ -668,7 +729,9 @@ function Action-Download {
 }
 
 function Action-Remove {
-    $name = Select-Client 'Какой ключ удалить'
+    param([string] $Name)
+    $name = $Name
+    if (-not $name) { $name = Select-Client 'Какой ключ удалить' }
     if (-not $name) { return }
 
     Write-Host ''
@@ -691,14 +754,14 @@ function Action-Remove {
 }
 
 function Action-Show {
-    Write-Head 'Состояние сервера'
+    Write-Head "Состояние интерфейса $script:Iface"
     Invoke-Remote -CmdArgs @('show') | Out-Null
 }
 
 function Action-Restart {
     Write-Head 'Перезапуск сервиса'
     Write-Warn 'Все текущие подключения оборвутся на несколько секунд.'
-    if (-not (Confirm-Action 'Перезапустить awg-quick@awg0?')) { Write-Dim 'Отменено.'; return }
+    if (-not (Confirm-Action "Перезапустить awg-quick@$($script:Iface)?")) { Write-Dim 'Отменено.'; return }
     Write-Host ''
     Invoke-Remote -CmdArgs @('restart') | Out-Null
 }
@@ -706,7 +769,7 @@ function Action-Restart {
 function Action-Backup {
     Write-Head 'Резервная копия'
     Write-Dim 'Архив с конфигами и ключами останется на сервере в ~/awg/backups.'
-    $keep = (Read-Host '  Сколько последних архивов оставить (Enter — ничего не удалять)').Trim()
+    $keep = (Read-Line '  Сколько последних архивов оставить (Enter — ничего не удалять)')
 
     $cmdArgs = @('backup')
     if ($keep) {
@@ -747,7 +810,7 @@ function Action-Endpoint {
     Write-Dim 'Этот адрес попадёт в Endpoint новых конфигов. DNS-имя лучше IP:'
     Write-Dim 'при смене адреса сервера выданные конфиги продолжат работать.'
     Write-Host ''
-    $name = (Read-Host '  Новое имя хоста (Enter — отмена)').Trim()
+    $name = (Read-Line '  Новое имя хоста (Enter — отмена)')
     if (-not $name) { Write-Dim 'Отменено.'; return }
     if ($name -notmatch '^[a-zA-Z0-9._-]+$') {
         Write-Err "Недопустимое имя хоста '$name'."
@@ -761,17 +824,224 @@ function Action-Endpoint {
     }
 }
 
-function Action-ServerRekey {
-    Write-Head 'Смена общих параметров сервера'
-    Write-Warn 'ЭТО ОТКЛЮЧИТ ВСЕХ КЛИЕНТОВ РАЗОМ.'
-    Write-Dim 'Сервер получит новые S1-S4, H1-H4 и HeaderProtectionKey. Старые конфиги'
-    Write-Dim 'перестанут подключаться: каждого клиента придётся удалить и создать заново.'
+# ── Интерфейсы ──────────────────────────────────────────────────────────────
+#
+# Разбор вывода `awg3.sh ifaces`: колонки разделены табуляцией именно ради
+# этого места. Возвращает массив массивов ячеек или пустой массив.
+function Get-Ifaces {
+    $out = Invoke-Remote -CmdArgs @('ifaces') -Quiet
+    if ($script:LastRc -ne 0) {
+        foreach ($line in $out) { Write-Host "  $line" }
+        Write-Err 'Список интерфейсов не получен.'
+        Write-Dim 'Похоже, на сервере awg3.sh без команды ifaces — обновите его.'
+        return @()
+    }
+
+    $rows = @()
+    foreach ($line in @($out)) {
+        $text = "$line"
+        if ($text -notmatch "`t") { continue }
+        $cells = $text -split "`t"
+        if ($cells[0] -eq 'ИНТЕРФЕЙС') { continue }
+        if ($cells.Count -lt 6) { continue }
+        $rows += , $cells
+    }
+    return $rows
+}
+
+# Создание интерфейса. Имя не спрашиваем: awg3 сам берёт первое свободное, и
+# придумывать его человеку незачем — важны порт и подсеть, а они у каждого
+# интерфейса свои, иначе смысла в нескольких нет.
+function Action-IfaceAdd {
+    Write-Head 'Новый интерфейс'
+    Write-Dim 'Интерфейсы независимы: свой порт, своя подсеть, свои общие параметры.'
+    Write-Dim 'Порт в фаерволе awg3 откроет сам.'
     Write-Host ''
-    $word = Read-Host '  Наберите СМЕНИТЬ заглавными, чтобы подтвердить'
+
+    $port = (Read-Line '  UDP-порт (Enter — случайный)')
+    if ($port -and ($port -notmatch '^\d+$' -or [int]$port -lt 1 -or [int]$port -gt 65535)) {
+        Write-Err 'Порт должен быть числом от 1 до 65535.'
+        return
+    }
+    $subnet = (Read-Line '  Подсеть туннеля, например 10.9.1.1/24 (Enter — по умолчанию)')
+    if ($subnet -and $subnet -notmatch '^\d+\.\d+\.\d+\.\d+/\d+$') {
+        Write-Err 'Подсеть указывается как адрес сервера с маской: 10.9.1.1/24.'
+        return
+    }
+
+    # --iface здесь не нужен: `iface add` сам выбирает имя и работает с ним.
+    $cmdArgs = @('iface', 'add')
+    if ($port)   { $cmdArgs += @('--awg-port', $port) }
+    if ($subnet) { $cmdArgs += @('--subnet', $subnet) }
+    $cmdArgs += '-y'
+
+    Write-Host ''
+    $saved = $script:Iface
+    Set-Iface 'awg0'          # чтобы к команде не приклеился --iface текущего
+    $out = Invoke-Remote -CmdArgs $cmdArgs
+    Set-Iface $saved
+    if ($script:LastRc -ne 0) { return }
+
+    # Имя нового интерфейса берём из вывода: угадывать его на своей стороне
+    # значило бы дублировать правило выбора, которое живёт в awg3.
+    $match = $out | Select-String 'новый интерфейс: (awg\w+)' | Select-Object -First 1
+    $created = if ($match) { $match.Matches[0].Groups[1].Value } else { '' }
+    if ($created) {
+        Write-Host ''
+        if (Confirm-Action "Переключить панель на $created?") { Set-Iface $created }
+    }
+}
+
+# Удаление интерфейса. Вместе с ним исчезают клиенты и их ключи, поэтому
+# подтверждение строгое — набрать имя целиком, как при смене общих параметров.
+function Action-IfaceRemove {
+    param($Rows)
+
+    Write-Head 'Удалить интерфейс'
+    Write-Warn 'Вместе с интерфейсом исчезнут его клиенты и их ключи.'
+    Write-Host ''
+    for ($i = 0; $i -lt $Rows.Count; $i++) {
+        $r = $Rows[$i]
+        Write-Host ("   {0,2}  {1,-8} порт {2}, клиентов {3}" -f ($i + 1), $r[0], $r[1], $r[4])
+    }
+    Write-Host '    0  отмена' -ForegroundColor DarkGray
+    Write-Host ''
+    $choice = (Read-Line '  Номер')
+    if ($choice -notmatch '^\d+$') { Write-Dim 'Отменено.'; return }
+    $idx = [int]$choice
+    if ($idx -lt 1 -or $idx -gt $Rows.Count) { Write-Dim 'Отменено.'; return }
+    $target = $Rows[$idx - 1][0]
+
+    Write-Host ''
+    $word = Read-Line "  Наберите имя интерфейса целиком, чтобы подтвердить [$target]"
+    if ($word -cne $target) { Write-Dim 'Отменено.'; return }
+
+    Write-Host ''
+    $saved = $script:Iface
+    Set-Iface 'awg0'
+    Invoke-Remote -CmdArgs @('iface', 'remove', $target, '-y') | Out-Null
+    $rc = $script:LastRc
+    Set-Iface $saved
+    if ($rc -ne 0) { return }
+
+    # Панель могла стоять на удалённом интерфейсе — возвращаем её на awg0,
+    # иначе следующая же команда ушла бы в никуда.
+    if ($script:Iface -eq $target) {
+        Set-Iface 'awg0'
+        Write-Warn "Панель переключена на awg0: $target больше нет."
+    }
+    Write-Ok "Интерфейс $target удалён."
+}
+
+# Удаление ключа из списка. Само удаление и подтверждение — в Action-Remove:
+# он же чистит локальную папку, и разводить два разных диалога на одно
+# действие незачем.
+function Action-KeyRemove {
+    param($Rows)
+
+    if ($Rows.Count -eq 0) { Write-Warn 'Удалять нечего.'; return }
+
+    Write-Head 'Удалить ключ'
+    for ($i = 0; $i -lt $Rows.Count; $i++) {
+        $r = $Rows[$i]
+        Write-Host ("   {0,2}  {1,-18} {2,-16} {3}" -f ($i + 1), $r[0], $r[1], $r[4])
+    }
+    Write-Host '    0  отмена' -ForegroundColor DarkGray
+    Write-Host ''
+    $choice = (Read-Line '  Номер')
+    if ($choice -notmatch '^\d+$') { Write-Dim 'Отменено.'; return }
+    $idx = [int]$choice
+    if ($idx -lt 1 -or $idx -gt $Rows.Count) { Write-Dim 'Отменено.'; return }
+
+    Action-Remove -Name $Rows[$idx - 1][0]
+}
+
+function Action-MigrateClient {
+    param([string] $Name)
+    Write-Head 'Переезд клиента на другой интерфейс'
+    Write-Dim "Сейчас панель работает с интерфейсом $script:Iface."
+    Write-Dim 'Клиент заводится на целевом интерфейсе с ТЕМ ЖЕ ключом, а на текущем'
+    Write-Dim 'остаётся. Прежняя ссылка продолжает работать, пока человек не импортирует'
+    Write-Dim 'новую, — поэтому переезд не отключает его ни на секунду.'
+
+    $rows = @(Get-Ifaces)
+    if ($rows.Count -lt 2) {
+        Write-Host ''
+        Write-Warn 'Переезжать некуда: на сервере только один интерфейс.'
+        return
+    }
+
+    $name = $Name
+    if (-not $name) { $name = Select-Client 'Кого переселяем' }
+    if (-not $name) { Write-Dim 'Отменено.'; return }
+
+    $targets = @($rows | Where-Object { $_[0] -ne $script:Iface })
+    Write-Head "Куда переселяем '$name'"
+    for ($i = 0; $i -lt $targets.Count; $i++) {
+        $t = $targets[$i]
+        Write-Host ("   {0,2}  {1,-8} порт {2}, подсеть {3}" -f ($i + 1), $t[0], $t[1], $t[2])
+    }
+    Write-Host '    0  отмена' -ForegroundColor DarkGray
+    Write-Host ''
+    $choice = (Read-Line '  Номер')
+    if ($choice -notmatch '^\d+$') { Write-Dim 'Отменено.'; return }
+    $idx = [int]$choice
+    if ($idx -lt 1 -or $idx -gt $targets.Count) { Write-Dim 'Отменено.'; return }
+    $target = $targets[$idx - 1][0]
+
+    Write-Host ''
+    Invoke-Remote -CmdArgs @('migrate-client', $name, '--to', $target) | Out-Null
+    if ($script:LastRc -ne 0) { return }
+
+    $from = $script:Iface
+    Write-Host ''
+    Write-Ok "'$name' заведён на $target."
+    Write-Dim "На $from он остался — прежняя ссылка продолжает работать."
+    Write-Dim "Когда человек импортирует новую, вернитесь на $from (пункт I) и удалите там ключ."
+
+    if (Confirm-Action "Переключить панель на $target и скачать новый набор?") {
+        Set-Iface $target
+        Invoke-Fetch -Name $name -OutDir (Join-Path $ScriptDir $name) | Out-Null
+        Show-ClientLink -Name $name
+    }
+}
+
+# Разбор `awg3 peers` — те же колонки через табуляцию, что у ifaces, и по той
+# же причине: выровненный вывод list пришлось бы угадывать по ширине полей.
+# Возвращает массив массивов ячеек.
+function Get-Peers {
+    $out = Invoke-Remote -CmdArgs @('peers') -Quiet
+    if ($script:LastRc -ne 0) {
+        foreach ($line in $out) { Write-Host "  $line" }
+        Write-Err 'Список ключей не получен.'
+        return @()
+    }
+
+    $rows = @()
+    foreach ($line in @($out)) {
+        $text = "$line"
+        if ($text -notmatch "`t") { continue }
+        $cells = $text -split "`t"
+        if ($cells[0] -eq 'ИМЯ') { continue }
+        if ($cells.Count -lt 8) { continue }
+        $rows += , $cells
+    }
+    return $rows
+}
+
+function Action-ServerRekey {
+    Write-Head "Смена общих параметров интерфейса $script:Iface"
+    Write-Warn 'ЭТО ОТКЛЮЧИТ ВСЕХ КЛИЕНТОВ ИНТЕРФЕЙСА.'
+    Write-Dim 'Интерфейс получит новые S1-S4, H1-H4 и HeaderProtectionKey. Старые конфиги'
+    Write-Dim 'перестанут подключаться: каждого клиента придётся удалить и создать заново.'
+    Write-Dim 'Порт и подсеть при этом не меняются: их смена — это пересоздание'
+    Write-Dim 'интерфейса, то есть удалить (пункт I → D) и создать заново (I → N).'
+    Write-Host ''
+    $word = Read-Line '  Наберите СМЕНИТЬ заглавными, чтобы подтвердить'
     if ($word -cne 'СМЕНИТЬ') { Write-Dim 'Отменено.'; return }
 
     Write-Host ''
-    Invoke-Remote -CmdArgs @('server-upgrade', '-y') | Out-Null
+    Invoke-Remote -CmdArgs @('server-rekey', '-y') | Out-Null
     if ($script:LastRc -eq 0) {
         Write-Warn 'Теперь пересоздайте клиентов и раздайте им новые конфиги.'
     }
@@ -791,35 +1061,39 @@ function Read-Connection {
     # незачем, поэтому при отсутствии подсказки просто требуем ввод.
     while ($true) {
         $prompt = if ($DefaultHost) { "  Имя хоста или IP [$DefaultHost]" } else { '  Имя хоста или IP' }
-        $answer = (Read-Host $prompt).Trim()
+        $answer = Read-Line $prompt
         if ($answer) { $script:VpsHost = $answer; break }
         if ($DefaultHost) { $script:VpsHost = $DefaultHost; break }
+        if ($script:InputClosed) { return }
         Write-Err 'Адрес сервера обязателен.'
     }
 
     while ($true) {
-        $answer = (Read-Host "  Порт SSH [$DefaultPort]").Trim()
+        $answer = (Read-Line "  Порт SSH [$DefaultPort]")
         if (-not $answer) { $script:VpsPort = $DefaultPort; break }
         if ($answer -match '^\d+$' -and [int]$answer -ge 1 -and [int]$answer -le 65535) {
             $script:VpsPort = [int]$answer; break
         }
+        if ($script:InputClosed) { return }
         Write-Err 'Порт должен быть числом от 1 до 65535.'
     }
 
     # Как и с адресом: без подсказки просто требуем ввод.
     while ($true) {
         $prompt = if ($DefaultUser) { "  Пользователь [$DefaultUser]" } else { '  Пользователь' }
-        $answer = (Read-Host $prompt).Trim()
+        $answer = Read-Line $prompt
         if ($answer) { $script:VpsUser = $answer; break }
         if ($DefaultUser) { $script:VpsUser = $DefaultUser; break }
+        if ($script:InputClosed) { return }
         Write-Err 'Имя пользователя обязательно.'
     }
 
     # Каталог данных лежит в домашнем каталоге пользователя — так его кладёт
     # install-awg3.sh. У root домашний каталог не в /home.
     $home_ = if ($script:VpsUser -eq 'root') { '/root' } else { "/home/$($script:VpsUser)" }
-    $script:RemoteDir    = "$home_/awg"
+    $script:HomeDir      = $home_
     $script:RemoteScript = "$home_/awg/awg3.sh"
+    Set-Iface 'awg0'
 }
 
 # Применяет профиль к переменным подключения. Конфиг ssh переписываем здесь же:
@@ -827,18 +1101,50 @@ function Read-Connection {
 # команда, и разъехаться эти два знания не должны.
 function Use-Profile {
     param($Item)
+    $script:ProfileName = $Item.name
     $script:VpsHost = $Item.host
     $script:VpsPort = [int]$Item.port
     $script:VpsUser = $Item.user
     $home_ = if ($Item.user -eq 'root') { '/root' } else { "/home/$($Item.user)" }
-    $script:RemoteDir    = "$home_/awg"
+    $script:HomeDir      = $home_
     $script:RemoteScript = "$home_/awg/awg3.sh"
+    Set-Iface 'awg0'
     Write-SshConfig
 }
 
 # Добавление сервера: кладём ключ и настраиваем sudo — дальше вход без
 # вопросов. Пароль спрашивает сам ssh, и это единственный раз, когда он вообще
 # нужен.
+# Что делать, когда панель не смогла войти сама.
+#
+# Такое бывает не от ошибки: на сервере может быть выключен вход по паролю (по
+# умолчанию так в облачных образах Debian и Ubuntu), а ключа панели там ещё
+# нет. Тупик из этого делать незачем — человек заходит на сервер как-то иначе,
+# и двух команд достаточно.
+function Show-ManualSetup {
+    param([string] $PubKey, [int] $Rc)
+
+    Write-Host ''
+    if ($Rc -eq 255) {
+        # 255 — код самого ssh: до выполнения команды дело не дошло.
+        Write-Dim 'Похоже, войти было нечем: вход по паролю на сервере может быть'
+        Write-Dim 'выключен, а ключа панели там ещё нет.'
+    } else {
+        Write-Dim 'Войти удалось, но настройка не закончилась — обычно на sudo.'
+    }
+    Write-Dim 'Сделайте это сами любым доступом, который у вас к серверу работает:'
+    Write-Host ''
+    Write-Host '  Ключ панели:' -ForegroundColor Cyan
+    Write-Host "  $PubKey"
+    Write-Host ''
+    Write-Host '  Одной командой на сервере:' -ForegroundColor Cyan
+    Write-Host ("  mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '{0}' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" -f $PubKey)
+    Write-Host ''
+    Write-Host '  И право запускать awg3 без пароля:' -ForegroundColor Cyan
+    Write-Host ("  echo '{0} ALL=(root) NOPASSWD: {1}' | sudo tee /etc/sudoers.d/awg3-panel && sudo chmod 440 /etc/sudoers.d/awg3-panel" -f $VpsUser, $RemoteScript)
+    Write-Host ''
+}
+
 function New-ServerProfile {
     Write-Head 'Новый сервер'
     Read-Connection
@@ -847,10 +1153,12 @@ function New-ServerProfile {
     if (-not (Ensure-PanelKey)) { return $false }
 
     Write-Host ''
-    Write-Dim 'Дальше спрашивает сам ssh — панель пароль не видит и не хранит:'
+    Write-Dim 'Панель войдёт тем доступом, который у вас уже есть: ключом из агента,'
+    Write-Dim 'ключом по умолчанию, а если сервер разрешает — по паролю. Дальше'
+    Write-Dim 'спрашивает сам ssh — панель пароль не видит и не хранит:'
     Write-Dim '  • отпечаток сервера, если подключаемся к нему впервые (ответ yes);'
-    Write-Dim '  • пароль пользователя — для входа;'
-    Write-Dim '  • его же ещё раз — для sudo на сервере.'
+    Write-Dim '  • пароль, если вход по ключу не сработал;'
+    Write-Dim '  • пароль для sudo на сервере.'
     Write-Host ''
 
     $pub = (Get-Content "$KeyPath.pub" -Raw).Trim()
@@ -861,13 +1169,23 @@ function New-ServerProfile {
         Write-Err 'Не удалось настроить вход по ключу.'
         # 255 — код самого ssh: до выполнения команды дело не дошло.
         if ($rc -eq 255) {
-            Write-Warn 'Проверьте адрес, порт, логин и пароль. Несколько неверных попыток'
-            Write-Warn 'подряд — и fail2ban заблокирует ваш IP примерно на 10 минут.'
+            Write-Warn 'Проверьте адрес, порт и логин. Несколько неверных попыток подряд —'
+            Write-Warn 'и fail2ban заблокирует ваш IP примерно на 10 минут.'
         }
-        return $false
+        Show-ManualSetup -PubKey $pub -Rc $rc
+        if (Confirm-Action 'Сделано — проверить ещё раз?') {
+            Invoke-Remote -CmdArgs @('names') -Quiet | Out-Null
+            if ($script:LastRc -ne 0) {
+                Write-Err 'Всё ещё не пускает.'
+                return $false
+            }
+            Write-Ok 'Теперь пускает.'
+        } else {
+            return $false
+        }
+    } else {
+        Write-Ok 'Ключ добавлен, sudo настроен.'
     }
-    Write-Ok 'Ключ добавлен, sudo настроен.'
-
     Write-Host '  Проверяю вход по ключу...' -ForegroundColor DarkGray
     Invoke-Remote -CmdArgs @('names') -Quiet | Out-Null
     if ($script:LastRc -ne 0) {
@@ -875,7 +1193,7 @@ function New-ServerProfile {
         return $false
     }
 
-    $name = (Read-Host "  Название для этого сервера [$VpsHost]").Trim()
+    $name = (Read-Line "  Название для этого сервера [$VpsHost]")
     if (-not $name) { $name = $VpsHost }
 
     $items = @(Get-Profiles | Where-Object { $_.name -ne $name })
@@ -883,6 +1201,7 @@ function New-ServerProfile {
         name = $name; host = $VpsHost; port = $VpsPort; user = $VpsUser
     }
     Save-Profiles $items
+    $script:ProfileName = $name
     Write-Ok "Сервер '$name' сохранён. Дальше вход без вопросов."
     return $true
 }
@@ -896,7 +1215,7 @@ function Remove-ServerProfile {
         Write-Host ("   {0,2}  {1}" -f ($i + 1), $items[$i].name)
     }
     Write-Host '    0  отмена' -ForegroundColor DarkGray
-    $choice = Read-Host '  Номер'
+    $choice = Read-Line '  Номер'
     if ($choice -notmatch '^\d+$') { return }
     $idx = [int]$choice
     if ($idx -lt 1 -or $idx -gt $items.Count) { return }
@@ -911,105 +1230,100 @@ function Remove-ServerProfile {
 }
 
 # Стартовый выбор: сохранённые серверы плюс действия над списком.
-function Select-Server {
+# ══════════════════════════════════════════════════════════════════════════════
+# Навигация
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Четыре уровня: серверы → интерфейсы → ключи → карточка ключа. Каждый экран
+# показывает краткий обзор уровня ниже — сколько на сервере интерфейсов,
+# сколько на интерфейсе ключей, какой у ключа адрес и связь, — чтобы за ответом
+# «а что там внутри» не приходилось заходить внутрь.
+#
+# Экран возвращает имя следующего экрана; переходами управляет один цикл в
+# конце файла. Возврат назад — 0, выход — Q, и они работают одинаково везде.
+
+# Сколько на сервере интерфейсов и ключей. Заполняется при входе на сервер и
+# показывается в его строке при возврате к списку: опрашивать все сохранённые
+# серверы разом нельзя — каждый опрос это SSH-подключение, а на порт стоит
+# `ufw limit`.
+$ServerSummary = @{}
+
+function Screen-Servers {
     while ($true) {
+        $script:Connected = $false
+        Show-Banner
         $items = @(Get-Profiles)
 
         Write-Host ''
-        Write-Host '  Куда подключаемся' -ForegroundColor Cyan
+        Write-Host '   СЕРВЕРЫ' -ForegroundColor DarkCyan
         Write-Host ''
         if ($items.Count -gt 0) {
             for ($i = 0; $i -lt $items.Count; $i++) {
-                Write-Host ("   {0,2}  {1}" -f ($i + 1), $items[$i].name) -NoNewline
-                Write-Host ("   {0}@{1}:{2}" -f $items[$i].user, $items[$i].host, $items[$i].port) -ForegroundColor DarkGray
+                $it = $items[$i]
+                Write-Host ("   {0,2}  {1,-22} " -f ($i + 1), $it.name) -NoNewline
+                Write-Host ("{0}@{1}:{2}" -f $it.user, $it.host, $it.port) -NoNewline -ForegroundColor DarkGray
+                $sum = $script:ServerSummary[$it.name]
+                if ($sum) { Write-Host ("   {0}" -f $sum) -ForegroundColor DarkGray }
+                else      { Write-Host '' }
             }
             Write-Host ''
         } else {
             Write-Dim 'Сохранённых серверов пока нет.'
             Write-Host ''
         }
-        Write-Host '    N  добавить новый' -ForegroundColor DarkCyan
-        if ($items.Count -gt 0) { Write-Host '    D  удалить из списка' -ForegroundColor DarkCyan }
+        Write-Host '    N  добавить сервер' -ForegroundColor DarkCyan
+        if ($items.Count -gt 0) { Write-Host '    D  удалить сервер из списка' -ForegroundColor DarkCyan }
         Write-Host '    Q  выход' -ForegroundColor DarkGray
         Write-Host ''
 
-        $choice = (Read-Host '  Выберите').Trim()
+        $choice = (Read-Line '  Выберите')
+        if ($script:InputClosed) { return 'exit' }
 
         switch -Regex ($choice) {
-            '^[Qq]$' { return $false }
-            '^[Nn]$' { if (New-ServerProfile) { return $true } }
-            '^[Dd]$' { Remove-ServerProfile }
+            '^[Qq]$' { return 'exit' }
+            '^[Nn]$' {
+                # Пауза обязательна: следующий виток цикла зовёт Show-Banner с
+                # Clear-Host и стёр бы объяснение, почему не вышло.
+                if (New-ServerProfile) {
+                    if (Connect-Server) { return 'ifaces' }
+                }
+                Pause-Panel
+            }
+            '^[Dd]$' { Remove-ServerProfile; Pause-Panel }
             '^\d+$'  {
                 $idx = [int]$choice
                 if ($idx -ge 1 -and $idx -le $items.Count) {
                     Use-Profile $items[$idx - 1]
-                    return $true
-                }
-                Write-Err 'Нет такого номера.'
+                    if (Connect-Server) { return 'ifaces' }
+                    Pause-Panel
+                } else { Write-Err 'Нет такого номера.'; Start-Sleep -Milliseconds 700 }
             }
-            default { Write-Err 'Не понял. Введите номер, N, D или Q.' }
+            default { Write-Err 'Не понял. Введите номер, N, D или Q.'; Start-Sleep -Milliseconds 700 }
         }
     }
 }
 
-function Show-Banner {
-    Clear-Host
-    Write-Host ''
-    Write-Host '   ╔══════════════════════════════════════════════╗' -ForegroundColor Cyan
-    Write-Host '   ║        AmneziaWG — панель управления         ║' -ForegroundColor Cyan
-    Write-Host '   ╚══════════════════════════════════════════════╝' -ForegroundColor Cyan
-    if ($VpsHost) { Write-Host "        $VpsUser@$VpsHost`:$VpsPort" -ForegroundColor DarkGray }
-}
-
-function Show-Menu {
-    Write-Host ''
-    Write-Host '   КЛЮЧИ' -ForegroundColor DarkCyan
-    Write-Host '    1  Список клиентов'
-    Write-Host '    2  Трафик и активность'
-    Write-Host '    3  Создать ключ'
-    Write-Host '    4  Скачать ключ (conf + QR + ссылка vpn://)'
-    Write-Host '    5  Удалить ключ'
-    Write-Host ''
-    Write-Host '   СЕРВЕР' -ForegroundColor DarkCyan
-    Write-Host '    6  Состояние (awg show)'
-    Write-Host '    7  Перезапустить сервис'
-    Write-Host '    8  Резервная копия'
-    Write-Host '    9  Имя хоста для клиентов'
-    Write-Host ''
-    Write-Host '   ПРОЧЕЕ' -ForegroundColor DarkCyan
-    Write-Host '    G  Показать набор параметров обфускации'
-    Write-Host '    M  Разложить файлы по каталогам'
-    Write-Host '    S  Сменить общие параметры сервера' -ForegroundColor DarkYellow
-    Write-Host ''
-    Write-Host '    Q  Выход' -ForegroundColor DarkGray
-    Write-Host ''
-}
-
-try {
-    Show-Banner
-    if (-not (Select-Server)) { exit 0 }
-    Show-Banner
-
+# Проверка доступа при входе на сервер. Здесь же ловится смена отпечатка: это
+# не сбой входа, а предупреждение о возможной подмене сервера.
+function Connect-Server {
     Write-Host ''
     Write-Host '  Проверяю доступ...' -ForegroundColor DarkGray
+    Set-Iface 'awg0'
+    $script:Peer = ''
+    $script:Connected = $false
     $probe = Invoke-Remote -CmdArgs @('names') -Quiet
 
-    # Смена отпечатка — не сбой входа, а предупреждение о возможной подмене
-    # сервера. Предлагаем забыть старый ключ, но подтверждение строгое:
-    # ответ «yes» целиком, как и при отключении root в bootstrap.sh. Беглое
-    # «y» здесь означало бы согласиться разговаривать с тем, кто выдаёт себя
-    # за ваш сервер.
     if (Test-HostKeyChanged $probe) {
         Write-Host ''
         foreach ($line in $probe) { Write-Host "  $line" -ForegroundColor Yellow }
         Write-Host ''
         Write-Warn 'Так выглядит и переустановка сервера, и попытка подмены.'
         Write-Warn 'Соглашайтесь ТОЛЬКО если сервер переустанавливали вы сами.'
-        $answer = Read-Host '  Забыть прежний отпечаток и подключиться? Введите yes целиком'
-        if ($answer -ne 'yes') {
-            Write-Err 'Отменено. Прежний отпечаток сохранён.'
-            exit 4
-        }
+        # Подтверждение строгое — «yes» целиком, как при отключении root в
+        # bootstrap.sh. Беглое «y» здесь означало бы согласиться разговаривать
+        # с тем, кто выдаёт себя за ваш сервер.
+        $answer = Read-Line '  Забыть прежний отпечаток и подключиться? Введите yes целиком'
+        if ($answer -ne 'yes') { Write-Err 'Отменено. Прежний отпечаток сохранён.'; return $false }
         if (Remove-KnownHost -ServerHost $VpsHost -ServerPort $VpsPort) {
             Write-Ok 'Прежний отпечаток удалён, подключаюсь заново...'
         } else {
@@ -1028,31 +1342,247 @@ try {
             Write-Warn 'Сервер не ответил или не принял ключ панели. Если сервер'
             Write-Warn 'переустанавливали, добавьте его заново — пункт N в списке.'
         }
-        exit 1
+        return $false
     }
-    Write-Ok ("Подключение есть. Клиентов на сервере: {0}" -f @($probe | Where-Object { "$_".Trim() }).Count)
+    $script:Connected = $true
+    return $true
+}
 
+function Screen-Ifaces {
     while ($true) {
-        Show-Menu
-        $choice = (Read-Host '  Выберите пункт').Trim()
+        Show-Banner
+        $rows = @(Get-Ifaces)
+
+        # Обзор нижнего уровня: сколько ключей на каждом интерфейсе. Он же
+        # запоминается для строки сервера в списке уровнем выше.
+        $totalPeers = 0
+        foreach ($r in $rows) { $totalPeers += [int]($r[4] -replace '\D', '') }
+        if ($script:ProfileName) {
+            $script:ServerSummary[$script:ProfileName] = "интерфейсов: $($rows.Count), ключей: $totalPeers"
+        }
+
+        Write-Host ''
+        Write-Host '   ИНТЕРФЕЙСЫ' -ForegroundColor DarkCyan
+        Write-Host ''
+        if ($rows.Count -eq 0) {
+            Write-Dim 'Ни одного интерфейса. Создайте первый — пункт N.'
+            Write-Host ''
+        } else {
+            Write-Host ('   {0,2}  {1,-8} {2,-6} {3,-18} {4,-22} {5,-7} {6}' -f `
+                '', 'ИМЯ', 'ПОРТ', 'ПОДСЕТЬ', 'ВЕРСИЯ', 'КЛЮЧЕЙ', 'СЕРВИС') -ForegroundColor DarkCyan
+            for ($i = 0; $i -lt $rows.Count; $i++) {
+                $r = $rows[$i]
+                Write-Host ('   {0,2}  {1,-8} {2,-6} {3,-18} {4,-22} {5,-7} {6}' -f `
+                    ($i + 1), $r[0], $r[1], $r[2], $r[3], $r[4], $r[5])
+            }
+            Write-Host ''
+        }
+        Write-Host '    N  создать интерфейс' -ForegroundColor DarkCyan
+        if ($rows.Count -gt 0) { Write-Host '    D  удалить интерфейс' -ForegroundColor DarkYellow }
+        Write-Host '    B  резервная копия сервера'
+        Write-Host '    M  разложить файлы по каталогам'
+        Write-Host '    0  назад к серверам' -ForegroundColor DarkGray
+        Write-Host '    Q  выход' -ForegroundColor DarkGray
+        Write-Host ''
+
+        $choice = (Read-Line '  Выберите')
+        if ($script:InputClosed) { return 'exit' }
 
         switch -Regex ($choice) {
-            '^1$'    { Action-List;        Pause-Panel }
-            '^2$'    { Action-Stats;       Pause-Panel }
-            '^3$'    { Action-Add;         Pause-Panel }
-            '^4$'    { Action-Download;    Pause-Panel }
-            '^5$'    { Action-Remove;      Pause-Panel }
-            '^6$'    { Action-Show;        Pause-Panel }
-            '^7$'    { Action-Restart;     Pause-Panel }
-            '^8$'    { Action-Backup;      Pause-Panel }
-            '^9$'    { Action-Endpoint;    Pause-Panel }
-            '^[gG]$' { Action-Gen;         Pause-Panel }
-            '^[mM]$' { Action-Migrate;     Pause-Panel }
-            '^[sS]$' { Action-ServerRekey; Pause-Panel }
-            '^[qQ]$' { return }
-            default  { Write-Warn 'Нет такого пункта.'; Start-Sleep -Milliseconds 700 }
+            '^[Qq]$' { return 'exit' }
+            '^0$'    { return 'servers' }
+            '^[Nn]$' { Action-IfaceAdd;          Pause-Panel }
+            '^[Dd]$' { Action-IfaceRemove $rows; Pause-Panel }
+            '^[Bb]$' { Action-Backup;            Pause-Panel }
+            '^[Mm]$' { Action-Migrate;           Pause-Panel }
+            '^\d+$'  {
+                $idx = [int]$choice
+                if ($idx -ge 1 -and $idx -le $rows.Count) {
+                    $row = $rows[$idx - 1]
+                    Set-Iface $row[0]
+                    # Интерфейс, созданный до 3.1, выглядит рабочим, но ключ на
+                    # нём молча не подключится: RandomTrailers обязан совпадать
+                    # на обоих концах, и awg3 такой ключ выдать не даст.
+                    if ($row[3] -notmatch '^3\.1') {
+                        Write-Host ''
+                        Write-Warn "Интерфейс $($row[0]) создан до 3.1 — новых ключей на нём выдать нельзя."
+                        Write-Dim 'Переведите его пунктом S на экране ключей.'
+                        Pause-Panel
+                    }
+                    return 'peers'
+                }
+                Write-Err 'Нет такого номера.'; Start-Sleep -Milliseconds 700
+            }
+            default { Write-Err 'Не понял.'; Start-Sleep -Milliseconds 700 }
         }
+    }
+}
+
+function Screen-Peers {
+    while ($true) {
         Show-Banner
+        $rows = @(Get-Peers)
+
+        Write-Host ''
+        Write-Host ("   КЛЮЧИ ИНТЕРФЕЙСА {0}" -f $script:Iface) -ForegroundColor DarkCyan
+        Write-Host ''
+        if ($rows.Count -eq 0) {
+            Write-Dim 'Ключей пока нет. Создайте первый — пункт N.'
+            Write-Host ''
+        } else {
+            Write-Host ('   {0,2}  {1,-18} {2,-16} {3,-5} {4,-16} {5}' -f `
+                '', 'ИМЯ', 'АДРЕС', 'ВЕРС', 'СВЯЗЬ', 'СОВМЕСТИМ') -ForegroundColor DarkCyan
+            for ($i = 0; $i -lt $rows.Count; $i++) {
+                $r = $rows[$i]
+                $line = ('   {0,2}  {1,-18} {2,-16} {3,-5} {4,-16} {5}' -f `
+                    ($i + 1), $r[0], $r[1], $r[2], $r[4], $r[3])
+                if ($r[3] -eq 'нет') { Write-Host $line -ForegroundColor Red }
+                else                 { Write-Host $line }
+            }
+            Write-Host ''
+        }
+        Write-Host '    N  создать ключ' -ForegroundColor DarkCyan
+        if ($rows.Count -gt 0) { Write-Host '    D  удалить ключ' -ForegroundColor DarkYellow }
+        Write-Host ''
+        Write-Host ("   ИНТЕРФЕЙС {0}" -f $script:Iface) -ForegroundColor DarkCyan
+        Write-Host '    C  состояние (awg show)'
+        Write-Host '    R  перезапустить сервис'
+        Write-Host '    H  имя хоста для клиентов'
+        Write-Host '    G  показать набор параметров обфускации'
+        Write-Host '    S  сменить общие параметры обфускации' -ForegroundColor DarkYellow
+        Write-Host ''
+        Write-Host '    0  назад к интерфейсам' -ForegroundColor DarkGray
+        Write-Host '    Q  выход' -ForegroundColor DarkGray
+        Write-Host ''
+
+        $choice = (Read-Line '  Выберите')
+        if ($script:InputClosed) { return 'exit' }
+
+        switch -Regex ($choice) {
+            '^[Qq]$' { return 'exit' }
+            '^0$'    { $script:Peer = ''; return 'ifaces' }
+            '^[Nn]$' { Action-Add;             Pause-Panel }
+            '^[Dd]$' { Action-KeyRemove $rows; Pause-Panel }
+            '^[Cc]$' { Action-Show;            Pause-Panel }
+            '^[Rr]$' { Action-Restart;     Pause-Panel }
+            '^[Hh]$' { Action-Endpoint;    Pause-Panel }
+            '^[Gg]$' { Action-Gen;         Pause-Panel }
+            '^[Ss]$' { Action-ServerRekey; Pause-Panel }
+            '^\d+$'  {
+                $idx = [int]$choice
+                if ($idx -ge 1 -and $idx -le $rows.Count) {
+                    $script:Peer = $rows[$idx - 1][0]
+                    $script:PeerRow = $rows[$idx - 1]
+                    return 'peer'
+                }
+                Write-Err 'Нет такого номера.'; Start-Sleep -Milliseconds 700
+            }
+            default { Write-Err 'Не понял.'; Start-Sleep -Milliseconds 700 }
+        }
+    }
+}
+
+function Screen-Peer {
+    while ($true) {
+        Show-Banner
+        $r = $script:PeerRow
+
+        Write-Host ''
+        Write-Host ("   КЛЮЧ {0}" -f $script:Peer) -ForegroundColor DarkCyan
+        Write-Host ''
+        Write-Host ("      адрес:      {0}" -f $r[1])
+        Write-Host ("      версия:     {0}" -f $r[2])
+        if ($r[3] -eq 'нет') {
+            Write-Host '      совместим:  нет — клиент не подключится' -ForegroundColor Red
+        } else {
+            Write-Host '      совместим:  да' -ForegroundColor Green
+        }
+        Write-Host ("      связь:      {0}" -f $r[4])
+        Write-Host ("      трафик:     принято {0}, отдано {1}" -f $r[5], $r[6])
+        Write-Host ("      откуда:     {0}" -f $r[7])
+        Write-Host ''
+        Write-Host '    1  скачать (conf + QR + ссылка vpn://)'
+        Write-Host '    2  показать ссылку vpn://'
+        Write-Host '    3  переселить на другой интерфейс'
+        Write-Host '    4  удалить ключ' -ForegroundColor DarkYellow
+        Write-Host ''
+        Write-Host '    0  назад к ключам' -ForegroundColor DarkGray
+        Write-Host '    Q  выход' -ForegroundColor DarkGray
+        Write-Host ''
+
+        $choice = (Read-Line '  Выберите')
+        if ($script:InputClosed) { return 'exit' }
+
+        switch -Regex ($choice) {
+            '^[Qq]$' { return 'exit' }
+            '^0$'    { $script:Peer = ''; return 'peers' }
+            '^1$'    { Action-Download -Name $script:Peer; Pause-Panel }
+            '^2$'    {
+                Write-Head "Ссылка vpn:// для $script:Peer"
+                Show-ClientLink -Name $script:Peer -OutDir (Join-Path $ScriptDir $script:Peer)
+                Pause-Panel
+            }
+            '^3$'    {
+                # Ключ мог уехать, а панель — переключиться на другой
+                # интерфейс: карточка прежнего ключа тут уже ни при чём.
+                Action-MigrateClient -Name $script:Peer
+                Pause-Panel
+                $script:Peer = ''
+                return 'peers'
+            }
+            '^4$'    {
+                Action-Remove -Name $script:Peer
+                Pause-Panel
+                $script:Peer = ''
+                return 'peers'
+            }
+            default { Write-Err 'Не понял.'; Start-Sleep -Milliseconds 700 }
+        }
+    }
+}
+
+function Show-Banner {
+    # Clear-Host падает, когда вывода в консоль нет: под перенаправлением в
+    # файл, в конвейере, в чужом терминале без дескриптора. Экран тогда просто
+    # не очищается — это лучше, чем уронить панель на первой же перерисовке и
+    # лишить человека возможности прислать лог.
+    try { Clear-Host } catch { }
+    Write-Host ''
+    Write-Host '   ╔══════════════════════════════════════════════╗' -ForegroundColor Cyan
+    Write-Host '   ║        AmneziaWG — панель управления         ║' -ForegroundColor Cyan
+    Write-Host '   ╚══════════════════════════════════════════════╝' -ForegroundColor Cyan
+    # Хлебные крошки: где мы находимся в дереве сервер → интерфейс → ключ.
+    # Без них на третьем уровне неясно, к какому интерфейсу относятся ключи.
+    #
+    # Показываются только после успешного входа: на экране серверов они
+    # печатали адрес прошлой (в том числе неудавшейся) попытки — панель
+    # выглядела подключённой к серверу, которого нет в списке.
+    if ($script:Connected -and $VpsHost) {
+        $crumbs = "$VpsUser@$VpsHost`:$VpsPort"
+        if ($script:Iface) { $crumbs += "  ›  $($script:Iface)" }
+        if ($script:Peer)  { $crumbs += "  ›  $($script:Peer)" }
+        Write-Host ("        " + $crumbs) -ForegroundColor DarkGray
+    }
+}
+
+# Меню разбито по тому, чем управляем: ключи, текущий интерфейс, сервер
+# целиком. Раздел интерфейса подписан его именем — иначе непонятно, к чему
+# относятся «состояние» и «перезапустить», когда интерфейсов несколько.
+try {
+    # Переходами между экранами управляет один цикл: каждый экран возвращает
+    # имя следующего. Так «назад» ведёт себя одинаково на всех уровнях, а
+    # состояние (какой сервер, какой интерфейс, какой ключ) живёт в одном месте
+    # и не растекается по вложенным вызовам.
+    $screen = 'servers'
+    while ($true) {
+        switch ($screen) {
+            'servers' { $screen = Screen-Servers }
+            'ifaces'  { $screen = Screen-Ifaces }
+            'peers'   { $screen = Screen-Peers }
+            'peer'    { $screen = Screen-Peer }
+            default   { $screen = 'exit' }
+        }
+        if ($screen -eq 'exit') { break }
     }
 }
 finally {
@@ -1061,7 +1591,3 @@ finally {
     Write-Host ''
     Write-Host '  Панель закрыта.' -ForegroundColor DarkGray
 }
-
-
-
-

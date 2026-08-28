@@ -10,7 +10,9 @@ teardown() { teardown_awg3; }
 }
 
 @test "пути уведены во временный каталог" {
-    [ "$AWG_DIR" = "$TEST_TMP/awg" ]
+    # AWG3_DIR задаёт корень, клиенты живут в подкаталоге интерфейса.
+    [ "$AWG_ROOT" = "$TEST_TMP/awg" ]
+    [ "$AWG_DIR" = "$TEST_TMP/awg/awg0" ]
     [ "$SERVER_CONF" = "$TEST_TMP/awg0.conf" ]
 }
 
