@@ -17,7 +17,7 @@
 |---|---|
 | `bootstrap.sh` | подготовка свежего сервера: обновление системы, `sudo`-пользователь, порт SSH, отключение root, фаервол, fail2ban, swap, sysctl |
 | `install-awg3.sh` | пакеты AmneziaWG, DKMS-модуль, `awg3` в `PATH`. Ни систему, ни фаервол, ни сервер не настраивает. Форк [bivlked/amneziawg-installer](https://github.com/bivlked/amneziawg-installer) v5.23.0 |
-| `awg3.sh` | интерфейсы и клиенты: `server-init`, `add`, `remove`, `link`, `list`, `stats`, `backup`, `show`, `restart`, `ifaces`, `migrate-client`, `server-rekey` |
+| `awg3.sh` | интерфейсы и клиенты: `iface` (список, создать, удалить), `add`, `remove`, `link`, `list`, `peers`, `stats`, `backup`, `show`, `restart`, `migrate-client`, `server-rekey`, `set-endpoint` |
 | `panel/` | необязательная панель управления с Windows: то же самое, но меню вместо SSH-команд |
 
 ## Требования
@@ -152,7 +152,7 @@ sudo awg3 add my_phone -y
 
 ```bash
 sudo awg3 --iface awg1 server-init --awg-port 51840 --subnet 10.9.1.1/24
-sudo awg3 ifaces
+sudo awg3 iface
 sudo awg3 --iface awg0 migrate-client ivan --to awg1
 ```
 
@@ -194,7 +194,7 @@ sudo apt-get install -y bats shellcheck
 ./tests/run.sh postup   # только tests/unit/postup.bats
 ```
 
-275 юнит-тестов. Плюс интеграционные прогоны на живых Ubuntu 24.04 и
+285 юнит-тестов. Плюс интеграционные прогоны на живых Ubuntu 24.04 и
 Debian 13, включая реальное подключение клиента и проверку после
 перезагрузки — журнал и список найденных ими дефектов в
 [`tests/integration/README.md`](tests/integration/README.md).
