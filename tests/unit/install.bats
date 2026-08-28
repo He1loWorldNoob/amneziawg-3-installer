@@ -442,3 +442,18 @@ Hit:7 https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu noble InRelease')
     # Каждый из четырёх экранов выходит, а не крутится.
     [ "$(grep -c "if (\$script:InputClosed) { return 'exit' }" "$panel")" -eq 4 ]
 }
+
+@test "ключ удаляется и из списка, и из карточки" {
+    # У интерфейсов на их экране есть и создание, и удаление; у ключей было
+    # только создание — чтобы удалить, приходилось заходить в карточку.
+    local panel="$REPO_ROOT/panel/awg-panel.ps1"
+    grep -q "function Action-KeyRemove" "$panel"
+    local body
+    body=$(sed -n '/^function Screen-Peers/,/^}/p' "$panel")
+    [[ "$body" == *"Action-KeyRemove"* ]]
+    [[ "$body" == *"удалить ключ"* ]]
+    # Оба пути ведут в одну функцию: два разных диалога на одно действие
+    # разошлись бы в подтверждении и чистке локальной папки.
+    body=$(sed -n '/^function Action-KeyRemove/,/^}/p' "$panel")
+    [[ "$body" == *"Action-Remove -Name"* ]]
+}

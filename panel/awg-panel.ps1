@@ -933,6 +933,29 @@ function Action-IfaceRemove {
     Write-Ok "Интерфейс $target удалён."
 }
 
+# Удаление ключа из списка. Само удаление и подтверждение — в Action-Remove:
+# он же чистит локальную папку, и разводить два разных диалога на одно
+# действие незачем.
+function Action-KeyRemove {
+    param($Rows)
+
+    if ($Rows.Count -eq 0) { Write-Warn 'Удалять нечего.'; return }
+
+    Write-Head 'Удалить ключ'
+    for ($i = 0; $i -lt $Rows.Count; $i++) {
+        $r = $Rows[$i]
+        Write-Host ("   {0,2}  {1,-18} {2,-16} {3}" -f ($i + 1), $r[0], $r[1], $r[4])
+    }
+    Write-Host '    0  отмена' -ForegroundColor DarkGray
+    Write-Host ''
+    $choice = (Read-Line '  Номер')
+    if ($choice -notmatch '^\d+$') { Write-Dim 'Отменено.'; return }
+    $idx = [int]$choice
+    if ($idx -lt 1 -or $idx -gt $Rows.Count) { Write-Dim 'Отменено.'; return }
+
+    Action-Remove -Name $Rows[$idx - 1][0]
+}
+
 function Action-MigrateClient {
     param([string] $Name)
     Write-Head 'Переезд клиента на другой интерфейс'
@@ -1419,6 +1442,7 @@ function Screen-Peers {
             Write-Host ''
         }
         Write-Host '    N  создать ключ' -ForegroundColor DarkCyan
+        if ($rows.Count -gt 0) { Write-Host '    D  удалить ключ' -ForegroundColor DarkYellow }
         Write-Host ''
         Write-Host ("   ИНТЕРФЕЙС {0}" -f $script:Iface) -ForegroundColor DarkCyan
         Write-Host '    C  состояние (awg show)'
@@ -1437,8 +1461,9 @@ function Screen-Peers {
         switch -Regex ($choice) {
             '^[Qq]$' { return 'exit' }
             '^0$'    { $script:Peer = ''; return 'ifaces' }
-            '^[Nn]$' { Action-Add;         Pause-Panel }
-            '^[Cc]$' { Action-Show;        Pause-Panel }
+            '^[Nn]$' { Action-Add;             Pause-Panel }
+            '^[Dd]$' { Action-KeyRemove $rows; Pause-Panel }
+            '^[Cc]$' { Action-Show;            Pause-Panel }
             '^[Rr]$' { Action-Restart;     Pause-Panel }
             '^[Hh]$' { Action-Endpoint;    Pause-Panel }
             '^[Gg]$' { Action-Gen;         Pause-Panel }
